@@ -39,6 +39,105 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Validation status**: As of 2026-02-11, all paths verified correct, test_observation_chain.py works from new location.
 
+## The Cascade Pattern (Essential)
+
+**The cascade is Foreman's primary coordination mechanism** for resolving cross-layer issues:
+
+### What is a Cascade?
+
+When an issue in Layer N requires changes in Layer N-1 (or deeper):
+
+```
+User reports issue to Layer N
+  ↓ (Layer N files fix-request to N-1)
+Layer N BLOCKED, waiting for Layer N-1
+  ↓ (Layer N-1 files fix-request to N-2)
+Layer N-1 BLOCKED, waiting for Layer N-2
+  ↓ (Layer N-2 can resolve)
+Layer N-2 fixes, tests, closes (N-1 UNBLOCKS)
+  ↓
+Layer N-1 fixes, tests, closes (N UNBLOCKS)
+  ↓
+Layer N fixes, tests, closes (User notified)
+  ↓
+Foreman validates integration tests ✅
+```
+
+**Key properties:**
+- Issues flow **down** (5→4→3)
+- Each layer **blocks** until the one below resolves
+- Fixes flow **up** (3✓→4✓→5✓)
+- Each layer maintains **sovereignty** (no cross-layer edits)
+
+### Foreman's Cascade Responsibilities
+
+1. **Track cascades** — Create tracking file in `cascades/active/<cascade-id>.md`
+2. **Monitor progress** — Update as layers file fix-requests and close issues
+3. **Validate resolution** — Run integration tests when cascade completes
+4. **Archive history** — Move to `cascades/completed/` or `cascades/failed/`
+5. **Notify user** — Report completion or escalate failures
+
+**Foreman does NOT:**
+- ❌ File fix-requests on behalf of layers (sovereignty)
+- ❌ Implement fixes (layers do that)
+- ❌ Rush layers to close faster (respect blocking)
+
+### Cascade Infrastructure
+
+**Workflow definition**: `philosophy/workflows/cascade.json`
+**Tracking system**: `foreman/cascades/` (active/, completed/, failed/)
+**Template**: `foreman/cascades/template.md`
+**Full guide**: `foreman/docs/cascade_pattern.md`
+**Example**: `foreman/cascades/completed/2026-02-terrain-aware-locomotion.md`
+
+### When to Create a Cascade
+
+Create a cascade tracking file when:
+- ✅ User reports issue to Layer N
+- ✅ Layer N discovers it needs Layer N-1 changes
+- ✅ Layer N files fix-request to Layer N-1
+
+**Cascade ID format**: `YYYY-MM-<short-description>`
+
+See `foreman/docs/cascade_pattern.md` for comprehensive guide.
+
+---
+
+## Foreman's Coordination Responsibilities
+
+Foreman coordinates the **application of improvements** from `improvements/` to the **implementation layers** (`layer_3/`, `layer_4/`, `layer_5/`), ensuring:
+
+1. **Architectural proposals are consistent with philosophy**
+   - Read `improvements/IMPLEMENTATION_PLAN.md` for step-by-step execution plans
+   - Read `improvements/ARCHITECTURE_JOURNEY.md` for design rationale
+   - Verify proposals respect `philosophy/scope.md` and `philosophy/boundaries.md`
+
+2. **Fix-requests respect layer sovereignty**
+   - `improvements/fix-requests/` contains detailed specs for layer changes
+   - Each fix-request targets ONE layer (e.g., `layer3_kinematic_state.md` → Layer 3)
+   - Foreman NEVER files fix-requests on behalf of layers (layers are sovereign)
+   - Foreman CAN validate that fix-requests follow `philosophy/workflows/fix-request.json` format
+
+3. **Integration tests validate cross-layer contracts**
+   - `test_observation_chain.py` validates FEP observation chain architecture
+   - Tests check: N → N-1 layering, semantic naming, error propagation, latency
+   - When improvements touch multiple layers, add/update integration tests
+   - Integration tests are Foreman's primary artifact (beyond guidance)
+
+4. **Version compatibility is understood**
+   - Layer versions: layers_1_2 (v0.1.11), layer_3 (v2.1.0), layer_4 (v0.13.0), layer_5 (v0.6.0)
+   - See `philosophy/workflows/repos.json` for repo URLs and status
+   - When coordinating improvements, note which layer versions are targeted
+   - Foreman doesn't enforce versions, but documents expectations
+
+**What Foreman does NOT do:**
+- ❌ Implement improvements directly in layer code
+- ❌ File fix-requests on behalf of layers (each layer files their own)
+- ❌ Make architectural decisions (that's in `improvements/`, informed by `philosophy/`)
+- ❌ Control layer development (coordinate, don't control)
+
+**Key insight**: Foreman is the **stage manager**, not the **director**. Improvements are the **script**, philosophy is the **playwright's intent**, and layers are the **actors**. Foreman sets context, ensures actors know their cues, and validates the performance meets the vision.
+
 ## What This Workspace Is
 
 This is a **multi-layer robotics control stack** for Unitree SDK2 robots (B2, Go2, H1, G1). The workspace implements an 8-layer onion architecture where each layer translates from one control language to another, following the OSI network model pattern.
@@ -217,11 +316,28 @@ See `training/CLAUDE.md` and `training/README.md` for training workflows.
 
 The `improvements/` directory contains **cross-layer architectural decisions**:
 
-- **IMPLEMENTATION_PLAN.md**: Step-by-step plan for HNN/RL features
-- **ARCHITECTURE_JOURNEY.md**: Historical record of design insights
-- **LEARNING_ROADMAP.md**: Technical details for training
+- **IMPLEMENTATION_PLAN.md**: Step-by-step plan for HNN/RL features (12-week timeline)
+- **ARCHITECTURE_JOURNEY.md**: Historical record of design insights (how we discovered correct architecture)
+- **LEARNING_ROADMAP.md**: Technical details for training (HNN, RL code examples)
+- **fix-requests/**: Detailed implementation specs ready to file as GitHub issues
+  - `layer3_kinematic_state.md` — KinematicState publisher for Layer 3
+  - `layer4_dynamics_prediction.md` — Dynamics prediction for Layer 4
+  - `layer5_fep_learning.md` — FEP-based learning for Layer 5
 
 **Scope**: Documents proposals that span multiple layers. Individual layer changes go in `layer_X/plans/`.
+
+**Foreman's role with improvements/**:
+- ✅ Read improvements/ to understand architectural direction
+- ✅ Validate that proposals respect philosophy/ principles (scope, boundaries, layering)
+- ✅ Update integration tests when improvements touch multiple layers
+- ✅ Track which improvements are planned vs implemented (via layer issue links in `improvements/README.md`)
+- ❌ Never implement improvements directly in layers (sovereignty violation)
+- ❌ Never make architectural decisions (that's improvements/' job, informed by philosophy/)
+
+**Philosophy vs Improvements**:
+- `philosophy/` = **established principles** (boundaries, scope, control, architecture model)
+- `improvements/` = **architectural proposals** (what to build next, how it fits principles)
+- Foreman ensures improvements **respect** philosophy, not the other way around
 
 See `improvements/README.md` for navigation.
 
@@ -239,6 +355,51 @@ The `Assets/` directory is the **central repository** for MuJoCo models:
 Download from: https://huggingface.co/unitree-robotics/unitree_robots
 
 See `Assets/README.md` for usage patterns.
+
+## Implementation Status Tracking
+
+Foreman tracks cross-layer implementation status from `improvements/README.md`:
+
+### Current State (as of 2026-02-11)
+
+**FEP terrain-aware locomotion: ✅ COMPLETE**
+
+| Layer | Issue | Feature | Status |
+|-------|-------|---------|--------|
+| Layer 3 | [#11](https://github.com/Pangeon-Robotics/layer_3/issues/11) | KinematicState publisher | ✅ v2.1.0 |
+| Layer 4 | [#19](https://github.com/Pangeon-Robotics/layer_4/issues/19) | Simple terrain estimation | ✅ v0.13.0 |
+| Layer 5 | [#2](https://github.com/Pangeon-Robotics/layer_5/issues/2) | Terrain-aware gait selection | ✅ v0.6.0 |
+
+**Key insight**: Rule-based implementation complete. Used sensor heuristics instead of HNN (Layer 4 #18 rejected - learning violated stateless boundary).
+
+### Next Phase: Adding Learning
+
+**Planned improvements from `improvements/IMPLEMENTATION_PLAN.md`:**
+
+1. **Phase 1: Training Infrastructure** (Week 1-2)
+   - Location: `training/` repo (separate from layers)
+   - HNN dynamics model (JAX/Flax)
+   - RL locomotion policy (PyTorch/SB3)
+   - Status: Planned, not implemented
+
+2. **Phase 2: HNN Training and Layer 4 Deployment** (Week 3-5)
+   - HNN learns terrain dynamics offline
+   - Layer 4 receives frozen HNN model for prediction
+   - Respects stateless constraint (inference only, no online learning)
+
+3. **Phase 3: RL Policy Training and Layer 5 Deployment** (Week 6-10)
+   - RL learns gait selection offline
+   - Layer 5 receives frozen policy for gait selection
+   - Respects sequence nature (Layer 5 is stateful, can use RL)
+
+**Foreman's tracking responsibilities**:
+- ✅ Maintain this status section in CLAUDE.md as improvements are implemented
+- ✅ Verify integration tests pass after each phase
+- ✅ Document version compatibility requirements
+- ❌ Do NOT implement phases (layers implement, training/ trains)
+- ❌ Do NOT decide what to build next (improvements/ decides)
+
+See `improvements/README.md` and `improvements/IMPLEMENTATION_PLAN.md` for detailed plans.
 
 ## Critical Principles
 
@@ -307,12 +468,38 @@ From `philosophy/scope.md`:
 - **[philosophy/engineering.md](philosophy/engineering.md)** — Code structure: modularity, short files, no duplication
 
 ### Workflows
-When the user says "P <workflow>", execute the corresponding workflow from `philosophy/workflows/`:
-- **P fix-request** — File a GitHub issue in Layer N-1's repo (foreman doesn't file these; layers do)
-- **P resolve-issues** — Check for open issues, fix, test, close (applies to foreman's own issues)
-- **P compliance** — Self-check repo against philosophy docs (foreman should run this on itself)
 
-**Note**: Foreman coordinates these workflows but doesn't execute them on behalf of other repos. Each repo is sovereign and runs its own workflows.
+When the user says "P <workflow>", execute the corresponding workflow from `philosophy/workflows/`:
+
+| Workflow | File | Foreman's Role |
+|----------|------|----------------|
+| **P cascade** | `cascade.json` | **Track and validate** — Create cascade tracking file, monitor progress, run integration tests when complete. Do NOT file fix-requests or implement fixes. |
+| **P fix-request** | `fix-request.json` | **Guide only** — Foreman NEVER files fix-requests on behalf of layers. Each layer files their own. Foreman can validate format. |
+| **P resolve-issues** | `resolve-issues.json` | **Self-apply** — Foreman runs this on its own issues in the foreman repo. |
+| **P compliance** | `compliance.json` | **Self-apply** — Foreman checks itself against philosophy docs. Can also guide layers through this workflow. |
+
+**Key principle**: Foreman coordinates workflows but **never executes them on behalf of other repos**. Each repo is sovereign.
+
+**The Cascade Pattern** (see full guide in `docs/cascade_pattern.md`):
+1. **User reports issue** to Layer N
+2. **Layer N discovers** it needs Layer N-1 changes
+3. **Cascade flows down**:
+   - Layer N files fix-request to Layer N-1 (Layer N BLOCKED)
+   - Layer N-1 files fix-request to Layer N-2 (Layer N-1 BLOCKED)
+   - Continue until resolving layer reached
+4. **Cascade flows up**:
+   - Layer N-2 fixes, closes (Layer N-1 UNBLOCKS)
+   - Layer N-1 fixes, closes (Layer N UNBLOCKS)
+   - Layer N fixes, closes (User notified)
+5. **Foreman validates** integration tests ✅
+
+**Foreman's cascade tracking**:
+- Create: `cascades/active/<cascade-id>.md` (using template)
+- Monitor: Update as layers file fix-requests and close issues
+- Validate: Run integration tests when cascade completes
+- Archive: Move to `cascades/completed/` or `cascades/failed/`
+
+**Example**: See `cascades/completed/2026-02-terrain-aware-locomotion.md` for a complete cascade (Layer 5→4→3, then 3✓→4✓→5✓).
 
 ## Working Across Layers
 
@@ -533,8 +720,38 @@ scripts/                         # Add only when patterns demand it
 
 ---
 
+## Changelog
+
+### 2026-02-11 (Latest)
+**Added — Cascade Pattern Codification**:
+- **"The Cascade Pattern (Essential)"** section — primary coordination mechanism
+- `philosophy/workflows/cascade.json` — formal workflow definition
+- `cascades/` tracking system — active/, completed/, failed/ directories
+- `cascades/template.md` — template for tracking new cascades
+- `cascades/completed/2026-02-terrain-aware-locomotion.md` — real example
+- `docs/cascade_pattern.md` — comprehensive 500+ line guide
+- Enhanced "Workflows" section — cascade tracking responsibilities
+
+**Previously added**:
+- "Foreman's Coordination Responsibilities" section — explicit role in applying improvements
+- "Implementation Status Tracking" section — tracks progress from `improvements/README.md`
+- Enhanced "Improvements (Architectural Planning)" section — role with fix-requests
+- Explicit philosophy/ vs improvements/ distinction (principles vs proposals)
+
+**Key insights**:
+- Foreman is stage manager (sets context, validates), not director (doesn't implement or decide)
+- Cascades are the primary mechanism for cross-layer issue resolution
+- Issues flow down (5→4→3), fixes flow up (3✓→4✓→5✓), Foreman validates
+
+### 2026-02-11 (Initial)
+- Foreman repo created
+- Initial CLAUDE.md with workspace structure, layer architecture, and critical principles
+- `test_observation_chain.py` integration test established
+
+---
+
 **Foreman repo created**: 2026-02-11 (brand new — expect refinement based on usage)
-**Last updated**: 2026-02-11
+**Last updated**: 2026-02-11 (cascade pattern codified)
 **Architecture version**: 8-layer onion model
 **Workspace**: Multi-repo at `/Users/graham/code/robotics/`
 **This file location**: `foreman/CLAUDE.md` (provides workspace-level guidance)

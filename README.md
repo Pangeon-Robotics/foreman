@@ -7,8 +7,9 @@ Workspace coordination for the Unitree robotics control stack.
 **Foreman** coordinates work across multiple sovereign layer repositories. It provides:
 
 - **Workspace guidance** (CLAUDE.md) — How to navigate and work across all layers
+- **Cascade tracking** — Monitor cross-layer issue resolution flows
 - **Integration tests** — Cross-layer validation (e.g., `test_observation_chain.py`)
-- **Coordination scripts** — Tools for managing the multi-repo workspace
+- **Coordination workflows** — Tools for managing the multi-repo workspace
 
 **Not a layer**: Foreman doesn't implement any layer of the 8-layer architecture. It's the orchestration layer that helps developers and agents work effectively across the stack.
 
@@ -21,15 +22,32 @@ cd /Users/graham/code/robotics
 # Read workspace guidance
 cat foreman/CLAUDE.md
 
+# Understand the cascade pattern (essential!)
+cat foreman/docs/cascade_pattern.md
+
 # Run cross-layer integration tests
 python foreman/test_observation_chain.py
+
+# Track a new cascade
+cp foreman/cascades/template.md foreman/cascades/active/2026-XX-description.md
+# Fill in cascade details as layers file fix-requests
 ```
 
 ## Contents
 
+### Core Files
 - **CLAUDE.md** — Root-level guidance for Claude Code when working across all repositories
-- **test_observation_chain.py** — Integration test validating FEP Observation Chain architecture
 - **README.md** — This file
+- **test_observation_chain.py** — Integration test validating FEP Observation Chain architecture
+
+### Cascade Pattern (Essential)
+- **cascades/** — Tracking system for cross-layer issue resolution
+  - `README.md` — Cascade tracking documentation
+  - `template.md` — Template for new cascades
+  - `active/` — Currently in-progress cascades
+  - `completed/` — Successfully resolved cascades (includes real example)
+  - `failed/` — Failed cascades requiring escalation
+- **docs/cascade_pattern.md** — Comprehensive guide to the cascade pattern
 
 ## Repository Structure Context
 
@@ -57,13 +75,17 @@ Each layer is a sovereign Git repository. Foreman coordinates but doesn't contro
 
 **Foreman does:**
 - Provide workspace navigation guidance
+- Track cascade patterns (cross-layer issue resolution)
 - Run cross-layer integration tests
 - Coordinate multi-repo workflows
+- Validate integration when cascades complete
 
 **Foreman does NOT:**
 - Implement any layer functionality
+- File fix-requests on behalf of layers (sovereignty)
 - Edit files in other repositories (sovereignty rule)
 - Contain layer-specific logic
+- Rush layers to close issues faster
 
 See `philosophy/scope.md` for information economy principles.
 
