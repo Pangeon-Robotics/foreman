@@ -2,23 +2,63 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What This Repository Is
+## About This File
 
-This is a **multi-layer robotics control stack** for Unitree SDK2 robots (B2, Go2, H1, G1). The codebase implements an 8-layer onion architecture where each layer translates from one control language to another, following the OSI network model pattern.
+**This is workspace-level guidance** for operating across the entire Unitree robotics control stack at `/Users/graham/code/robotics/`. All paths in this document are relative to the workspace root, not to the `foreman/` directory where this file lives.
 
-**Repository structure**: Mono-repo containing separate implementations of Layers 1-5, plus a `philosophy/` directory with canonical architecture documentation and engineering principles compiled from 40+ postmortems.
+**Foreman's role**: This repository (foreman) provides workspace coordination, integration tests, and cross-repo guidance. It doesn't implement any layer functionality — each layer is a sovereign Git repository.
 
-## Mono-Repo Structure and Sovereignty
+## Foreman's Identity and Boundaries
 
-This directory contains **multiple sovereign layer implementations** that work together but remain separate:
+**What foreman IS** (capabilities, not tools):
+- **Coordinates** cross-repo workflows — provides navigation, not control
+- **Tests integration** — validates contracts between layers, doesn't fix violations
+- **Stage manager, not director** — sets context for work, doesn't make implementation decisions
 
+**Foreman's vocabulary** (from `philosophy/scope.md`):
+- Speaks in: "workspace", "coordination", "navigation", "integration", "sovereignty"
+- Does NOT use layer-specific vocabulary: "kinematics", "gaits", "IK", "firmware", "trajectories"
+- **Vocabulary test**: "Foreman coordinates navigation and integration testing across sovereign repositories." (one sentence, only foreman's words ✅)
+
+**What foreman CAN do:**
+- ✅ Read any repo for understanding interfaces and contracts
+- ✅ Maintain integration tests (e.g., `test_observation_chain.py`)
+- ✅ Update workspace guidance (CLAUDE.md, README.md in foreman repo only)
+- ✅ Coordinate workflows (reference `philosophy/workflows/`)
+
+**What foreman CANNOT do:**
+- ❌ NEVER edit files in other repos (layers_1_2/, layer_3/, philosophy/, Assets/, etc.)
+- ❌ NEVER implement layer functionality
+- ❌ NEVER fix violations directly — file fix-requests using `philosophy/workflows/fix-request.json`
+- ❌ NEVER create scaffolding or automation until actual needs emerge 3+ times
+
+**Scope discipline** (from `philosophy/scope.md`):
+- **Need-to-know**: Only maintain what's immediately required for coordination
+- **Minimal surface area**: Foreman's current structure (CLAUDE.md + test_observation_chain.py + README.md) is sufficient
+- **Let usage guide evolution**: Don't add scripts/ or features until patterns demand them
+
+**Validation status**: As of 2026-02-11, all paths verified correct, test_observation_chain.py works from new location.
+
+## What This Workspace Is
+
+This is a **multi-layer robotics control stack** for Unitree SDK2 robots (B2, Go2, H1, G1). The workspace implements an 8-layer onion architecture where each layer translates from one control language to another, following the OSI network model pattern.
+
+**Workspace structure**: Multi-repo workspace containing separate Git repositories for Layers 1-5, plus `philosophy/` (architecture docs), `training/` (offline ML), `improvements/` (planning), and `Assets/` (robot models). The `foreman/` repo coordinates across all repositories.
+
+## Multi-Repo Workspace and Sovereignty
+
+This workspace (`/Users/graham/code/robotics/`) contains **multiple sovereign Git repositories** that work together but remain separate:
+
+- **foreman/** (THIS REPO): Workspace coordination — integration tests, cross-repo guidance. Each directory below is a **separate Git repository** with its own `.git/`, commit history, and VERSION.
 - **Layers** (layers_1_2/, layer_3/, layer_4/, layer_5/): Each is a sovereign implementation with its own VERSION, CLAUDE.md, and API contract
 - **Philosophy** (philosophy/): Source of truth for architecture, principles, and workflows
 - **Training** (training/): Separate Git repository for offline ML training (HNN, RL)
 - **Improvements** (improvements/): Architectural planning and research proposals
 - **Assets** (Assets/): Shared MuJoCo robot models (layers_1_2/unitree_robots/ symlinks here)
 
-**Key principle**: Each layer has **agency, scope, and responsibility**. Layers may read other layers for reference but **NEVER edit files belonging to another layer**. To request changes, use `philosophy/workflows/fix-request.json`.
+**Key principle**: Each repository has **agency, scope, and responsibility**. Repositories may read other repos for reference but **NEVER edit files belonging to another repository**. To request changes, use `philosophy/workflows/fix-request.json`.
+
+**Git structure**: The workspace root is NOT a git repo. Each subdirectory (foreman/, philosophy/, layers_1_2/, etc.) is its own independent Git repository. Use `cd <repo> && git status` to work with individual repos.
 
 See `philosophy/scope.md` for information economy principles and `philosophy/boundaries.md` for boundary enforcement.
 
@@ -39,8 +79,10 @@ See `philosophy/scope.md` for information economy principles and `philosophy/bou
 
 ## Quick Start
 
+**Important**: All commands below assume you're working from the workspace root at `/Users/graham/code/robotics/`. If you're in the `foreman/` directory, use `cd ..` first.
+
 ```bash
-# Activate Python environment
+# Activate Python environment (from workspace root)
 source env/bin/activate
 
 # Run the full stack (two terminals)
@@ -52,12 +94,21 @@ cd layer_3 && python controller.py
 
 # Or run tests for a specific layer
 cd layer_3 && make test
+
+# Run workspace-level integration tests
+python foreman/test_observation_chain.py
 ```
 
-## Repository Structure
+## Workspace Structure
+
+**Multi-repo workspace layout** (each directory is a separate Git repository):
 
 ```
-/Users/graham/code/robotics/
+/Users/graham/code/robotics/          # Workspace root (not a git repo)
+├── foreman/             # THIS REPO: Workspace coordination
+│   ├── CLAUDE.md        # This file (workspace-level guidance)
+│   └── test_observation_chain.py  # Cross-layer integration test
+│
 ├── philosophy/          # Source of truth: architecture, principles, workflows
 │   ├── architecture.md  # Canonical 8-layer model
 │   ├── scope.md         # Need-to-know, vocabulary compression, agency
@@ -102,9 +153,10 @@ cd layer_3 && make test
 │   ├── meshes/          # 3D models by robot
 │   └── scenes/          # Reusable environments
 │
-├── test_observation_chain.py  # Integration test for FEP architecture
 └── env/                 # Python virtual environment
 ```
+
+**Note**: `test_observation_chain.py` lives in `foreman/` and is run from workspace root as `python foreman/test_observation_chain.py`.
 
 ## Common Commands
 
@@ -256,13 +308,21 @@ From `philosophy/scope.md`:
 
 ### Workflows
 When the user says "P <workflow>", execute the corresponding workflow from `philosophy/workflows/`:
-- **P fix-request** — File a GitHub issue in Layer N-1's repo
-- **P resolve-issues** — Check for open issues, fix, test, close
-- **P compliance** — Self-check repo against philosophy docs
+- **P fix-request** — File a GitHub issue in Layer N-1's repo (foreman doesn't file these; layers do)
+- **P resolve-issues** — Check for open issues, fix, test, close (applies to foreman's own issues)
+- **P compliance** — Self-check repo against philosophy docs (foreman should run this on itself)
+
+**Note**: Foreman coordinates these workflows but doesn't execute them on behalf of other repos. Each repo is sovereign and runs its own workflows.
 
 ## Working Across Layers
 
-When Claude operates in this repository:
+When Claude operates in this workspace:
+
+### If in foreman/ (THIS REPO):
+1. **Read philosophy/scope.md and philosophy/boundaries.md FIRST** — These are your north star for operating in the workspace
+2. **Coordinate, don't control** — Provide guidance and run integration tests; never implement layer features
+3. **Respect all repo sovereignty** — Read other repos for understanding, but NEVER edit their files
+4. **Minimal additions** — Before adding files/features to foreman, ask: "Does this coordinate, navigate, or test integration?"
 
 ### If in a specific layer directory (layer_3/, layer_4/, etc.):
 1. **Read that layer's CLAUDE.md first** — it defines scope, boundaries, and vocabulary
@@ -272,9 +332,9 @@ When Claude operates in this repository:
 
 ### If in root directory or cross-layer work:
 1. **Read philosophy/scope.md** — understand need-to-know and vocabulary compression
-2. **Identify which layer owns the work** — don't mix layer concerns
-3. **Route to appropriate layer** — each layer has its own agent context
-4. **Use workflows** — `P compliance`, `P fix-request`, `P resolve-issues`
+2. **Read foreman/CLAUDE.md** — this file provides workspace navigation
+3. **Identify which layer owns the work** — don't mix layer concerns
+4. **Route to appropriate layer** — each layer has its own agent context
 
 ### Information flow direction:
 - **Commands flow down** (Layer 5 → 4 → 3 → 2 → 1)
@@ -302,10 +362,11 @@ cd layer_3 && pytest tests/test_controller.py -v
 
 ### Cross-Layer Integration Tests
 
-**test_observation_chain.py** — Root-level test validating the FEP Observation Chain:
+**foreman/test_observation_chain.py** — Workspace-level test validating the FEP Observation Chain:
 
 ```bash
-python test_observation_chain.py
+# From workspace root
+python foreman/test_observation_chain.py
 ```
 
 Tests:
@@ -314,7 +375,7 @@ Tests:
 - FEP "explain away" pattern (error propagation upward)
 - Latency constraints across layers
 
-This is a **cross-layer integration test** — individual layers have their own unit tests in their own directories.
+This is a **cross-layer integration test** maintained in the foreman repo. Individual layers have their own unit tests in their own directories.
 
 ### Manual Exploration
 ```bash
@@ -436,6 +497,32 @@ From `philosophy/engineering.md`:
 4. **Explicit code** — Named constants with units, visible imports
 5. **Composition over inheritance** — Use protocols, not class hierarchies
 
+## Foreman Evolution
+
+**Current structure** (sufficient as of 2026-02-11):
+```
+foreman/
+├── CLAUDE.md                    # Workspace guidance (this file)
+├── README.md                    # Foreman scope documentation
+├── test_observation_chain.py    # Cross-layer FEP integration test
+└── .git/                        # Git repository
+```
+
+**When to add features** (from `philosophy/scope.md`):
+- **Compression test**: Can you remove it and foreman still does its job? If yes, don't add it.
+- **3+ usage rule**: If you find yourself doing the same cross-repo task 3+ times, consider automation
+- **Capability-oriented**: Ask "what capability does this enable?" not "what tool should I add?"
+
+**Potential future additions** (only when actual needs emerge):
+```
+scripts/                         # Add only when patterns demand it
+├── workspace_health.sh          # If you check git status across repos 3+ times
+├── version_report.sh            # If you query VERSION files 3+ times
+└── dependency_check.sh          # If you verify deps 3+ times
+```
+
+**Golden rule**: Foreman is brand new (created 2026-02-11). Let usage patterns guide evolution. Don't create scaffolding for hypothetical needs.
+
 ## Additional Resources
 
 - **[philosophy/gotchas.md](philosophy/gotchas.md)** — Lessons from 40+ postmortems
@@ -446,6 +533,10 @@ From `philosophy/engineering.md`:
 
 ---
 
+**Foreman repo created**: 2026-02-11 (brand new — expect refinement based on usage)
 **Last updated**: 2026-02-11
 **Architecture version**: 8-layer onion model
+**Workspace**: Multi-repo at `/Users/graham/code/robotics/`
+**This file location**: `foreman/CLAUDE.md` (provides workspace-level guidance)
+**Philosophy docs**: Read `philosophy/scope.md` and `philosophy/boundaries.md` as north star
 **Applies to**: Unitree SDK2 robots (B2, Go2, G1, H1)
