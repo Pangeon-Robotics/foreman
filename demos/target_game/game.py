@@ -13,13 +13,14 @@ from .target import TargetSpawner
 
 CONTROL_DT = 0.01          # 100 Hz
 STARTUP_SETTLE = 1.5       # seconds (0.5s ramp + 1.0s stabilize)
-WALK_SPEED = 0.3            # m/s forward
+WALK_SPEED = 1.0            # m/s forward (increased with higher PD gains)
 KP_YAW = 2.0               # proportional yaw gain
-HEADING_FULL_SPEED = 0.5    # rad — below this, walk at full speed
-HEADING_SLOW_SPEED = 1.2    # rad — above this, walk at minimum speed
-WALK_SPEED_MIN = 0.1        # m/s — slow walk when heading error is large
+HEADING_FULL_SPEED = 0.35   # rad — tighter alignment for full speed (archive: 0.35)
+HEADING_SLOW_SPEED = 0.79   # rad — switch to slow earlier (archive: walk_to_turn=0.79)
+HEADING_TURN_ONLY = 1.2     # rad — above this, stop and turn in place
+WALK_SPEED_MIN = 0.3        # m/s — faster minimum speed
 REACH_DISTANCE = 0.5        # m
-TARGET_TIMEOUT_STEPS = 12000 # 120 seconds at 100 Hz (turning is slow)
+TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz (faster with improved locomotion)
 TELEMETRY_INTERVAL = 100    # steps between prints (1 Hz at 100 Hz)
 
 
@@ -66,8 +67,8 @@ class TargetGame:
         self,
         sim,
         num_targets: int = 5,
-        min_dist: float = 1.0,
-        max_dist: float = 2.0,
+        min_dist: float = 3.0,
+        max_dist: float = 6.0,
         reach_threshold: float = 0.5,
         timeout_steps: int = TARGET_TIMEOUT_STEPS,
         seed: int | None = None,
@@ -182,7 +183,10 @@ class TargetGame:
 
         # Scale forward speed by alignment: full speed when aligned, slow when misaligned
         abs_err = abs(heading_err)
-        if abs_err < HEADING_FULL_SPEED:
+        if abs_err > HEADING_TURN_ONLY:
+            # Very large heading error — stop and turn in place to avoid walking away
+            vx = 0.0
+        elif abs_err < HEADING_FULL_SPEED:
             vx = WALK_SPEED
         elif abs_err > HEADING_SLOW_SPEED:
             vx = WALK_SPEED_MIN
