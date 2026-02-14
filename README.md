@@ -16,8 +16,8 @@ Workspace coordination for the Unitree robotics control stack.
 ## Quick Start
 
 ```bash
-# From the parent workspace directory:
-cd /Users/graham/code/robotics
+# From the parent workspace directory (one level above foreman/):
+cd ..
 
 # Read workspace guidance
 cat foreman/CLAUDE.md
@@ -54,7 +54,7 @@ cp foreman/cascades/template.md foreman/cascades/active/2026-XX-description.md
 The foreman repo sits at the coordination level:
 
 ```
-/Users/graham/code/robotics/
+<workspace-root>/
 ├── foreman/              # This repo (workspace coordination)
 │   ├── CLAUDE.md         # Cross-repo guidance
 │   └── test_observation_chain.py

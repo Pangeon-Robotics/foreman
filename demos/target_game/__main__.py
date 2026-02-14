@@ -21,7 +21,7 @@ from pathlib import Path
 # Also replace Layer 4's load_config call in the constructor to use the
 # pre-loaded config.
 # ---------------------------------------------------------------------------
-_root = Path(__file__).resolve().parents[3]  # /home/graham/code/robotics
+_root = Path(__file__).resolve().parents[3]  # workspace root
 _layer5 = str(_root / "layer_5")
 _layer4 = str(_root / "layer_4")
 _layer3 = str(_root / "layer_3")
