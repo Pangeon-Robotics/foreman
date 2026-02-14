@@ -25,10 +25,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ✅ Maintain integration tests (e.g., `test_observation_chain.py`)
 - ✅ Update workspace guidance (CLAUDE.md, README.md in foreman repo only)
 - ✅ Coordinate workflows (reference `philosophy/workflows/`)
+- ✅ **Delegate layer work to agents** — spawn a subagent that operates *within* the target layer's directory, reads its CLAUDE.md, and works under its sovereignty (see "Agent Delegation" below)
 
 **What foreman CANNOT do:**
-- ❌ NEVER edit files in other repos (layers_1_2/, layer_3/, philosophy/, Assets/, etc.)
-- ❌ NEVER implement layer functionality
+- ❌ NEVER edit files in other repos directly — delegate to a layer agent instead
+- ❌ NEVER implement layer functionality from foreman's context
 - ❌ NEVER fix violations directly — file fix-requests using `philosophy/workflows/fix-request.json`
 - ❌ NEVER create scaffolding or automation until actual needs emerge 3+ times
 
@@ -510,6 +511,31 @@ When Claude operates in this workspace:
 2. **Coordinate, don't control** — Provide guidance and run integration tests; never implement layer features
 3. **Respect all repo sovereignty** — Read other repos for understanding, but NEVER edit their files
 4. **Minimal additions** — Before adding files/features to foreman, ask: "Does this coordinate, navigate, or test integration?"
+
+### Agent Delegation for Layer Work (Essential)
+
+**When the user asks Foreman to do work in a layer, Foreman MUST spawn a subagent that operates within that layer.** Foreman never reaches into a layer to edit files directly — it delegates to an agent that becomes a native worker in that layer's context.
+
+**Every layer agent prompt MUST include:**
+1. `cd` to the layer's directory first (e.g., `cd /home/graham/code/robotics/layer_5`)
+2. Read the layer's `CLAUDE.md` before doing anything
+3. The specific task to accomplish
+4. Sovereignty reminder: never edit files outside this layer; if you need changes in a lower layer, report back
+
+**Workflow routing for layer agents:**
+- **Resolve issues** → agent follows `../philosophy/workflows/resolve-issues.json`
+- **Run compliance** → agent follows `../philosophy/workflows/compliance.json`
+- **General work** → agent reads layer's CLAUDE.md and proceeds
+
+**When Foreman needs a layer to fix something** (e.g., cascade dependency):
+- Foreman follows `philosophy/workflows/fix-request.json` to file the request
+- Foreman does NOT spawn an agent to make the fix — it files a request, respecting sovereignty
+
+**Rules:**
+- ✅ One agent per layer — never spawn one agent across multiple layers
+- ✅ Agent reads the **layer's** CLAUDE.md, not foreman's
+- ❌ Never have Foreman edit layer files directly, even "just a small fix"
+- ❌ Never give the agent instructions that contradict the layer's CLAUDE.md
 
 ### If in a specific layer directory (layer_3/, layer_4/, etc.):
 1. **Read that layer's CLAUDE.md first** — it defines scope, boundaries, and vocabulary
