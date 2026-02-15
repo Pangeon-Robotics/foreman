@@ -13,12 +13,14 @@ from .target import TargetSpawner
 
 CONTROL_DT = 0.01          # 100 Hz
 STARTUP_SETTLE = 1.5       # seconds (0.5s ramp + 1.0s stabilize)
-WALK_SPEED = 1.0            # m/s forward (increased with higher PD gains)
+WALK_SPEED = 1.0            # m/s forward
 KP_YAW = 2.0               # proportional yaw gain
-HEADING_FULL_SPEED = 0.35   # rad — tighter alignment for full speed (archive: 0.35)
-HEADING_SLOW_SPEED = 0.79   # rad — switch to slow earlier (archive: walk_to_turn=0.79)
-HEADING_TURN_ONLY = 1.2     # rad — above this, stop and turn in place
-WALK_SPEED_MIN = 0.3        # m/s — faster minimum speed
+WZ_CLAMP = 2.0              # max angular velocity command (rad/s)
+HEADING_FULL_SPEED = 0.30   # rad — below this, full forward speed
+HEADING_SLOW_SPEED = 0.50   # rad — above this, minimum forward speed
+HEADING_TURN_ONLY = 0.79    # rad — above this, stop and turn in place (~45 deg)
+HEADING_HYSTERESIS = 0.15   # rad — gap for exiting turn-only (avoids oscillation)
+WALK_SPEED_MIN = 0.15       # m/s — creep speed when misaligned (prevents walking away)
 REACH_DISTANCE = 0.5        # m
 TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz (faster with improved locomotion)
 TELEMETRY_INTERVAL = 100    # steps between prints (1 Hz at 100 Hz)
@@ -92,6 +94,7 @@ class TargetGame:
         self._target_step_count = 0
         self._startup_steps = 0
         self._startup_total = int(STARTUP_SETTLE / CONTROL_DT)
+        self._in_turn_only = False  # hysteresis state for turn-in-place
 
     def _get_robot_pose(self) -> tuple[float, float, float]:
         """Return (x, y, yaw) from simulation."""
@@ -152,6 +155,7 @@ class TargetGame:
         target = self._spawner.spawn_relative(x, y, yaw)
         self._target_index += 1
         self._target_step_count = 0
+        self._in_turn_only = False
         self._stats.targets_spawned += 1
 
         # Move visual target marker (mocap body) to target position
@@ -179,19 +183,26 @@ class TargetGame:
 
         heading_err = target.heading_error(x, y, yaw)
         dist = target.distance_to(x, y)
-        wz = _clamp(KP_YAW * heading_err, -1.0, 1.0)
+        wz = _clamp(KP_YAW * heading_err, -WZ_CLAMP, WZ_CLAMP)
 
-        # Scale forward speed by alignment: full speed when aligned, slow when misaligned
+        # Hysteresis for turn-in-place: enter at HEADING_TURN_ONLY, exit at
+        # HEADING_TURN_ONLY - HEADING_HYSTERESIS to avoid oscillation
         abs_err = abs(heading_err)
-        if abs_err > HEADING_TURN_ONLY:
-            # Very large heading error — stop and turn in place to avoid walking away
+        if self._in_turn_only:
+            if abs_err < HEADING_TURN_ONLY - HEADING_HYSTERESIS:
+                self._in_turn_only = False
+        else:
+            if abs_err > HEADING_TURN_ONLY:
+                self._in_turn_only = True
+
+        # Scale forward speed by alignment
+        if self._in_turn_only:
             vx = 0.0
         elif abs_err < HEADING_FULL_SPEED:
             vx = WALK_SPEED
         elif abs_err > HEADING_SLOW_SPEED:
             vx = WALK_SPEED_MIN
         else:
-            # Linear interpolation between full and minimum speed
             t = (abs_err - HEADING_FULL_SPEED) / (HEADING_SLOW_SPEED - HEADING_FULL_SPEED)
             vx = WALK_SPEED - t * (WALK_SPEED - WALK_SPEED_MIN)
 
