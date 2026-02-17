@@ -74,11 +74,13 @@ class TargetGame:
         reach_threshold: float = 0.5,
         timeout_steps: int = TARGET_TIMEOUT_STEPS,
         seed: int | None = None,
+        angle_range: tuple[float, float] = (-math.pi / 2, math.pi / 2),
     ):
         self._sim = sim
         self._num_targets = num_targets
         self._reach_threshold = reach_threshold
         self._timeout_steps = timeout_steps
+        self._angle_range = angle_range
 
         self._spawner = TargetSpawner(
             min_distance=min_dist,
@@ -152,7 +154,7 @@ class TargetGame:
             return
 
         x, y, yaw = self._get_robot_pose()
-        target = self._spawner.spawn_relative(x, y, yaw)
+        target = self._spawner.spawn_relative(x, y, yaw, angle_range=self._angle_range)
         self._target_index += 1
         self._target_step_count = 0
         self._in_turn_only = False

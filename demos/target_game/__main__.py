@@ -154,6 +154,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--genome", type=str, default=None,
                         help="Path to GA-evolved genome JSON file")
+    parser.add_argument("--full-circle", action="store_true",
+                        help="Spawn targets at any angle (uniform -π to π)")
     parser.add_argument("--domain", type=int, default=None,
                         help="DDS domain ID (avoids conflict with running firmware)")
     args = parser.parse_args()
@@ -188,10 +190,13 @@ def main():
     )
     sim.start()
     try:
+        import math
+        angle_range = (-math.pi, math.pi) if args.full_circle else (-math.pi / 2, math.pi / 2)
         game = TargetGame(
             sim,
             num_targets=args.targets,
             seed=args.seed,
+            angle_range=angle_range,
         )
         stats = game.run()
         print(f"\nFinal: {stats.targets_reached}/{stats.targets_spawned} "
