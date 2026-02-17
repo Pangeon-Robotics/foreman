@@ -90,8 +90,11 @@ Cross-layer integration demo that spawns random targets and drives the robot to 
 python -m foreman.demos.target_game --robot b2 --targets 5
 python -m foreman.demos.target_game --robot b2 --targets 3 --headless
 python -m foreman.demos.target_game --robot b2 --seed 42  # Reproducible
+python -m foreman.demos.target_game --robot b2 --full-circle  # 360° target spawning
+python -m foreman.demos.target_game --robot b2 --genome path/to/genome.json  # GA-evolved params
+python -m foreman.demos.target_game --robot b2 --domain 2  # Separate DDS domain (avoids firmware conflicts)
 ```
-Runs Layers 1-5 together. Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time.
+Runs Layers 1-5 together. Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time (see gotcha below).
 
 ### Troubleshooting
 ```bash
@@ -147,6 +150,10 @@ MuJoCo and DDS use different orderings. **Forgetting this causes immediate robot
 - Use `dds_init(domain_id=1, interface="lo")` from `dds.py`
 - Domain IDs: 1 = simulation, 0 = real robot
 - CRC required: call `stamp_cmd(cmd)` before every `pub.Write(cmd)`
+- **CycloneDDS preload**: The pip-installed cyclonedds (0.10.5) bundles an incompatible `libddsc`. Target game `__main__.py` preloads the system `libddsc.so.0.10.4` via `ctypes.CDLL` before any DDS imports. If you see DDS segfaults, check this preload path.
+
+### Cross-Layer Config Namespace Collision
+Layers 3, 4, and 5 each have a `config/` package. When imported into the same process (e.g., target game), `importlib.import_module("config.b2")` resolves to the wrong layer's config via `sys.modules`. The target game `__main__.py` works around this by loading each layer's config by file path and injecting into `_active_config` globals. If adding new cross-layer demos, follow the same pattern.
 
 ### Hardware Abstraction
 **Allowed** (available on real robot): joint encoders (`motor_state[i].q`, `.dq`, `.tau_est`), IMU, foot contact forces
