@@ -191,7 +191,11 @@ def main():
     sim.start()
     try:
         import math
-        angle_range = (-math.pi, math.pi) if args.full_circle else (-math.pi / 2, math.pi / 2)
+        if args.full_circle:
+            angle_range = (-math.pi, math.pi)
+        else:
+            # Exclude front cone (±30°): spawn to the sides and behind
+            angle_range = [(math.pi / 6, math.pi), (-math.pi, -math.pi / 6)]
         game = TargetGame(
             sim,
             num_targets=args.targets,

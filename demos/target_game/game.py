@@ -74,7 +74,7 @@ class TargetGame:
         reach_threshold: float = 0.5,
         timeout_steps: int = TARGET_TIMEOUT_STEPS,
         seed: int | None = None,
-        angle_range: tuple[float, float] = (-math.pi / 2, math.pi / 2),
+        angle_range: tuple[float, float] | list[tuple[float, float]] = (-math.pi / 2, math.pi / 2),
     ):
         self._sim = sim
         self._num_targets = num_targets

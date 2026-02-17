@@ -65,11 +65,26 @@ class TargetSpawner:
         robot_x: float,
         robot_y: float,
         robot_yaw: float,
-        angle_range: tuple[float, float] = (-math.pi / 2, math.pi / 2),
+        angle_range: tuple[float, float] | list[tuple[float, float]] = (-math.pi / 2, math.pi / 2),
     ) -> Target:
-        """Spawn target in forward half-plane relative to robot heading."""
+        """Spawn target relative to robot heading.
+
+        angle_range can be a single (lo, hi) tuple or a list of such tuples
+        for disjoint ranges. When multiple ranges are given, one is chosen
+        at random weighted by its arc length.
+        """
         distance = self._rng.uniform(self.min_distance, self.max_distance)
-        relative_angle = self._rng.uniform(angle_range[0], angle_range[1])
+
+        # Normalize to list of ranges
+        if isinstance(angle_range, list):
+            ranges = angle_range
+        else:
+            ranges = [angle_range]
+
+        # Pick a range weighted by arc length, then sample uniformly within it
+        weights = [hi - lo for lo, hi in ranges]
+        chosen = self._rng.choices(ranges, weights=weights, k=1)[0]
+        relative_angle = self._rng.uniform(chosen[0], chosen[1])
         world_angle = robot_yaw + relative_angle
 
         target_x = robot_x + distance * math.cos(world_angle)
