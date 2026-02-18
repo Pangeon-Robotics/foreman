@@ -200,3 +200,23 @@ Test gains: kp=500, kd=25. Production gains (kp=2500) cause oscillation in simul
 - `philosophy/gotchas.md` — Lessons from 40+ postmortems
 - `improvements/IMPLEMENTATION_PLAN.md` — Next phase planning (HNN/RL)
 - Each layer's own `CLAUDE.md` — Authoritative for that layer's development
+
+## Cross-Repo Shared Utilities
+
+`foreman/demos/target_game/utils.py` is the canonical location for cross-layer utilities that multiple repos need. Currently provides: `quat_to_yaw`, `quat_to_rpy`, `normalize_angle`, `clamp`, `load_module_by_path`, `patch_layer_configs`.
+
+Training imports from here (`from foreman.demos.target_game.utils import ...`). Never duplicate these functions into other repos. If a new cross-layer utility is needed, add it to utils.py and import it.
+
+The DDS preload has a separate canonical location per repo: `training/ga/dds_preload.py` for training, inline in `__main__.py` for foreman. This is intentional — the preload must happen before any DDS imports, and the two repos have different boot sequences.
+
+## Lessons from GA Fitness Exploit (Issue 002)
+
+The GA discovered a degenerate strategy (backward arc-trotting to earn turn rewards) that exposed fundamental fitness function design flaws. Key principles learned:
+
+**Multiplicative gating, not additive penalties.** When a constraint must be conjunctive (robot must be still AND turning correctly), multiply the reward by a gate. Additive penalties fight rewards at a fixed exchange rate that the optimizer will find and exploit. `reward * gate` makes the exploit structurally impossible — violating the constraint zeros the reward entirely.
+
+**Biomechanical coupling as repair, not penalty.** Physical constraints like minimum stance time (120ms for B2's mass) should be enforced by repairing genomes after mutation/crossover, not by fitness penalties the optimizer can trade against.
+
+**Behavioral observability during training.** Per-generation JSONL telemetry, bound convergence alerts (>30% of population at a bound = WARNING), and behavioral sanity checks (turn translational speed > 0.30 m/s = CRITICAL) catch exploits during training rather than during demos.
+
+**The cascade pattern works for deduplication, not just layer issues.** When code is duplicated across repos, initiate a cascade: the provider repo (usually foreman for cross-layer utilities) extracts the canonical version, then consumer repos replace copies with imports. See `cascades/completed/2026-02-cross-repo-utility-dedup.md`.

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from .target import TargetSpawner
+from .utils import quat_to_yaw as _quat_to_yaw, clamp as _clamp
 
 
 # --- Game constants ---
@@ -46,16 +47,6 @@ class GameStatistics:
         if self.targets_spawned == 0:
             return 0.0
         return self.targets_reached / self.targets_spawned
-
-
-def _quat_to_yaw(quat) -> float:
-    """Extract yaw from [w, x, y, z] quaternion."""
-    w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
-    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-
-
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
 
 
 class TargetGame:

@@ -10,7 +10,6 @@ if _os.path.exists(_SYS_DDSC):
     _ctypes.CDLL(_SYS_DDSC, mode=_ctypes.RTLD_GLOBAL)
 
 import argparse
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -32,8 +31,6 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 _root = Path(__file__).resolve().parents[3]  # workspace root
 _layer5 = str(_root / "layer_5")
-_layer4 = str(_root / "layer_4")
-_layer3 = str(_root / "layer_3")
 
 if _layer5 not in sys.path:
     sys.path.insert(0, _layer5)
@@ -43,50 +40,7 @@ from simulation import SimulationManager
 from config.defaults import MotionCommand  # noqa: F401 — captured for game.py
 
 from .game import TargetGame
-
-
-def _load_module_by_path(name: str, path: str):
-    """Load a Python module by file path without polluting sys.modules."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _patch_layer_configs(robot: str) -> None:
-    """Pre-populate _active_config for Layer 3 and Layer 4 config modules.
-
-    After Layer 5's import-time swap, each layer's get_active_config() function
-    has _active_config=None in its globals. When called at runtime, it tries
-    importlib.import_module("config.b2") which collides between layers.
-
-    We bypass this by:
-    1. Loading each layer's config/b2.py directly by file path
-    2. Injecting the result into get_active_config's __globals__["_active_config"]
-    3. Replacing Layer 4's _load_l4_config with a no-op (config already cached)
-    """
-    # Load each layer's config/robot.py by file path (no sys.modules)
-    l3_b2 = _load_module_by_path(
-        "_l3_config_b2", str(Path(_layer3) / "config" / f"{robot}.py"))
-    l4_b2 = _load_module_by_path(
-        "_l4_config_b2", str(Path(_layer4) / "config" / f"{robot}.py"))
-
-    # Patch Layer 3's config: policy.cartesian and ik share the same globals
-    cart_mod = sys.modules.get("policy.cartesian")
-    if cart_mod and hasattr(cart_mod, "get_active_config"):
-        cart_mod.get_active_config.__globals__["_active_config"] = l3_b2
-
-    # Patch Layer 4's config: generator uses its own config globals
-    gen_mod = sys.modules.get("generator")
-    if gen_mod and hasattr(gen_mod, "get_active_config"):
-        gen_mod.get_active_config.__globals__["_active_config"] = l4_b2
-
-    # Replace Layer 4's _load_l4_config with a no-op — config is already cached.
-    # Without this, Layer 4's SimulationManager.__init__ calls load_config(robot)
-    # which does importlib.import_module("config.b2") and gets the wrong one.
-    l4_sim = sys.modules.get("_l4_simulation")
-    if l4_sim:
-        l4_sim._load_l4_config = lambda robot: l4_b2
+from .utils import load_module_by_path, patch_layer_configs
 
 
 def _apply_genome(genome_path: str) -> None:
@@ -167,7 +121,7 @@ def main():
         _apply_genome(args.genome)
 
     # Pre-populate config caches to avoid runtime namespace collision
-    _patch_layer_configs(args.robot)
+    patch_layer_configs(args.robot, Path(_root))
 
     # If --domain specified, monkey-patch FirmwareLauncher to use it
     # (avoids DDS session conflict with other running firmware)
