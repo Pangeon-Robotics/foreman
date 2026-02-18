@@ -164,6 +164,24 @@ Layers 3, 4, and 5 each have a `config/` package. When imported into the same pr
 - Never use `if simulation:` branches — controller code must be identical for real and simulated robots
 - Each layer uses only sensors/data available on real hardware
 
+### Target Visualization (IMPORTANT — do not use plain red sphere)
+When rendering targets in headed MuJoCo demos, **always use the glowing golden marker** from `layers_1_2/run_modes.py:draw_target()`. It renders a multi-layered glowing sphere with core, inner/outer glow, ground illumination, and light rays via `mjv_initGeom` on `viewer.user_scn`.
+
+```python
+from run_modes import draw_target  # layers_1_2/run_modes.py
+
+# Hide the red mocap sphere (make transparent)
+target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target")
+for gid in range(model.ngeom):
+    if model.geom_bodyid[gid] == target_body_id:
+        model.geom_rgba[gid] = [0, 0, 0, 0]
+
+# In render loop: clear user_scn, draw golden target, sync
+viewer.user_scn.ngeom = 0
+draw_target(viewer, target_x, target_y)
+viewer.sync()
+```
+
 ### Simulation Gains
 Test gains: kp=500, kd=25. Production gains (kp=2500) cause oscillation in simulation.
 
