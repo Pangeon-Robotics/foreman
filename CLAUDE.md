@@ -220,3 +220,9 @@ The GA discovered a degenerate strategy (backward arc-trotting to earn turn rewa
 **Behavioral observability during training.** Per-generation JSONL telemetry, bound convergence alerts (>30% of population at a bound = WARNING), and behavioral sanity checks (turn translational speed > 0.30 m/s = CRITICAL) catch exploits during training rather than during demos.
 
 **The cascade pattern works for deduplication, not just layer issues.** When code is duplicated across repos, initiate a cascade: the provider repo (usually foreman for cross-layer utilities) extracts the canonical version, then consumer repos replace copies with imports. See `cascades/completed/2026-02-cross-repo-utility-dedup.md`.
+
+## Lessons from GA Stdout Buffering (Issue 003)
+
+When running `nohup python ... > logfile 2>&1`, Python uses full buffering for stdout (~8KB buffer). In multiprocessing pipelines (`mp.get_context("spawn")`), worker processes have their own PIDs and flush independently, but the main process's Gen/summary lines stay in the buffer. If the process is killed, those lines are lost — making it look like no generations completed when they actually did. Fix: `sys.stdout.reconfigure(line_buffering=True)` at pipeline start. Also avoid noisy per-genome prints from workers (128 interleaved lines per gen from 20 workers obscures actual progress). See `philosophy/gotchas.md` for the full postmortem.
+
+**Config key validation prevents silent zeroing.** `dict.get(key, 0.0)` silently returns 0.0 for mismatched keys. The v6 config used `"fall_penalty"` but the accumulator used `"fall"`, disabling fall penalty for an entire run. Always validate config weight keys against accumulator keys at startup.
