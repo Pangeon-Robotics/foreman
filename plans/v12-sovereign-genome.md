@@ -140,9 +140,41 @@ Key patterns:
    lower frequencies. Watch for mean_turn_rate improvements.
 5. **Turn-obsessive (76% of time turning)** — with targets at 60-150° offset and slow
    turn rate (0.28 rad/s), most time is spent turning. Will improve as turn genes evolve.
-6. **ATB stagnation at gen 33 on puget** — best hasn't improved since gen 4. This may
-   be because the gen 4 champion found a heading_progress-heavy strategy that's hard
-   to beat without better closing_speed (which requires good turn→walk transitions).
+6. **ATB stagnation at gen 33 on puget** — best hasn't improved since gen 4. Root cause:
+   heading_progress oscillation exploit (see below).
+
+### 2026-02-19: Heading progress oscillation exploit (Issue 002 pattern)
+
+**Discovered**: The gen 4 champion (fitness 288.3) earned 91% of fitness from
+heading_progress by oscillating — turning back and forth, earning credit each time
+|heading_err| decreases. The champion earned 17.5 rad of heading progress per target,
+when the maximum physically meaningful heading correction is π ≈ 3.14 rad.
+
+**Root cause**: heading_progress accumulated without any per-target cap. Each step where
+|heading_err| decreased earned reward, even if the robot oscillated past zero and back.
+With weight 15 and no cap, a dedicated oscillator could earn 262 fitness from heading
+alone, making closing_speed (weight 40, max ~20 realistic) irrelevant.
+
+**Fix**: Cap `target_heading_progress` at π per target. Max heading_progress fitness is
+now 15 * π ≈ 47.1 instead of unbounded. This makes heading_progress comparable to
+closing_speed instead of dominating.
+
+**Lesson**: This is the exact same exploit pattern as Issue 002 (backward-trotting for
+turn rewards). Whenever a fitness term accumulates over time without a cap, the GA will
+find a way to maximize time spent earning that term. Caps should be set at the maximum
+physically meaningful value.
+
+### 2026-02-19: Post-cap observations (gen 0-40)
+
+After restarting with the heading_progress π cap:
+- **Puget**: Gen 40, ATB=92.6 at gen 2. Mean fitness 52→56 (climbing). ~5s/gen.
+- **Bizon**: Gen 17, ATB=96.4 at gen 11 (bizon leading!). Mean fitness 52→63.
+- heading_progress now 42-47% of fitness (was 91%) — healthy balance
+- No more inflated outlier fitness values (was 288, now max ~96)
+- Turn-obsessive (71-75%) is real but expected: targets at 60-150° offset require
+  significant turning before walking
+- Bound camping on 5 params: GAIT_FREQ→max, STANCE_WIDTH→min, WZ_LIMIT→min,
+  TURN_FREQ→min, TURN_DUTY_CYCLE→min — clear genetic pressure at boundaries
 
 ### Server details
 
