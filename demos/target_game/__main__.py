@@ -39,6 +39,10 @@ if _layer5 not in sys.path:
 from simulation import SimulationManager
 from config.defaults import MotionCommand  # noqa: F401 — captured for game.py
 
+# Get L4 GaitParams (Layer 5 registers _l4_simulation at import time)
+_l4_sim = sys.modules["_l4_simulation"]
+L4GaitParams = _l4_sim.GaitParams
+
 from .game import TargetGame
 from .utils import load_module_by_path, patch_layer_configs
 
@@ -129,9 +133,9 @@ def _is_v10_genome(params: dict) -> bool:
 def _apply_genome(genome_path: str) -> None:
     """Load a GA-evolved genome JSON and patch game + Layer 5 parameters.
 
-    Detects v9 genomes (have "FREQ" key) and expands them to all Layer 5
-    constants. Patches steering constants in game.py and locomotion
-    constants in Layer 5's config.defaults + downstream modules.
+    v12+ genomes: dual patch — game module constants for L4-direct walk
+    control, plus L5 expansion for the startup/stand phase.
+    v9/v10 genomes: expand to L5 constants and patch L5 modules.
     """
     genome = json.loads(Path(genome_path).read_text())
 
@@ -144,15 +148,28 @@ def _apply_genome(genome_path: str) -> None:
         if group in genome:
             params.update(genome[group])
 
-    # v12 genomes: sovereign — expand to L5 constants (no joint angles)
-    # v10 genomes: expand walk params via v9 path, turn genes used directly
-    # v9 genomes: expand to all Layer 5 constants
+    from . import game as game_mod
+
     if _is_v12_genome(params):
+        # v12+ sovereign genome: dual patch
+
+        # 1. Patch game module constants for L4-direct walk/turn control
+        v12_game_params = [
+            "GAIT_FREQ", "STEP_LENGTH", "STEP_HEIGHT", "DUTY_CYCLE", "STANCE_WIDTH",
+            "KP_YAW", "WZ_LIMIT", "TURN_FREQ", "TURN_STEP_HEIGHT", "TURN_DUTY_CYCLE",
+            "TURN_STANCE_WIDTH", "TURN_WZ", "THETA_THRESHOLD",
+        ]
+        for name in v12_game_params:
+            if name in params:
+                setattr(game_mod, name, params[name])
+                print(f"  game.{name} = {params[name]:.4f}")
+
+        # 2. Expand to L5 constants for startup/stand phase (send_motion_command)
         expanded = _expand_v12_genome(params)
-        params = expanded
-        theta = genome.get("genome", {}).get("THETA_THRESHOLD", params.get("THETA_THRESHOLD", "?"))
-        turn_wz = genome.get("genome", {}).get("TURN_WZ", params.get("TURN_WZ", "?"))
+        theta = params.get("THETA_THRESHOLD", "?")
+        turn_wz = params.get("TURN_WZ", "?")
         print(f"  v12 sovereign genome: 13 genes, theta_threshold={theta}, turn_wz={turn_wz}")
+
     elif _is_v10_genome(params):
         # Extract walk subset (the 8 v9 params) for L5 expansion
         walk_keys = ["FREQ", "STEP_LENGTH", "STEP_HEIGHT", "DUTY_CYCLE",
@@ -163,23 +180,16 @@ def _apply_genome(genome_path: str) -> None:
         for k, v in params.items():
             if k not in expanded:
                 expanded[k] = v
-        params = expanded
         # Print turn gene summary
         turn_count = sum(1 for k in params if k.startswith(("P1_", "P2_")))
         timing = {k: params[k] for k in ["T_PHASE1", "T_PHASE2", "T_PHASE3"] if k in params}
         print(f"  v10 turn genes: {turn_count} joint deltas, timing={timing}")
-    elif "FREQ" in params:
-        params = _expand_v9_genome(params)
 
-    # Patch game module steering constants
-    from . import game as game_mod
-    steering_params = [
-        "KP_YAW", "WALK_SPEED", "WALK_SPEED_MIN", "TURN_WZ_LIMIT",
-    ]
-    for name in steering_params:
-        if name in params:
-            setattr(game_mod, name, params[name])
-            print(f"  game.{name} = {params[name]:.4f}")
+    elif "FREQ" in params:
+        expanded = _expand_v9_genome(params)
+
+    else:
+        expanded = params
 
     # Patch Layer 5 config.defaults and downstream modules
     locomotion_params = [
@@ -195,14 +205,14 @@ def _apply_genome(genome_path: str) -> None:
                        "transition", "terrain_gait"]
 
     for name in locomotion_params:
-        if name not in params:
+        if name not in expanded:
             continue
         if defaults_mod and hasattr(defaults_mod, name):
-            setattr(defaults_mod, name, params[name])
+            setattr(defaults_mod, name, expanded[name])
         for mod_name in downstream_mods:
             mod = sys.modules.get(mod_name)
             if mod and hasattr(mod, name):
-                setattr(mod, name, params[name])
+                setattr(mod, name, expanded[name])
 
     gen = genome.get("generation", "?")
     fitness = genome.get("fitness", "?")
@@ -218,7 +228,7 @@ def main():
     parser.add_argument("--genome", type=str, default=None,
                         help="Path to GA-evolved genome JSON file")
     parser.add_argument("--full-circle", action="store_true",
-                        help="Spawn targets at any angle (uniform -π to π)")
+                        help="Spawn targets at any angle (uniform -pi to pi)")
     parser.add_argument("--domain", type=int, default=None,
                         help="DDS domain ID (avoids conflict with running firmware)")
     args = parser.parse_args()
@@ -257,10 +267,11 @@ def main():
         if args.full_circle:
             angle_range = (-math.pi, math.pi)
         else:
-            # Exclude front cone (±30°): spawn to the sides and behind
+            # Exclude front cone (+/-30deg): spawn to the sides and behind
             angle_range = [(math.pi / 6, math.pi), (-math.pi, -math.pi / 6)]
         game = TargetGame(
             sim,
+            L4GaitParams=L4GaitParams,
             num_targets=args.targets,
             seed=args.seed,
             angle_range=angle_range,

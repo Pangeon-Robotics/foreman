@@ -14,12 +14,25 @@ from .utils import quat_to_yaw as _quat_to_yaw, clamp as _clamp
 
 CONTROL_DT = 0.01          # 100 Hz
 STARTUP_SETTLE = 1.5       # seconds (0.5s ramp + 1.0s stabilize)
-WALK_SPEED = 1.0            # m/s forward
-KP_YAW = 2.0               # proportional yaw gain
-TURN_WZ_LIMIT = 2.0         # max angular velocity command (rad/s)
 REACH_DISTANCE = 0.5        # m
-TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz (faster with improved locomotion)
+TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz
 TELEMETRY_INTERVAL = 100    # steps between prints (1 Hz at 100 Hz)
+
+# --- Genome parameters (patched by _apply_genome in __main__.py) ---
+
+GAIT_FREQ = 1.5
+STEP_LENGTH = 0.30
+STEP_HEIGHT = 0.08
+DUTY_CYCLE = 0.55
+STANCE_WIDTH = 0.0
+KP_YAW = 2.0
+WZ_LIMIT = 1.5
+TURN_FREQ = 1.0
+TURN_STEP_HEIGHT = 0.07
+TURN_DUTY_CYCLE = 0.55
+TURN_STANCE_WIDTH = 0.04
+TURN_WZ = 1.2
+THETA_THRESHOLD = 0.4
 
 
 class GameState(Enum):
@@ -48,12 +61,13 @@ class TargetGame:
     """Random target navigation game.
 
     Runs a state machine that spawns targets and drives the robot toward
-    them using continuous cos(heading_err) steering.
+    them using L4 GaitParams directly (same path as GA training).
     """
 
     def __init__(
         self,
         sim,
+        L4GaitParams=None,
         num_targets: int = 5,
         min_dist: float = 3.0,
         max_dist: float = 6.0,
@@ -63,10 +77,15 @@ class TargetGame:
         angle_range: tuple[float, float] | list[tuple[float, float]] = (-math.pi / 2, math.pi / 2),
     ):
         self._sim = sim
+        self._L4GaitParams = L4GaitParams
         self._num_targets = num_targets
         self._reach_threshold = reach_threshold
         self._timeout_steps = timeout_steps
         self._angle_range = angle_range
+
+        # Gains captured after startup ramp completes
+        self._kp = None
+        self._kd = None
 
         self._spawner = TargetSpawner(
             min_distance=min_dist,
@@ -82,7 +101,6 @@ class TargetGame:
         self._target_step_count = 0
         self._startup_steps = 0
         self._startup_total = int(STARTUP_SETTLE / CONTROL_DT)
-        # hysteresis state removed — using continuous cos(heading_err) steering
 
     def _get_robot_pose(self) -> tuple[float, float, float]:
         """Return (x, y, yaw) from simulation."""
@@ -92,16 +110,12 @@ class TargetGame:
         yaw = _quat_to_yaw(body.quat)
         return x, y, yaw
 
-    def _send_cmd(self, vx: float = 0.0, wz: float = 0.0, behavior: str = "walk"):
-        """Send a motion command through the simulation."""
-        # Lazy import: Layer 5's config.defaults must be on sys.path, which
-        # is set up by __main__.py before this method is ever called.
-        from config.defaults import MotionCommand
-        cmd = MotionCommand(vx=vx, wz=wz, behavior=behavior)
+    def _send_l4(self, params):
+        """Send L4 GaitParams directly to Layer 4 (bypassing L5)."""
         try:
-            self._sim.send_motion_command(cmd, dt=CONTROL_DT, terrain=False)
+            self._sim.send_command(params, self._sim._t, kp=self._kp, kd=self._kd)
+            self._sim._t += CONTROL_DT
         except RuntimeError:
-            # Firmware process exited — end the game gracefully
             print("Simulation stopped unexpectedly")
             self._state = GameState.DONE
 
@@ -122,19 +136,29 @@ class TargetGame:
         return self._state != GameState.DONE
 
     def _tick_startup(self):
-        """Send stand commands until ramp completes and settle time elapses."""
-        self._send_cmd(behavior="stand")
+        """Send stand commands via L5 until ramp completes and settle time elapses."""
+        from config.defaults import MotionCommand
+        cmd = MotionCommand(vx=0.0, wz=0.0, behavior="stand")
+        try:
+            self._sim.send_motion_command(cmd, dt=CONTROL_DT, terrain=False)
+        except RuntimeError:
+            print("Simulation stopped unexpectedly")
+            self._state = GameState.DONE
+            return
+
         self._startup_steps += 1
 
         ramp_done = not self._sim.is_ramping
         settle_done = self._startup_steps >= self._startup_total
 
         if ramp_done and settle_done:
-            print("Robot ready!")
+            # Capture final gains for L4-direct control
+            self._kp, self._kd = self._sim.locomotion.startup_gains()
+            print(f"Robot ready! (kp={self._kp:.0f}, kd={self._kd:.1f})")
             self._state = GameState.SPAWN_TARGET
 
     def _tick_spawn(self):
-        """Spawn a new target and transition to turning."""
+        """Spawn a new target and transition to walking."""
         if self._target_index >= self._num_targets:
             self._state = GameState.DONE
             return
@@ -158,11 +182,11 @@ class TargetGame:
         self._state = GameState.WALK_TO_TARGET
 
     def _tick_walk(self):
-        """Walk toward target with continuous cos(heading_err) steering.
+        """Walk toward target using L4 GaitParams directly.
 
-        Forward speed scales smoothly from WALK_SPEED (aligned) to 0
-        (perpendicular or beyond), while yaw rate is proportional to
-        heading error.  Matches the GA v9 evaluation steering model.
+        Matches GA training episode logic (episode.py:1771-1811):
+        - Large heading error -> turn in place (L4 arc mode)
+        - Small heading error -> walk with differential stride
         """
         x, y, yaw = self._get_robot_pose()
         target = self._spawner.current_target
@@ -171,17 +195,32 @@ class TargetGame:
         heading_err = target.heading_error(x, y, yaw)
         dist = target.distance_to(x, y)
 
-        # Continuous steering: cos modulates forward speed, P-control on yaw
-        vx = WALK_SPEED * max(0.0, math.cos(heading_err))
-        wz = _clamp(KP_YAW * heading_err, -TURN_WZ_LIMIT, TURN_WZ_LIMIT)
+        if abs(heading_err) > THETA_THRESHOLD:
+            # TURN IN PLACE — L4 arc mode (layer_4/generator.py:100-132)
+            wz = TURN_WZ if heading_err > 0 else -TURN_WZ
+            params = self._L4GaitParams(
+                gait_type='trot', turn_in_place=True, wz=wz,
+                gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
+                duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
+            )
+        else:
+            # WALK — L4 differential stride (layer_4/generator.py:134-164)
+            heading_mod = max(0.0, math.cos(heading_err))
+            wz = _clamp(KP_YAW * heading_err, -WZ_LIMIT, WZ_LIMIT)
+            params = self._L4GaitParams(
+                gait_type='trot', step_length=STEP_LENGTH * heading_mod,
+                gait_freq=GAIT_FREQ, step_height=STEP_HEIGHT,
+                duty_cycle=DUTY_CYCLE, stance_width=STANCE_WIDTH, wz=wz,
+            )
 
-        self._send_cmd(vx=vx, wz=wz)
+        self._send_l4(params)
 
         if self._target_step_count % TELEMETRY_INTERVAL == 0:
             t = self._target_step_count * CONTROL_DT
+            mode = "TURN" if abs(heading_err) > THETA_THRESHOLD else "WALK"
             print(f"[target {self._target_index}/{self._num_targets}] "
-                  f"dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
-                  f"vx={vx:.2f}  pos=({x:.1f}, {y:.1f})  t={t:.1f}s")
+                  f"{mode}  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
+                  f"pos=({x:.1f}, {y:.1f})  t={t:.1f}s")
 
         if dist < self._reach_threshold:
             self._on_reached()
