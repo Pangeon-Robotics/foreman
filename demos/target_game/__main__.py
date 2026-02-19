@@ -79,6 +79,11 @@ def _expand_v9_genome(params: dict) -> dict:
     }
 
 
+def _is_v10_genome(params: dict) -> bool:
+    """Detect v10 genome by presence of turn joint delta keys."""
+    return "P1_FL_HIP" in params
+
+
 def _apply_genome(genome_path: str) -> None:
     """Load a GA-evolved genome JSON and patch game + Layer 5 parameters.
 
@@ -97,8 +102,24 @@ def _apply_genome(genome_path: str) -> None:
         if group in genome:
             params.update(genome[group])
 
-    # v9 genomes have "FREQ" key — expand to all Layer 5 constants
-    if "FREQ" in params:
+    # v10 genomes: expand walk params via v9 path, turn genes used directly
+    # v9 genomes: expand to all Layer 5 constants
+    if _is_v10_genome(params):
+        # Extract walk subset (the 8 v9 params) for L5 expansion
+        walk_keys = ["FREQ", "STEP_LENGTH", "STEP_HEIGHT", "DUTY_CYCLE",
+                     "WALK_SPEED", "KP_YAW", "WZ_LIMIT", "STANCE_WIDTH"]
+        walk_params = {k: params[k] for k in walk_keys if k in params}
+        expanded = _expand_v9_genome(walk_params)
+        # Merge: expanded walk + original turn/timing genes
+        for k, v in params.items():
+            if k not in expanded:
+                expanded[k] = v
+        params = expanded
+        # Print turn gene summary
+        turn_count = sum(1 for k in params if k.startswith(("P1_", "P2_")))
+        timing = {k: params[k] for k in ["T_PHASE1", "T_PHASE2", "T_PHASE3"] if k in params}
+        print(f"  v10 turn genes: {turn_count} joint deltas, timing={timing}")
+    elif "FREQ" in params:
         params = _expand_v9_genome(params)
 
     # Patch game module steering constants
