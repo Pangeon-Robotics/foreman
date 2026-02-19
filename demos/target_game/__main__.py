@@ -79,6 +79,48 @@ def _expand_v9_genome(params: dict) -> dict:
     }
 
 
+def _is_v12_genome(params: dict) -> bool:
+    """Detect v12 sovereign genome by presence of GAIT_FREQ key."""
+    return "GAIT_FREQ" in params
+
+
+def _expand_v12_genome(params: dict) -> dict:
+    """Expand v12 genome (13 params) to all Layer 5 constants.
+
+    Maps sovereign walk + turn genes to L5's TURN_IN_PLACE_* and
+    walk constants. WALK_SPEED is derived from STEP_LENGTH * GAIT_FREQ.
+    """
+    gait_freq = params.get("GAIT_FREQ", 1.5)
+    step_length = params.get("STEP_LENGTH", 0.20)
+    step_height = params.get("STEP_HEIGHT", 0.06)
+    duty_cycle = params.get("DUTY_CYCLE", 0.55)
+    stance_width = params.get("STANCE_WIDTH", 0.0)
+    kp_yaw = params.get("KP_YAW", 2.0)
+    wz_limit = params.get("WZ_LIMIT", 1.5)
+
+    return {
+        # Walk gait
+        "BASE_FREQ": gait_freq, "MIN_FREQ": gait_freq, "MAX_FREQ": gait_freq,
+        "FREQ_SCALE": 0.0,
+        "STEP_LENGTH_SCALE": step_length,
+        "MAX_STEP_LENGTH": step_length,
+        "TROT_STEP_HEIGHT": step_height,
+        "WALK_STEP_HEIGHT": step_height,
+        # Turn gait (v12 has separate turn params)
+        "TURN_IN_PLACE_FREQ": params.get("TURN_FREQ", 1.0),
+        "TURN_IN_PLACE_STEP_HEIGHT": params.get("TURN_STEP_HEIGHT", 0.06),
+        "TURN_IN_PLACE_STEP_LENGTH": step_length,
+        "TURN_IN_PLACE_DUTY_CYCLE": params.get("TURN_DUTY_CYCLE", 0.55),
+        "TURN_IN_PLACE_WZ_SCALE": 1.0,
+        "TURN_IN_PLACE_STANCE_WIDTH": params.get("TURN_STANCE_WIDTH", 0.04),
+        # Steering (WALK_SPEED derived from step_length * gait_freq)
+        "KP_YAW": kp_yaw,
+        "WALK_SPEED": step_length * gait_freq,
+        "WALK_SPEED_MIN": 0.0,
+        "TURN_WZ_LIMIT": wz_limit,
+    }
+
+
 def _is_v10_genome(params: dict) -> bool:
     """Detect v10 genome by presence of turn joint delta keys."""
     return "P1_FL_HIP" in params
@@ -102,9 +144,16 @@ def _apply_genome(genome_path: str) -> None:
         if group in genome:
             params.update(genome[group])
 
+    # v12 genomes: sovereign — expand to L5 constants (no joint angles)
     # v10 genomes: expand walk params via v9 path, turn genes used directly
     # v9 genomes: expand to all Layer 5 constants
-    if _is_v10_genome(params):
+    if _is_v12_genome(params):
+        expanded = _expand_v12_genome(params)
+        params = expanded
+        theta = genome.get("genome", {}).get("THETA_THRESHOLD", params.get("THETA_THRESHOLD", "?"))
+        turn_wz = genome.get("genome", {}).get("TURN_WZ", params.get("TURN_WZ", "?"))
+        print(f"  v12 sovereign genome: 13 genes, theta_threshold={theta}, turn_wz={turn_wz}")
+    elif _is_v10_genome(params):
         # Extract walk subset (the 8 v9 params) for L5 expansion
         walk_keys = ["FREQ", "STEP_LENGTH", "STEP_HEIGHT", "DUTY_CYCLE",
                      "WALK_SPEED", "KP_YAW", "WZ_LIMIT", "STANCE_WIDTH"]
