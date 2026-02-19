@@ -16,12 +16,7 @@ CONTROL_DT = 0.01          # 100 Hz
 STARTUP_SETTLE = 1.5       # seconds (0.5s ramp + 1.0s stabilize)
 WALK_SPEED = 1.0            # m/s forward
 KP_YAW = 2.0               # proportional yaw gain
-WZ_CLAMP = 2.0              # max angular velocity command (rad/s)
-HEADING_FULL_SPEED = 0.30   # rad — below this, full forward speed
-HEADING_SLOW_SPEED = 0.50   # rad — above this, minimum forward speed
-HEADING_TURN_ONLY = 0.79    # rad — above this, stop and turn in place (~45 deg)
-HEADING_HYSTERESIS = 0.15   # rad — gap for exiting turn-only (avoids oscillation)
-WALK_SPEED_MIN = 0.15       # m/s — creep speed when misaligned (prevents walking away)
+TURN_WZ_LIMIT = 2.0         # max angular velocity command (rad/s)
 REACH_DISTANCE = 0.5        # m
 TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz (faster with improved locomotion)
 TELEMETRY_INTERVAL = 100    # steps between prints (1 Hz at 100 Hz)
@@ -53,7 +48,7 @@ class TargetGame:
     """Random target navigation game.
 
     Runs a state machine that spawns targets and drives the robot toward
-    them using turn-then-walk control.
+    them using continuous cos(heading_err) steering.
     """
 
     def __init__(
@@ -87,7 +82,7 @@ class TargetGame:
         self._target_step_count = 0
         self._startup_steps = 0
         self._startup_total = int(STARTUP_SETTLE / CONTROL_DT)
-        self._in_turn_only = False  # hysteresis state for turn-in-place
+        # hysteresis state removed — using continuous cos(heading_err) steering
 
     def _get_robot_pose(self) -> tuple[float, float, float]:
         """Return (x, y, yaw) from simulation."""
@@ -148,7 +143,6 @@ class TargetGame:
         target = self._spawner.spawn_relative(x, y, yaw, angle_range=self._angle_range)
         self._target_index += 1
         self._target_step_count = 0
-        self._in_turn_only = False
         self._stats.targets_spawned += 1
 
         # Move visual target marker (mocap body) to target position
@@ -164,11 +158,11 @@ class TargetGame:
         self._state = GameState.WALK_TO_TARGET
 
     def _tick_walk(self):
-        """Walk toward target with proportional heading and speed control.
+        """Walk toward target with continuous cos(heading_err) steering.
 
-        Always walks forward while correcting heading. Speed is proportional
-        to alignment: full speed when heading error is small, slower when
-        heading error is large. This eliminates the slow turn-in-place phase.
+        Forward speed scales smoothly from WALK_SPEED (aligned) to 0
+        (perpendicular or beyond), while yaw rate is proportional to
+        heading error.  Matches the GA v9 evaluation steering model.
         """
         x, y, yaw = self._get_robot_pose()
         target = self._spawner.current_target
@@ -176,28 +170,10 @@ class TargetGame:
 
         heading_err = target.heading_error(x, y, yaw)
         dist = target.distance_to(x, y)
-        wz = _clamp(KP_YAW * heading_err, -WZ_CLAMP, WZ_CLAMP)
 
-        # Hysteresis for turn-in-place: enter at HEADING_TURN_ONLY, exit at
-        # HEADING_TURN_ONLY - HEADING_HYSTERESIS to avoid oscillation
-        abs_err = abs(heading_err)
-        if self._in_turn_only:
-            if abs_err < HEADING_TURN_ONLY - HEADING_HYSTERESIS:
-                self._in_turn_only = False
-        else:
-            if abs_err > HEADING_TURN_ONLY:
-                self._in_turn_only = True
-
-        # Scale forward speed by alignment
-        if self._in_turn_only:
-            vx = 0.0
-        elif abs_err < HEADING_FULL_SPEED:
-            vx = WALK_SPEED
-        elif abs_err > HEADING_SLOW_SPEED:
-            vx = WALK_SPEED_MIN
-        else:
-            t = (abs_err - HEADING_FULL_SPEED) / (HEADING_SLOW_SPEED - HEADING_FULL_SPEED)
-            vx = WALK_SPEED - t * (WALK_SPEED - WALK_SPEED_MIN)
+        # Continuous steering: cos modulates forward speed, P-control on yaw
+        vx = WALK_SPEED * max(0.0, math.cos(heading_err))
+        wz = _clamp(KP_YAW * heading_err, -TURN_WZ_LIMIT, TURN_WZ_LIMIT)
 
         self._send_cmd(vx=vx, wz=wz)
 

@@ -43,11 +43,48 @@ from .game import TargetGame
 from .utils import load_module_by_path, patch_layer_configs
 
 
+def _expand_v9_genome(params: dict) -> dict:
+    """Expand v9 genome (8 params) to all Layer 5 constants.
+
+    Maps unified gait/steering params to both walk and turn-in-place
+    constants, matching training/ga/episode.py:inject_genome_v9().
+    """
+    freq = params.get("FREQ", 1.5)
+    step_length = params.get("STEP_LENGTH", 0.20)
+    step_height = params.get("STEP_HEIGHT", 0.06)
+    duty_cycle = params.get("DUTY_CYCLE", 0.55)
+    walk_speed = params.get("WALK_SPEED", 1.0)
+    kp_yaw = params.get("KP_YAW", 2.0)
+    wz_limit = params.get("WZ_LIMIT", 1.5)
+    stance_width = params.get("STANCE_WIDTH", 0.0)
+
+    return {
+        # Walk gait
+        "BASE_FREQ": freq, "MIN_FREQ": freq, "MAX_FREQ": freq,
+        "FREQ_SCALE": 0.0,
+        "STEP_LENGTH_SCALE": step_length,
+        "MAX_STEP_LENGTH": step_length,
+        "TROT_STEP_HEIGHT": step_height,
+        "WALK_STEP_HEIGHT": step_height,
+        # Turn gait (unified with walk)
+        "TURN_IN_PLACE_FREQ": freq,
+        "TURN_IN_PLACE_STEP_HEIGHT": step_height,
+        "TURN_IN_PLACE_STEP_LENGTH": step_length,
+        "TURN_IN_PLACE_DUTY_CYCLE": duty_cycle,
+        "TURN_IN_PLACE_WZ_SCALE": 1.0,
+        "TURN_IN_PLACE_STANCE_WIDTH": stance_width,
+        # Steering
+        "KP_YAW": kp_yaw, "WALK_SPEED": walk_speed,
+        "WALK_SPEED_MIN": 0.0, "TURN_WZ_LIMIT": wz_limit,
+    }
+
+
 def _apply_genome(genome_path: str) -> None:
     """Load a GA-evolved genome JSON and patch game + Layer 5 parameters.
 
-    Patches steering constants in game.py and locomotion constants in
-    Layer 5's config.defaults + downstream modules.
+    Detects v9 genomes (have "FREQ" key) and expands them to all Layer 5
+    constants. Patches steering constants in game.py and locomotion
+    constants in Layer 5's config.defaults + downstream modules.
     """
     genome = json.loads(Path(genome_path).read_text())
 
@@ -60,11 +97,14 @@ def _apply_genome(genome_path: str) -> None:
         if group in genome:
             params.update(genome[group])
 
+    # v9 genomes have "FREQ" key — expand to all Layer 5 constants
+    if "FREQ" in params:
+        params = _expand_v9_genome(params)
+
     # Patch game module steering constants
     from . import game as game_mod
     steering_params = [
-        "KP_YAW", "HEADING_FULL_SPEED", "HEADING_SLOW_SPEED",
-        "HEADING_TURN_ONLY", "WALK_SPEED", "WALK_SPEED_MIN",
+        "KP_YAW", "WALK_SPEED", "WALK_SPEED_MIN", "TURN_WZ_LIMIT",
     ]
     for name in steering_params:
         if name in params:
@@ -75,6 +115,10 @@ def _apply_genome(genome_path: str) -> None:
     locomotion_params = [
         "BASE_FREQ", "FREQ_SCALE", "MAX_FREQ", "MIN_FREQ",
         "STEP_LENGTH_SCALE", "MAX_STEP_LENGTH", "TROT_STEP_HEIGHT",
+        "WALK_STEP_HEIGHT",
+        "TURN_IN_PLACE_FREQ", "TURN_IN_PLACE_STEP_HEIGHT",
+        "TURN_IN_PLACE_STEP_LENGTH", "TURN_IN_PLACE_DUTY_CYCLE",
+        "TURN_IN_PLACE_WZ_SCALE", "TURN_IN_PLACE_STANCE_WIDTH",
     ]
     defaults_mod = sys.modules.get("config.defaults")
     downstream_mods = ["velocity_mapper", "gait_selector", "locomotion",
@@ -85,15 +129,10 @@ def _apply_genome(genome_path: str) -> None:
             continue
         if defaults_mod and hasattr(defaults_mod, name):
             setattr(defaults_mod, name, params[name])
-            print(f"  config.defaults.{name} = {params[name]:.4f}")
         for mod_name in downstream_mods:
             mod = sys.modules.get(mod_name)
             if mod and hasattr(mod, name):
                 setattr(mod, name, params[name])
-
-    # NOTE: genome "KP"/"KD" are GPU tier PD gains (100-3000, with torque
-    # clamp). Layer 5 uses "KP_FULL"/"KD_FULL" (5000/141.4) at firmware
-    # scale. Do NOT map between them — different control architectures.
 
     gen = genome.get("generation", "?")
     fitness = genome.get("fitness", "?")
