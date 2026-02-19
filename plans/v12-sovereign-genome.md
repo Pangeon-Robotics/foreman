@@ -102,3 +102,73 @@ dropped — effective speed = 0.382 * 2.5 = 0.955 m/s.
 - **bizon**: `ga_v12_bizon.json`, seed=137, checkpoint_dir=models/b2/ga_v12_bizon
 - Both: 128 pop, 20 parallel workers, fast_sim, 16000 max gen, 5000 stagnation stop
 - Seeded from v11 champion (25% of population via seed_champion_fraction)
+
+## Run Log
+
+### 2026-02-19: First launch + behavior dict fix
+
+**Issue found**: The v12 episode behavior dict used `mean_closing_speed_ms` but the
+critic and pipeline sanity checks read `mean_walk_speed` (from v9-v11). This caused
+false "Walk forward speed = 0.000 m/s" CRITICAL alerts every generation, making it
+look like walking was completely broken when it was actually working fine.
+
+**Fix**: Added `walk_forward_speed_sum` accumulator to v12 episode, emit
+`mean_walk_speed` in behavior dict alongside `mean_closing_speed_ms`. After fix,
+walk speed alerts correctly disappeared.
+
+**Lesson**: When creating new episode versions, the behavior dict keys must match
+what the critic and pipeline sanity checks read. The sanity checks are version-agnostic
+— they read fixed keys. Either new episodes must emit the same keys, or the checks
+must be version-aware.
+
+### 2026-02-19: Initial run observations (gen 0-33)
+
+Both servers launched successfully:
+- **puget**: ~4-6s/gen, ATB=288.3 at gen 4, heading_progress=42-91% of fitness
+- **bizon**: ~16s/gen, ATB=92.7 at gen 8, heading_progress=48-61% of fitness
+
+Key patterns:
+1. **heading_progress dominance expected early** — turn genes start at defaults and
+   need time to evolve. The robot earns most fitness from turning toward targets,
+   not closing distance. This should shift as turn genes improve.
+2. **THETA_THRESHOLD converging to min (0.15 rad)** on bizon — the GA wants to minimize
+   time spent turning and maximize walking. Makes sense: walking is fast, turning is slow.
+3. **KP_YAW converging to min (0.5)** — after turning to face the target, gentle steering
+   suffices. High KP_YAW causes overcorrection/oscillation.
+4. **TURN_* params drifting toward min bounds** — turn genes being pushed toward slower,
+   more conservative settings. May indicate the arc-based turn mode works better at
+   lower frequencies. Watch for mean_turn_rate improvements.
+5. **Turn-obsessive (76% of time turning)** — with targets at 60-150° offset and slow
+   turn rate (0.28 rad/s), most time is spent turning. Will improve as turn genes evolve.
+6. **ATB stagnation at gen 33 on puget** — best hasn't improved since gen 4. This may
+   be because the gen 4 champion found a heading_progress-heavy strategy that's hard
+   to beat without better closing_speed (which requires good turn→walk transitions).
+
+### Server details
+
+| Server | Host | Python | Cores | RAM | GPU | Speed |
+|--------|------|--------|-------|-----|-----|-------|
+| puget | puget-280957 (local) | 3.12.3 | 24 | 30GB | RTX 5090 | ~4-6s/gen |
+| bizon | bizon@10.0.0.12 | 3.12.11 (venv) | 20 | 125GB | Titan RTX | ~16s/gen |
+
+**Launch commands**:
+```bash
+# puget (from training/)
+nohup python -u -m ga.pipeline --config configs/b2/ga_v12_puget.json \
+  --seed-genome models/b2/ga_v12_seed_from_v11.json \
+  > models/b2/ga_v12_puget/run.log 2>&1 &
+
+# bizon (via SSH, must activate venv)
+ssh bizon@10.0.0.12
+cd /home/bizon/code/robotics/training
+source /home/bizon/code/robotics/env/bin/activate
+nohup python -u -m ga.pipeline --config configs/b2/ga_v12_bizon.json \
+  --seed-genome models/b2/ga_v12_seed_from_v11_bizon.json \
+  > models/b2/ga_v12_bizon/run.log 2>&1 &
+```
+
+**Gotchas from launch**:
+- bizon's default python is 2.7 — must use venv at `/home/bizon/code/robotics/env/bin/python`
+- `scripts/run_ga.py` doesn't have `--seed-genome` flag; use `python -m ga.pipeline` instead
+- bizon had stale local v11 changes that needed `git stash` before pull
+- Always use `python -u` for unbuffered stdout (Issue 003 lesson)
