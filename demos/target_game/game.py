@@ -17,6 +17,8 @@ STARTUP_SETTLE = 1.5       # seconds (0.5s ramp + 1.0s stabilize)
 REACH_DISTANCE = 0.5        # m
 TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz
 TELEMETRY_INTERVAL = 100    # steps between prints (1 Hz at 100 Hz)
+NOMINAL_BODY_HEIGHT = 0.465 # m (B2)
+FALL_THRESHOLD = 0.4        # fraction of nominal height (matches GA episode)
 
 # --- Genome parameters (patched by _apply_genome in __main__.py) ---
 
@@ -102,13 +104,14 @@ class TargetGame:
         self._startup_steps = 0
         self._startup_total = int(STARTUP_SETTLE / CONTROL_DT)
 
-    def _get_robot_pose(self) -> tuple[float, float, float]:
-        """Return (x, y, yaw) from simulation."""
+    def _get_robot_pose(self) -> tuple[float, float, float, float]:
+        """Return (x, y, yaw, z) from simulation."""
         body = self._sim.get_body("base")
         x = float(body.pos[0])
         y = float(body.pos[1])
+        z = float(body.pos[2])
         yaw = _quat_to_yaw(body.quat)
-        return x, y, yaw
+        return x, y, yaw, z
 
     def _send_l4(self, params):
         """Send L4 GaitParams directly to Layer 4 (bypassing L5)."""
@@ -163,7 +166,7 @@ class TargetGame:
             self._state = GameState.DONE
             return
 
-        x, y, yaw = self._get_robot_pose()
+        x, y, yaw, _z = self._get_robot_pose()
         target = self._spawner.spawn_relative(x, y, yaw, angle_range=self._angle_range)
         self._target_index += 1
         self._target_step_count = 0
@@ -188,9 +191,16 @@ class TargetGame:
         - Large heading error -> turn in place (L4 arc mode)
         - Small heading error -> walk with differential stride
         """
-        x, y, yaw = self._get_robot_pose()
+        x, y, yaw, z = self._get_robot_pose()
         target = self._spawner.current_target
         self._target_step_count += 1
+
+        # Fall detection (matches GA episode: rz < nominal_z * 0.4)
+        if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
+            self._stats.falls += 1
+            print(f"FALL DETECTED at z={z:.3f}m (threshold={NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:.3f}m)")
+            self._state = GameState.SPAWN_TARGET
+            return
 
         heading_err = target.heading_error(x, y, yaw)
         dist = target.distance_to(x, y)
@@ -220,7 +230,7 @@ class TargetGame:
             mode = "TURN" if abs(heading_err) > THETA_THRESHOLD else "WALK"
             print(f"[target {self._target_index}/{self._num_targets}] "
                   f"{mode}  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
-                  f"pos=({x:.1f}, {y:.1f})  t={t:.1f}s")
+                  f"z={z:.2f}  pos=({x:.1f}, {y:.1f})  t={t:.1f}s")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -257,5 +267,5 @@ class TargetGame:
         print("\n=== GAME OVER ===")
         print(f"Targets: {s.targets_reached}/{s.targets_spawned} reached "
               f"({s.success_rate:.0%})")
-        print(f"Timeouts: {s.targets_timeout}")
+        print(f"Timeouts: {s.targets_timeout}  Falls: {s.falls}")
         print(f"Total time: {s.total_time:.1f}s")
