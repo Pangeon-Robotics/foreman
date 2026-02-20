@@ -30,7 +30,7 @@ KD_FULL = 126.5             # sqrt(KP_FULL) * 2 — critically damped
 
 GAIT_FREQ = 1.5
 STEP_LENGTH = 0.30
-STEP_HEIGHT = 0.08
+STEP_HEIGHT = 0.07
 DUTY_CYCLE = 0.65
 STANCE_WIDTH = 0.0
 KP_YAW = 2.0
