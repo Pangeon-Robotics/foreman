@@ -7,34 +7,40 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from .target import TargetSpawner
-from .utils import quat_to_yaw as _quat_to_yaw, clamp as _clamp
+from .utils import quat_to_yaw as _quat_to_yaw, quat_to_rpy as _quat_to_rpy, clamp as _clamp
 
 
 # --- Game constants ---
 
 CONTROL_DT = 0.01          # 100 Hz
-STARTUP_SETTLE = 1.5       # seconds (0.5s ramp + 1.0s stabilize)
+STARTUP_RAMP_SECONDS = 2.5 # seconds — slow L4-direct gain ramp (L5's 0.5s causes vibration)
 REACH_DISTANCE = 0.5        # m
 TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz
 TELEMETRY_INTERVAL = 100    # steps between prints (1 Hz at 100 Hz)
 NOMINAL_BODY_HEIGHT = 0.465 # m (B2)
-FALL_THRESHOLD = 0.4        # fraction of nominal height (matches GA episode)
+FALL_THRESHOLD = 0.5        # fraction of nominal height (catches robot on its side at z=0.22m, threshold=0.233m)
+
+# --- Startup gain ramp (bypasses L5 to avoid vibration) ---
+KP_START = 500.0
+KP_FULL = 4000.0
+KD_START = 25.0
+KD_FULL = 126.5             # sqrt(KP_FULL) * 2 — critically damped
 
 # --- Genome parameters (patched by _apply_genome in __main__.py) ---
 
 GAIT_FREQ = 1.5
 STEP_LENGTH = 0.30
 STEP_HEIGHT = 0.08
-DUTY_CYCLE = 0.55
+DUTY_CYCLE = 0.65
 STANCE_WIDTH = 0.0
 KP_YAW = 2.0
 WZ_LIMIT = 1.5
 TURN_FREQ = 1.0
 TURN_STEP_HEIGHT = 0.07
-TURN_DUTY_CYCLE = 0.55
-TURN_STANCE_WIDTH = 0.04
-TURN_WZ = 1.2
-THETA_THRESHOLD = 0.4
+TURN_DUTY_CYCLE = 0.65
+TURN_STANCE_WIDTH = 0.08
+TURN_WZ = 1.0
+THETA_THRESHOLD = 0.6
 
 
 class GameState(Enum):
@@ -85,9 +91,9 @@ class TargetGame:
         self._timeout_steps = timeout_steps
         self._angle_range = angle_range
 
-        # Gains captured after startup ramp completes
-        self._kp = None
-        self._kd = None
+        # Gains — start low, ramp during first 2.5s of navigation
+        self._kp = KP_START
+        self._kd = KD_START
 
         self._spawner = TargetSpawner(
             min_distance=min_dist,
@@ -96,22 +102,24 @@ class TargetGame:
             seed=seed,
         )
 
-        self._state = GameState.STARTUP
+        self._state = GameState.SPAWN_TARGET  # No startup phase — ramp gains during navigation
         self._stats = GameStatistics()
         self._target_index = 0
         self._step_count = 0
         self._target_step_count = 0
-        self._startup_steps = 0
-        self._startup_total = int(STARTUP_SETTLE / CONTROL_DT)
 
-    def _get_robot_pose(self) -> tuple[float, float, float, float]:
-        """Return (x, y, yaw, z) from simulation."""
+        # Pitch/roll diagnostics
+        self._rp_log = []  # (step, roll_deg, pitch_deg, droll, dpitch, mode)
+
+    def _get_robot_pose(self) -> tuple[float, float, float, float, float, float]:
+        """Return (x, y, yaw, z, roll, pitch) from simulation."""
         body = self._sim.get_body("base")
         x = float(body.pos[0])
         y = float(body.pos[1])
         z = float(body.pos[2])
         yaw = _quat_to_yaw(body.quat)
-        return x, y, yaw, z
+        roll, pitch, _ = _quat_to_rpy(body.quat)
+        return x, y, yaw, z, roll, pitch
 
     def _send_l4(self, params):
         """Send L4 GaitParams directly to Layer 4 (bypassing L5)."""
@@ -128,37 +136,24 @@ class TargetGame:
             return False
 
         self._step_count += 1
+        self._update_gains()
 
-        if self._state == GameState.STARTUP:
-            self._tick_startup()
-        elif self._state == GameState.SPAWN_TARGET:
+        if self._state == GameState.SPAWN_TARGET:
             self._tick_spawn()
         elif self._state == GameState.WALK_TO_TARGET:
             self._tick_walk()
 
         return self._state != GameState.DONE
 
-    def _tick_startup(self):
-        """Send stand commands via L5 until ramp completes and settle time elapses."""
-        from config.defaults import MotionCommand
-        cmd = MotionCommand(vx=0.0, wz=0.0, behavior="stand")
-        try:
-            self._sim.send_motion_command(cmd, dt=CONTROL_DT, terrain=False)
-        except RuntimeError:
-            print("Simulation stopped unexpectedly")
-            self._state = GameState.DONE
+    def _update_gains(self):
+        """Smoothly ramp PD gains over first 2.5s of operation."""
+        if self._kp >= KP_FULL:
             return
-
-        self._startup_steps += 1
-
-        ramp_done = not self._sim.is_ramping
-        settle_done = self._startup_steps >= self._startup_total
-
-        if ramp_done and settle_done:
-            # Capture final gains for L4-direct control
-            self._kp, self._kd = self._sim.locomotion.startup_gains()
-            print(f"Robot ready! (kp={self._kp:.0f}, kd={self._kd:.1f})")
-            self._state = GameState.SPAWN_TARGET
+        t = self._step_count * CONTROL_DT
+        progress = min(1.0, t / STARTUP_RAMP_SECONDS)
+        alpha = progress * progress * (3.0 - 2.0 * progress)  # smoothstep
+        self._kp = KP_START + alpha * (KP_FULL - KP_START)
+        self._kd = KD_START + alpha * (KD_FULL - KD_START)
 
     def _tick_spawn(self):
         """Spawn a new target and transition to walking."""
@@ -166,7 +161,7 @@ class TargetGame:
             self._state = GameState.DONE
             return
 
-        x, y, yaw, _z = self._get_robot_pose()
+        x, y, yaw, _z, _r, _p = self._get_robot_pose()
         target = self._spawner.spawn_relative(x, y, yaw, angle_range=self._angle_range)
         self._target_index += 1
         self._target_step_count = 0
@@ -191,11 +186,11 @@ class TargetGame:
         - Large heading error -> turn in place (L4 arc mode)
         - Small heading error -> walk with differential stride
         """
-        x, y, yaw, z = self._get_robot_pose()
+        x, y, yaw, z, roll, pitch = self._get_robot_pose()
         target = self._spawner.current_target
         self._target_step_count += 1
 
-        # Fall detection (matches GA episode: rz < nominal_z * 0.4)
+        # Fall detection (matches GA episode: rz < nominal_z * 0.5)
         if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
             self._stats.falls += 1
             print(f"FALL DETECTED at z={z:.3f}m (threshold={NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:.3f}m)")
@@ -215,7 +210,15 @@ class TargetGame:
             )
         else:
             # WALK — L4 differential stride (layer_4/generator.py:134-164)
-            heading_mod = max(0.0, math.cos(heading_err))
+            # Decel taper in last 30% before threshold so WALK→TURN
+            # transition doesn't pitch the robot forward from momentum.
+            taper_start = 0.7 * THETA_THRESHOLD
+            if abs(heading_err) > taper_start:
+                decel = (THETA_THRESHOLD - abs(heading_err)) / (THETA_THRESHOLD - taper_start)
+                decel = max(0.0, decel)
+            else:
+                decel = 1.0
+            heading_mod = decel * max(0.0, math.cos(heading_err))
             wz = _clamp(KP_YAW * heading_err, -WZ_LIMIT, WZ_LIMIT)
             params = self._L4GaitParams(
                 gait_type='trot', step_length=STEP_LENGTH * heading_mod,
@@ -225,12 +228,25 @@ class TargetGame:
 
         self._send_l4(params)
 
+        # Log pitch/roll every step for diagnostics
+        r_deg = math.degrees(roll)
+        p_deg = math.degrees(pitch)
+        mode = "T" if abs(heading_err) > THETA_THRESHOLD else "W"
+        if len(self._rp_log) > 0:
+            prev = self._rp_log[-1]
+            droll = (r_deg - prev[1]) / CONTROL_DT
+            dpitch = (p_deg - prev[2]) / CONTROL_DT
+        else:
+            droll = dpitch = 0.0
+        self._rp_log.append((self._step_count, r_deg, p_deg, droll, dpitch, mode))
+
         if self._target_step_count % TELEMETRY_INTERVAL == 0:
             t = self._target_step_count * CONTROL_DT
-            mode = "TURN" if abs(heading_err) > THETA_THRESHOLD else "WALK"
+            mode_str = "TURN" if abs(heading_err) > THETA_THRESHOLD else "WALK"
             print(f"[target {self._target_index}/{self._num_targets}] "
-                  f"{mode}  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
-                  f"z={z:.2f}  pos=({x:.1f}, {y:.1f})  t={t:.1f}s")
+                  f"{mode_str}  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
+                  f"z={z:.2f}  R={r_deg:+.1f}° P={p_deg:+.1f}°  "
+                  f"pos=({x:.1f}, {y:.1f})  t={t:.1f}s")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -269,3 +285,50 @@ class TargetGame:
               f"({s.success_rate:.0%})")
         print(f"Timeouts: {s.targets_timeout}  Falls: {s.falls}")
         print(f"Total time: {s.total_time:.1f}s")
+        self._print_rp_analysis()
+
+    def _print_rp_analysis(self):
+        """Print pitch/roll dynamics analysis."""
+        if not self._rp_log:
+            return
+        rolls = [r[1] for r in self._rp_log]
+        pitches = [r[2] for r in self._rp_log]
+        drolls = [r[3] for r in self._rp_log]
+        dpitches = [r[4] for r in self._rp_log]
+        modes = [r[5] for r in self._rp_log]
+
+        print("\n=== PITCH/ROLL ANALYSIS ===")
+        print(f"Samples: {len(self._rp_log)} ({len(self._rp_log)*CONTROL_DT:.1f}s)")
+        print(f"Roll:   min={min(rolls):+.1f}°  max={max(rolls):+.1f}°  "
+              f"mean={sum(abs(r) for r in rolls)/len(rolls):.1f}°")
+        print(f"Pitch:  min={min(pitches):+.1f}°  max={max(pitches):+.1f}°  "
+              f"mean={sum(abs(p) for p in pitches)/len(pitches):.1f}°")
+        print(f"dRoll:  min={min(drolls):+.0f}°/s  max={max(drolls):+.0f}°/s")
+        print(f"dPitch: min={min(dpitches):+.0f}°/s  max={max(dpitches):+.0f}°/s")
+
+        # Top 10 worst moments by combined |roll| + |pitch|
+        scored = [(abs(r[1]) + abs(r[2]), i, r) for i, r in enumerate(self._rp_log)]
+        scored.sort(reverse=True)
+        print("\nTop 10 worst tilt moments (|R|+|P|):")
+        print(f"  {'step':>6}  {'t':>5}  {'R':>7}  {'P':>7}  {'dR':>8}  {'dP':>8}  mode")
+        for _, idx, r in scored[:10]:
+            step, roll, pitch, dr, dp, mode = r
+            t = step * CONTROL_DT
+            print(f"  {step:6d}  {t:5.2f}  {roll:+7.1f}  {pitch:+7.1f}  "
+                  f"{dr:+8.0f}  {dp:+8.0f}  {mode}")
+
+        # Mode breakdown
+        walk_rolls = [abs(r[1]) for r in self._rp_log if r[5] == "W"]
+        turn_rolls = [abs(r[1]) for r in self._rp_log if r[5] == "T"]
+        walk_pitches = [abs(r[2]) for r in self._rp_log if r[5] == "W"]
+        turn_pitches = [abs(r[2]) for r in self._rp_log if r[5] == "T"]
+        if walk_rolls:
+            print(f"\nWALK ({len(walk_rolls)} steps):  "
+                  f"avg|R|={sum(walk_rolls)/len(walk_rolls):.1f}°  "
+                  f"avg|P|={sum(walk_pitches)/len(walk_pitches):.1f}°  "
+                  f"max|R|={max(walk_rolls):.1f}°  max|P|={max(walk_pitches):.1f}°")
+        if turn_rolls:
+            print(f"TURN ({len(turn_rolls)} steps):  "
+                  f"avg|R|={sum(turn_rolls)/len(turn_rolls):.1f}°  "
+                  f"avg|P|={sum(turn_pitches)/len(turn_pitches):.1f}°  "
+                  f"max|R|={max(turn_rolls):.1f}°  max|P|={max(turn_pitches):.1f}°")
