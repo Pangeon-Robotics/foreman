@@ -254,11 +254,14 @@ def main():
         FirmwareLauncher.__init__ = _patched_init
 
     # Use scene with mocap target body for visual markers
-    scene_path = str(_root / "layers_1_2" / "unitree_robots" / args.robot / "scene_target.xml")
+    scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene_target.xml"
+    if not scene_path.exists():
+        scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene.xml"
+        print(f"Warning: scene_target.xml not found for {args.robot}, using scene.xml")
     sim = SimulationManager(
         args.robot,
         headless=args.headless,
-        scene=scene_path,
+        scene=str(scene_path),
         track_bodies=["target"],
     )
     sim.start()
