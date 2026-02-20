@@ -43,7 +43,7 @@ from config.defaults import MotionCommand  # noqa: F401 — captured for game.py
 _l4_sim = sys.modules["_l4_simulation"]
 L4GaitParams = _l4_sim.GaitParams
 
-from .game import TargetGame
+from .game import TargetGame, configure_for_robot
 from .utils import load_module_by_path, patch_layer_configs
 
 
@@ -234,6 +234,9 @@ def main():
     args = parser.parse_args()
 
     print(f"Starting target game: robot={args.robot}, targets={args.targets}")
+
+    # Configure game constants for this robot (before genome, so genome overrides)
+    configure_for_robot(args.robot)
 
     if args.genome:
         print(f"\nApplying evolved genome: {args.genome}")

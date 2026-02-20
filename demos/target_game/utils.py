@@ -107,3 +107,14 @@ def patch_layer_configs(robot: str, workspace_root: Path) -> None:
         l4_sim = sys.modules.get("_l4_simulation")
         if l4_sim:
             l4_sim._load_l4_config = lambda robot: l4_b2
+
+    # Patch L4 simulation's captured module-level values from L3.
+    # At import time, L4's simulation.py captures _KP, _KD, _MAX_DELTA,
+    # _JOINT_LIMITS from L3's B2 config. For non-B2 robots these are wrong
+    # and cause torque saturation (go2's torque limits are 8× lower than B2's).
+    if l3_b2 is not None:
+        l4_sim = sys.modules.get("_l4_simulation")
+        if l4_sim:
+            for attr in ("MAX_DELTA", "JOINT_LIMITS"):
+                if hasattr(l3_b2, attr):
+                    setattr(l4_sim, f"_{attr}", getattr(l3_b2, attr))

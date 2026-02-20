@@ -18,7 +18,7 @@ REACH_DISTANCE = 0.5        # m
 TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz
 TELEMETRY_INTERVAL = 100    # steps between prints (1 Hz at 100 Hz)
 NOMINAL_BODY_HEIGHT = 0.465 # m (B2)
-FALL_THRESHOLD = 0.5        # fraction of nominal height (catches robot on its side at z=0.22m, threshold=0.233m)
+FALL_THRESHOLD = 0.5        # fraction of nominal height
 
 # --- Startup gain ramp (bypasses L5 to avoid vibration) ---
 KP_START = 500.0
@@ -33,6 +33,7 @@ STEP_LENGTH = 0.30
 STEP_HEIGHT = 0.07
 DUTY_CYCLE = 0.65
 STANCE_WIDTH = 0.0
+BODY_HEIGHT = 0.465
 KP_YAW = 2.0
 WZ_LIMIT = 1.5
 TURN_FREQ = 1.0
@@ -41,6 +42,55 @@ TURN_DUTY_CYCLE = 0.65
 TURN_STANCE_WIDTH = 0.08
 TURN_WZ = 1.0
 THETA_THRESHOLD = 0.6
+
+# --- Per-robot defaults ---
+# Scaling rationale: Go2 legs are 60% of B2 (0.213/0.35), mass is 25% (15/60 kg).
+# Step params scale with leg length, gains scale with mass, freq scales inversely.
+
+ROBOT_DEFAULTS = {
+    "b2": {
+        "NOMINAL_BODY_HEIGHT": 0.465, "BODY_HEIGHT": 0.465,
+        "KP_START": 500.0, "KP_FULL": 4000.0,
+        "KD_START": 25.0, "KD_FULL": 126.5,
+        "GAIT_FREQ": 1.5, "STEP_LENGTH": 0.30, "STEP_HEIGHT": 0.07,
+        "DUTY_CYCLE": 0.65, "STANCE_WIDTH": 0.0,
+        "KP_YAW": 2.0, "WZ_LIMIT": 1.5,
+        "TURN_FREQ": 1.0, "TURN_STEP_HEIGHT": 0.06,
+        "TURN_DUTY_CYCLE": 0.65, "TURN_STANCE_WIDTH": 0.08,
+        "TURN_WZ": 1.0, "THETA_THRESHOLD": 0.6,
+    },
+    "go2": {
+        "NOMINAL_BODY_HEIGHT": 0.27,       # MJCF keyframe z (actual sim standing height)
+        "BODY_HEIGHT": 0.34,               # L4 NOMINAL_HEIGHT — target standing height for IK
+        # Gains: go2 motors max 23.7 Nm. KP>200 causes torque saturation → backward walking.
+        # KP=150 keeps thigh tracking in linear PD zone (saturation at 0.158 rad error).
+        "KP_START": 75.0, "KP_FULL": 150.0,
+        "KD_START": 3.8, "KD_FULL": 7.5,
+        "GAIT_FREQ": 1.5, "STEP_LENGTH": 0.18, "STEP_HEIGHT": 0.06,
+        "DUTY_CYCLE": 0.65, "STANCE_WIDTH": 0.0,
+        "KP_YAW": 2.0, "WZ_LIMIT": 1.5,
+        "TURN_FREQ": 1.5, "TURN_STEP_HEIGHT": 0.04,
+        "TURN_DUTY_CYCLE": 0.65, "TURN_STANCE_WIDTH": 0.04,
+        "TURN_WZ": 0.8, "THETA_THRESHOLD": 0.6,
+    },
+}
+
+
+def configure_for_robot(robot: str) -> None:
+    """Set module-level game constants for the given robot.
+
+    Call before _apply_genome so genome values override these defaults.
+    """
+    import sys
+    mod = sys.modules[__name__]
+    defaults = ROBOT_DEFAULTS.get(robot, ROBOT_DEFAULTS["b2"])
+    for name, value in defaults.items():
+        setattr(mod, name, value)
+    print(f"Configured game for {robot}: height={defaults['NOMINAL_BODY_HEIGHT']}m, "
+          f"KP={defaults['KP_FULL']}, step_h={defaults['STEP_HEIGHT']}m")
+
+
+STARTUP_SETTLE_STEPS = 100  # 1s at 100 Hz — let robot settle before first gait command
 
 
 class GameState(Enum):
@@ -102,7 +152,7 @@ class TargetGame:
             seed=seed,
         )
 
-        self._state = GameState.SPAWN_TARGET  # No startup phase — ramp gains during navigation
+        self._state = GameState.STARTUP  # Settle before first gait command
         self._stats = GameStatistics()
         self._target_index = 0
         self._step_count = 0
@@ -138,7 +188,9 @@ class TargetGame:
         self._step_count += 1
         self._update_gains()
 
-        if self._state == GameState.SPAWN_TARGET:
+        if self._state == GameState.STARTUP:
+            self._tick_startup()
+        elif self._state == GameState.SPAWN_TARGET:
             self._tick_spawn()
         elif self._state == GameState.WALK_TO_TARGET:
             self._tick_walk()
@@ -154,6 +206,21 @@ class TargetGame:
         alpha = progress * progress * (3.0 - 2.0 * progress)  # smoothstep
         self._kp = KP_START + alpha * (KP_FULL - KP_START)
         self._kd = KD_START + alpha * (KD_FULL - KD_START)
+
+    def _tick_startup(self):
+        """Hold a neutral stand for STARTUP_SETTLE_STEPS to let the robot settle."""
+        params = self._L4GaitParams(
+            gait_type='trot', step_length=0.0,
+            gait_freq=GAIT_FREQ, step_height=0.0,
+            duty_cycle=1.0, stance_width=0.0, wz=0.0,
+            body_height=BODY_HEIGHT,
+        )
+        self._send_l4(params)
+        if self._step_count >= STARTUP_SETTLE_STEPS:
+            x, y, yaw, z, roll, pitch = self._get_robot_pose()
+            print(f"Startup complete: z={z:.3f}m  R={math.degrees(roll):+.1f}°  "
+                  f"P={math.degrees(pitch):+.1f}°")
+            self._state = GameState.SPAWN_TARGET
 
     def _tick_spawn(self):
         """Spawn a new target and transition to walking."""
@@ -207,6 +274,7 @@ class TargetGame:
                 gait_type='trot', turn_in_place=True, wz=wz,
                 gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                 duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
+                body_height=BODY_HEIGHT,
             )
         else:
             # WALK — L4 differential stride (layer_4/generator.py:134-164)
@@ -224,6 +292,7 @@ class TargetGame:
                 gait_type='trot', step_length=STEP_LENGTH * heading_mod,
                 gait_freq=GAIT_FREQ, step_height=STEP_HEIGHT,
                 duty_cycle=DUTY_CYCLE, stance_width=STANCE_WIDTH, wz=wz,
+                body_height=BODY_HEIGHT,
             )
 
         self._send_l4(params)
@@ -243,10 +312,16 @@ class TargetGame:
         if self._target_step_count % TELEMETRY_INTERVAL == 0:
             t = self._target_step_count * CONTROL_DT
             mode_str = "TURN" if abs(heading_err) > THETA_THRESHOLD else "WALK"
+            # Get velocity for direction analysis
+            body = self._sim.get_body("base")
+            vx = float(body.linvel[0]) if body else 0
+            vy = float(body.linvel[1]) if body else 0
+            v_heading = math.atan2(vy, vx) if (abs(vx) + abs(vy)) > 0.01 else 0
             print(f"[target {self._target_index}/{self._num_targets}] "
                   f"{mode_str}  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
                   f"z={z:.2f}  R={r_deg:+.1f}° P={p_deg:+.1f}°  "
-                  f"pos=({x:.1f}, {y:.1f})  t={t:.1f}s")
+                  f"pos=({x:.1f}, {y:.1f})  yaw={yaw:+.2f}  "
+                  f"v=({vx:+.2f},{vy:+.2f}) v_dir={v_heading:+.2f}  t={t:.1f}s")
 
         if dist < self._reach_threshold:
             self._on_reached()
