@@ -86,15 +86,25 @@ python foreman/test_observation_chain.py --demo  # With simulation demo
 ### Target Game Demo
 Cross-layer integration demo that spawns random targets and drives the robot to them:
 ```bash
-# From workspace root
+# Simple launcher (auto-detects seed genome, domain=2)
+python foreman/run_demo.py                          # b2, 3 targets, v14 seed genome
+python foreman/run_demo.py --robot go2              # Go2
+python foreman/run_demo.py --robot go2w             # Go2 wheeled (differential drive)
+python foreman/run_demo.py --no-genome              # Run without GA-evolved genome
+
+# Full control (from workspace root)
 python -m foreman.demos.target_game --robot b2 --targets 5
 python -m foreman.demos.target_game --robot b2 --targets 3 --headless
 python -m foreman.demos.target_game --robot b2 --seed 42  # Reproducible
 python -m foreman.demos.target_game --robot b2 --full-circle  # 360° target spawning
 python -m foreman.demos.target_game --robot b2 --genome path/to/genome.json  # GA-evolved params
 python -m foreman.demos.target_game --robot b2 --domain 2  # Separate DDS domain (avoids firmware conflicts)
+python -m foreman.demos.target_game --robot b2 --slam  # SLAM odometry (replaces ground-truth position)
+python -m foreman.demos.target_game --robot b2 --slam --obstacles  # SLAM + obstacle scene
 ```
-Runs Layers 1-5 together. Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time (see gotcha below).
+Supported robots: **b2** (legged), **go2** (legged), **go2w** (wheeled), **b2w** (wheeled). Per-robot defaults (gains, step params, body height) live in `game.py:ROBOT_DEFAULTS`.
+
+Runs Layers 1-4 together (legged robots use L4 GaitParams directly, wheeled robots use differential wheel torque). Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time (see gotcha below).
 
 ### Troubleshooting
 ```bash
@@ -155,6 +165,13 @@ MuJoCo and DDS use different orderings. **Forgetting this causes immediate robot
 ### Cross-Layer Config Namespace Collision
 Layers 3, 4, and 5 each have a `config/` package. When imported into the same process (e.g., target game), `importlib.import_module("config.b2")` resolves to the wrong layer's config via `sys.modules`. The target game `__main__.py` works around this by loading each layer's config by file path and injecting into `_active_config` globals. If adding new cross-layer demos, follow the same pattern.
 
+### L4-Direct Control Path (Target Game)
+The target game bypasses Layer 5 and sends L4 GaitParams directly to Layer 4. This is intentional — it matches the GA training control path (`episode.py` also sends GaitParams directly). The game implements its own turn/walk switching via `THETA_THRESHOLD` and its own PD gain ramp (smoothstep from KP_START to KP_FULL over 2.5s).
+
+Wheeled robots (go2w, b2w) bypass even L4 — they hold legs rigid at a pre-specified keyframe pose via PD and drive wheels with pure differential torque. No gait generator is involved.
+
+**Critical**: if you add control logic to the demo, it MUST also be added to `training/ga/episode.py` (or vice versa). The v12 postmortem documents how a control path mismatch between training and demo invalidated an entire training run.
+
 ### Hardware Abstraction
 **Allowed** (available on real robot): joint encoders (`motor_state[i].q`, `.dq`, `.tau_est`), IMU, foot contact forces
 
@@ -199,7 +216,21 @@ Test gains: kp=500, kd=25. Production gains (kp=2500) cause oscillation in simul
 - `philosophy/architecture.md` — Canonical 8-layer model
 - `philosophy/gotchas.md` — Lessons from 40+ postmortems
 - `improvements/IMPLEMENTATION_PLAN.md` — Next phase planning (HNN/RL)
+- `foreman/postmortems/` — Postmortems from training runs and integration issues
+- `foreman/plans/` — Version-specific design docs (v10-v14)
 - Each layer's own `CLAUDE.md` — Authoritative for that layer's development
+
+## Genome Versions
+
+The target game `__main__.py` handles multiple genome formats via auto-detection:
+
+| Version | Key marker | Genes | Notes |
+|---------|-----------|-------|-------|
+| v9 | `FREQ` | 8 | Walk-only params |
+| v10 | `P1_FL_HIP` | 8 + turn joint deltas | Adds per-joint turn offsets |
+| v12 | `GAIT_FREQ` | 13 | Sovereign walk + turn (separate turn genes) |
+
+Genomes are JSON files (either `{"genome": {...}}` or `{"locomotion": {...}, "steering": {...}}`). The `_apply_genome()` function flattens, detects version, expands to L5 constants, and patches module-level globals at runtime.
 
 ## Cross-Repo Shared Utilities
 
@@ -208,6 +239,18 @@ Test gains: kp=500, kd=25. Production gains (kp=2500) cause oscillation in simul
 Training imports from here (`from foreman.demos.target_game.utils import ...`). Never duplicate these functions into other repos. If a new cross-layer utility is needed, add it to utils.py and import it.
 
 The DDS preload has a separate canonical location per repo: `training/ga/dds_preload.py` for training, inline in `__main__.py` for foreman. This is intentional — the preload must happen before any DDS imports, and the two repos have different boot sequences.
+
+## Lessons from Train/Demo Parity (Issue 004 — v12 Postmortem)
+
+The v12 training run evolved champions with 96+ fitness that completely failed in the headed demo: no turns, vibrating feet, wandering arcs. Root cause: training sent GaitParams directly to L4 (`send_gait_params`), but the demo routed through Layer 5 (`MotionCommand`). The two paths have different turn/walk switching logic, different wz clamping, and different parameter routing.
+
+**Train and demo MUST use the same control path.** If training bypasses a layer, the demo must bypass it identically. The v14 fix was Option B: the demo now also sends L4 GaitParams directly (matching training), with the same `THETA_THRESHOLD` switching and `TURN_WZ` values.
+
+**Accumulating fitness terms need physical caps.** The GA exploited unbounded `heading_progress` by oscillating across the target heading (17.5 rad per target vs. pi max meaningful). Cap: `min(heading_progress, pi)` per target.
+
+**Completion-gated fitness is structurally unexploitable.** v14's fitness: `100 * (1 - steps/max_steps)` if all targets reached, `5 * targets_reached` otherwise (max 10 for partial), `0` if fell. The 40+ point gap between partial (max 10) and full completion (50-100) makes exploitation impossible — no amount of fast walking or heading progress earns points without reaching all targets.
+
+See `postmortems/2026-02-v12-sovereign-genome.md` for the full analysis.
 
 ## Lessons from GA Fitness Exploit (Issue 002)
 

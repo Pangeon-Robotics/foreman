@@ -42,6 +42,34 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def frame_transform(points, x: float, y: float, yaw: float):
+    """Transform points from body/sensor frame to world frame.
+
+    Parameters
+    ----------
+    points : array-like, shape (N, 2) or (N, 3)
+        Points in body/sensor frame.
+    x, y : float
+        World-frame position of the body/sensor origin.
+    yaw : float
+        Heading of the body/sensor in world frame (radians).
+
+    Returns
+    -------
+    np.ndarray, same shape as input
+        Points in world frame.
+    """
+    import numpy as np
+    pts = np.asarray(points, dtype=np.float32)
+    c, s = np.cos(yaw), np.sin(yaw)
+    out = np.empty_like(pts)
+    out[:, 0] = c * pts[:, 0] - s * pts[:, 1] + x
+    out[:, 1] = s * pts[:, 0] + c * pts[:, 1] + y
+    if pts.shape[1] > 2:
+        out[:, 2] = pts[:, 2]
+    return out
+
+
 def load_module_by_path(name: str, path: str):
     """Load a Python module by file path without polluting sys.modules."""
     spec = importlib.util.spec_from_file_location(name, path)

@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
 from .target import TargetSpawner
 from .utils import quat_to_yaw as _quat_to_yaw, quat_to_rpy as _quat_to_rpy, clamp as _clamp
+
+if TYPE_CHECKING:
+    from layer_6.slam.odometry import Odometry
 
 
 # --- Game constants ---
@@ -190,6 +194,7 @@ class TargetGame:
         timeout_steps: int = TARGET_TIMEOUT_STEPS,
         seed: int | None = None,
         angle_range: tuple[float, float] | list[tuple[float, float]] = (-math.pi / 2, math.pi / 2),
+        odometry: Odometry | None = None,
     ):
         self._sim = sim
         self._L4GaitParams = L4GaitParams
@@ -199,6 +204,18 @@ class TargetGame:
         self._reach_threshold = reach_threshold
         self._timeout_steps = timeout_steps
         self._angle_range = angle_range
+
+        # SLAM odometry (Phase 1: replaces ground-truth position for nav)
+        self._odometry = odometry
+        self._slam_trail: list[tuple[float, float]] = []   # estimated (x, y)
+        self._truth_trail: list[tuple[float, float]] = []   # ground truth (x, y)
+        self._pose_pub = None       # DDS publisher, set via set_pose_publisher()
+        self._PoseMsg = None
+        self._pose_stamp = None
+        self._perception = None     # PerceptionPipeline, set from __main__.py
+        self._dwa_planner = None    # DWAPlanner, set via set_dwa_planner()
+        self._last_dwa_result = None
+        self._telemetry = None      # TelemetryLog, set via set_telemetry()
 
         # Gains — start low, ramp during first 2.5s of navigation
         self._kp = KP_START
@@ -224,7 +241,7 @@ class TargetGame:
         self._rp_log = []  # (step, roll_deg, pitch_deg, droll, dpitch, mode)
 
     def _get_robot_pose(self) -> tuple[float, float, float, float, float, float]:
-        """Return (x, y, yaw, z, roll, pitch) from simulation."""
+        """Return (x, y, yaw, z, roll, pitch) from simulation ground truth."""
         body = self._sim.get_body("base")
         x = float(body.pos[0])
         y = float(body.pos[1])
@@ -232,6 +249,101 @@ class TargetGame:
         yaw = _quat_to_yaw(body.quat)
         roll, pitch, _ = _quat_to_rpy(body.quat)
         return x, y, yaw, z, roll, pitch
+
+    def _update_slam(self, truth_yaw: float) -> None:
+        """Feed SLAM odometry with current sensor data.
+
+        Uses IMU quaternion from L5 upward state, and body velocity
+        from simulation (ground truth linvel rotated to body frame).
+        The target game bypasses L5 for commands, so L5's commanded
+        velocity is (0,0). We use true velocity as a stand-in for
+        what leg odometry would provide on a real robot.
+        """
+        if self._odometry is None:
+            return
+
+        from types import SimpleNamespace
+
+        # IMU quaternion from L5 upward state (real sensor)
+        l5_state = self._sim.get_state()
+        imu_quat = l5_state.imu_quaternion
+
+        # Body velocity: transform world-frame linvel to body frame
+        body = self._sim.get_body("base")
+        vx_world = float(body.linvel[0])
+        vy_world = float(body.linvel[1])
+        c = math.cos(truth_yaw)
+        s = math.sin(truth_yaw)
+        vx_body = c * vx_world + s * vy_world
+        vy_body = -s * vx_world + c * vy_world
+
+        state = SimpleNamespace(
+            imu_quaternion=imu_quat,
+            body_velocity=(vx_body, vy_body),
+            timestamp=l5_state.timestamp if l5_state.timestamp > 0 else self._step_count * CONTROL_DT,
+        )
+        self._odometry.update(state, CONTROL_DT)
+
+        # Publish pose on DDS (if publisher available)
+        if self._pose_pub is not None:
+            self._publish_pose()
+
+    def set_dwa_planner(self, planner) -> None:
+        """Set DWA planner for obstacle-aware navigation.
+
+        When set, the DWA planner replaces the heading-based controller
+        in _tick_walk. This is demo-only — training uses the heading
+        controller to avoid the v12 train/demo parity issue.
+        """
+        self._dwa_planner = planner
+
+    def set_pose_publisher(self, pub, msg_class, stamp_fn) -> None:
+        """Set DDS publisher for rt/pose_estimate topic.
+
+        Called from __main__.py after DDS init. Optional — if not called,
+        SLAM still works but pose is not published on DDS.
+        """
+        self._pose_pub = pub
+        self._PoseMsg = msg_class
+        self._pose_stamp = stamp_fn
+
+    def set_telemetry(self, telemetry_log) -> None:
+        """Set JSONL telemetry logger for Layer 6 modules.
+
+        When set, the game records SLAM drift, DWA decisions, and perception
+        timing into a JSONL file for post-run analysis.
+        """
+        self._telemetry = telemetry_log
+
+    def _publish_pose(self) -> None:
+        """Publish current SLAM pose on DDS."""
+        if self._odometry is None or self._pose_pub is None:
+            return
+        p = self._odometry.pose
+        msg = self._PoseMsg(x=p.x, y=p.y, yaw=p.yaw, timestamp=p.stamp, crc=0)
+        self._pose_stamp(msg)
+        self._pose_pub.Write(msg)
+
+    def _get_nav_pose(self) -> tuple[float, float, float]:
+        """Return (x, y, yaw) for navigation decisions.
+
+        Uses SLAM estimate when available, ground truth otherwise.
+        """
+        if self._odometry is not None:
+            p = self._odometry.pose
+            return p.x, p.y, p.yaw
+        x, y, yaw, _, _, _ = self._get_robot_pose()
+        return x, y, yaw
+
+    @property
+    def slam_trail(self) -> list[tuple[float, float]]:
+        """SLAM estimated positions (10Hz), for visualization."""
+        return self._slam_trail
+
+    @property
+    def truth_trail(self) -> list[tuple[float, float]]:
+        """Ground truth positions (10Hz), for visualization."""
+        return self._truth_trail
 
     def _send_l4(self, params):
         """Send L4 GaitParams directly to Layer 4 (bypassing L5)."""
@@ -250,6 +362,26 @@ class TargetGame:
         self._step_count += 1
         self._update_gains()
 
+        # Update SLAM odometry (every tick, before navigation)
+        _, _, truth_yaw, _, _, _ = self._get_robot_pose()
+        self._update_slam(truth_yaw)
+
+        # Record trails for visualization (every 10 steps = 10Hz)
+        if self._odometry is not None and self._step_count % 10 == 0:
+            truth_x, truth_y, _, _, _, _ = self._get_robot_pose()
+            self._truth_trail.append((truth_x, truth_y))
+            p = self._odometry.pose
+            self._slam_trail.append((p.x, p.y))
+
+            # Telemetry: SLAM drift
+            if self._telemetry is not None:
+                drift = math.sqrt((p.x - truth_x)**2 + (p.y - truth_y)**2)
+                self._telemetry.record("slam", {
+                    "drift": round(drift, 4),
+                    "slam_x": round(p.x, 3), "slam_y": round(p.y, 3),
+                    "truth_x": round(truth_x, 3), "truth_y": round(truth_y, 3),
+                })
+
         if self._state == GameState.STARTUP:
             self._tick_startup()
         elif self._state == GameState.SPAWN_TARGET:
@@ -257,6 +389,8 @@ class TargetGame:
         elif self._state == GameState.WALK_TO_TARGET:
             if WHEELED:
                 self._tick_walk_wheeled()
+            elif self._dwa_planner is not None and self._perception is not None:
+                self._tick_walk_dwa()
             else:
                 self._tick_walk()
 
@@ -309,8 +443,9 @@ class TargetGame:
             self._state = GameState.DONE
             return
 
-        x, y, yaw, _z, _r, _p = self._get_robot_pose()
-        target = self._spawner.spawn_relative(x, y, yaw, angle_range=self._angle_range)
+        # Use SLAM pose for spawning (target relative to estimated position)
+        nav_x, nav_y, nav_yaw = self._get_nav_pose()
+        target = self._spawner.spawn_relative(nav_x, nav_y, nav_yaw, angle_range=self._angle_range)
         self._target_index += 1
         self._target_step_count = 0
         self._stats.targets_spawned += 1
@@ -324,9 +459,10 @@ class TargetGame:
         except (RuntimeError, AttributeError):
             pass  # No mocap body in scene (headless without target scene)
 
-        dist = target.distance_to(x, y)
+        dist = target.distance_to(nav_x, nav_y)
+        src = "SLAM" if self._odometry else "truth"
         print(f"\n[target {self._target_index}/{self._num_targets}] "
-              f"spawned at ({target.x:.1f}, {target.y:.1f})  dist={dist:.1f}m")
+              f"spawned at ({target.x:.1f}, {target.y:.1f})  dist={dist:.1f}m  (nav={src})")
 
         self._state = GameState.WALK_TO_TARGET
 
@@ -336,20 +472,25 @@ class TargetGame:
         Matches GA training episode logic (episode.py:1771-1811):
         - Large heading error -> turn in place (L4 arc mode)
         - Small heading error -> walk with differential stride
+
+        When SLAM odometry is active, heading/distance use the estimated
+        pose. Fall detection still uses ground truth (z-height).
         """
-        x, y, yaw, z, roll, pitch = self._get_robot_pose()
+        x_truth, y_truth, yaw_truth, z, roll, pitch = self._get_robot_pose()
         target = self._spawner.current_target
         self._target_step_count += 1
 
-        # Fall detection (matches GA episode: rz < nominal_z * 0.5)
+        # Fall detection uses ground truth (z-height is not estimated by SLAM)
         if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
             self._stats.falls += 1
             print(f"FALL DETECTED at z={z:.3f}m (threshold={NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:.3f}m)")
             self._state = GameState.SPAWN_TARGET
             return
 
-        heading_err = target.heading_error(x, y, yaw)
-        dist = target.distance_to(x, y)
+        # Navigation uses SLAM pose when available
+        nav_x, nav_y, nav_yaw = self._get_nav_pose()
+        heading_err = target.heading_error(nav_x, nav_y, nav_yaw)
+        dist = target.distance_to(nav_x, nav_y)
 
         if abs(heading_err) > THETA_THRESHOLD:
             # TURN IN PLACE — L4 arc mode (layer_4/generator.py:100-132)
@@ -401,11 +542,116 @@ class TargetGame:
             vx = float(body.linvel[0]) if body else 0
             vy = float(body.linvel[1]) if body else 0
             v_heading = math.atan2(vy, vx) if (abs(vx) + abs(vy)) > 0.01 else 0
+            slam_info = ""
+            if self._odometry is not None:
+                drift = math.sqrt((nav_x - x_truth)**2 + (nav_y - y_truth)**2)
+                slam_info = f"  drift={drift:.3f}m"
             print(f"[target {self._target_index}/{self._num_targets}] "
                   f"{mode_str}  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
                   f"z={z:.2f}  R={r_deg:+.1f}° P={p_deg:+.1f}°  "
-                  f"pos=({x:.1f}, {y:.1f})  yaw={yaw:+.2f}  "
-                  f"v=({vx:+.2f},{vy:+.2f}) v_dir={v_heading:+.2f}  t={t:.1f}s")
+                  f"pos=({nav_x:.1f}, {nav_y:.1f})  yaw={nav_yaw:+.2f}  "
+                  f"v=({vx:+.2f},{vy:+.2f}) v_dir={v_heading:+.2f}  t={t:.1f}s"
+                  f"{slam_info}")
+
+        if dist < self._reach_threshold:
+            self._on_reached()
+            return
+
+        if self._target_step_count >= self._timeout_steps:
+            self._on_timeout()
+
+    def _tick_walk_dwa(self):
+        """Walk toward target using DWA obstacle avoidance.
+
+        DWA replans at 10Hz (every 10 ticks). Between replans, the last
+        DWA command persists. Uses the perception pipeline's costmap for
+        obstacle awareness. Falls back to heading controller if no
+        costmap is available yet.
+        """
+        x_truth, y_truth, yaw_truth, z, roll, pitch = self._get_robot_pose()
+        target = self._spawner.current_target
+        self._target_step_count += 1
+
+        # Fall detection uses ground truth
+        if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
+            self._stats.falls += 1
+            print(f"FALL DETECTED at z={z:.3f}m")
+            self._state = GameState.SPAWN_TARGET
+            return
+
+        nav_x, nav_y, nav_yaw = self._get_nav_pose()
+        dist = target.distance_to(nav_x, nav_y)
+
+        # Replan at 10Hz (every 10 ticks)
+        if self._target_step_count % 10 == 0:
+            costmap_q = self._perception.costmap_query if self._perception else None
+            if costmap_q is not None:
+                # Goal in robot-centered frame
+                goal_x = target.x - nav_x
+                goal_y = target.y - nav_y
+                # Rotate to robot frame
+                c = math.cos(-nav_yaw)
+                s = math.sin(-nav_yaw)
+                goal_rx = c * goal_x - s * goal_y
+                goal_ry = s * goal_x + c * goal_y
+
+                result = self._dwa_planner.plan(costmap_q, goal_x=goal_rx, goal_y=goal_ry)
+                self._last_dwa_result = result
+
+                # Telemetry: DWA decision
+                if self._telemetry is not None:
+                    self._telemetry.record("dwa", {
+                        "forward": round(result.forward, 3),
+                        "turn": round(result.turn, 3),
+                        "score": round(result.score, 3),
+                        "n_feasible": result.n_feasible,
+                        "goal_rx": round(goal_rx, 2),
+                        "goal_ry": round(goal_ry, 2),
+                        "dist": round(dist, 2),
+                    })
+
+        # Convert DWA result to L4 gait params
+        if self._last_dwa_result is not None and self._last_dwa_result.n_feasible > 0:
+            dwa = self._last_dwa_result
+            # Map DWA (forward, turn) to L4 commands
+            heading_mod = dwa.forward  # 0.0 to 1.0
+            wz = _clamp(dwa.turn * WZ_LIMIT, -WZ_LIMIT, WZ_LIMIT)
+
+            if heading_mod < 0.1 and abs(wz) > 0.3:
+                # DWA says turn — use arc mode
+                params = self._L4GaitParams(
+                    gait_type='trot', turn_in_place=True, wz=wz,
+                    gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
+                    duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
+                    body_height=BODY_HEIGHT,
+                )
+            else:
+                params = self._L4GaitParams(
+                    gait_type='trot', step_length=STEP_LENGTH * heading_mod,
+                    gait_freq=GAIT_FREQ, step_height=STEP_HEIGHT,
+                    duty_cycle=DUTY_CYCLE, stance_width=STANCE_WIDTH, wz=wz,
+                    body_height=BODY_HEIGHT,
+                )
+        else:
+            # Emergency stop or no costmap yet — stand still
+            params = self._L4GaitParams(
+                gait_type='trot', step_length=0.0,
+                gait_freq=GAIT_FREQ, step_height=0.0,
+                duty_cycle=1.0, stance_width=0.0, wz=0.0,
+                body_height=BODY_HEIGHT,
+            )
+
+        self._send_l4(params)
+
+        # Telemetry
+        if self._target_step_count % TELEMETRY_INTERVAL == 0:
+            t = self._target_step_count * CONTROL_DT
+            dwa_info = ""
+            if self._last_dwa_result is not None:
+                d = self._last_dwa_result
+                dwa_info = f"  dwa=({d.forward:.2f},{d.turn:.2f}) score={d.score:.2f} feasible={d.n_feasible}"
+            print(f"[target {self._target_index}/{self._num_targets}] "
+                  f"DWA  dist={dist:.1f}m  pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s{dwa_info}")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -420,19 +666,21 @@ class TargetGame:
         No gait generator — legs hold rigid at home pose via PD,
         wheels get pure torque for forward drive + differential steering.
         """
-        x, y, yaw, z, roll, pitch = self._get_robot_pose()
+        x_truth, y_truth, yaw_truth, z, roll, pitch = self._get_robot_pose()
         target = self._spawner.current_target
         self._target_step_count += 1
 
-        # Fall detection (same threshold as walking)
+        # Fall detection uses ground truth (same threshold as walking)
         if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
             self._stats.falls += 1
             print(f"FALL DETECTED at z={z:.3f}m (threshold={NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:.3f}m)")
             self._state = GameState.SPAWN_TARGET
             return
 
-        heading_err = target.heading_error(x, y, yaw)
-        dist = target.distance_to(x, y)
+        # Navigation uses SLAM pose when available
+        nav_x, nav_y, nav_yaw = self._get_nav_pose()
+        heading_err = target.heading_error(nav_x, nav_y, nav_yaw)
+        dist = target.distance_to(nav_x, nav_y)
 
         # Forward: proportional to alignment², taper near target.
         # Squaring alignment prioritizes turning: at 60° off, fwd drops to 6%
@@ -468,7 +716,7 @@ class TargetGame:
             print(f"[target {self._target_index}/{self._num_targets}] "
                   f"DRIVE  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
                   f"z={z:.2f}  fwd={fwd:.1f}Nm  turn={turn:.1f}Nm  "
-                  f"pos=({x:.1f}, {y:.1f})  v=({vx:+.2f},{vy:+.2f})  t={t:.1f}s")
+                  f"pos=({nav_x:.1f}, {nav_y:.1f})  v=({vx:+.2f},{vy:+.2f})  t={t:.1f}s")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -525,6 +773,8 @@ class TargetGame:
             time.sleep(CONTROL_DT)
 
         self._stats.total_time = time.monotonic() - start_time
+        if self._telemetry is not None:
+            self._telemetry.close()
         self._print_summary()
         return self._stats
 
@@ -535,7 +785,23 @@ class TargetGame:
               f"({s.success_rate:.0%})")
         print(f"Timeouts: {s.targets_timeout}  Falls: {s.falls}")
         print(f"Total time: {s.total_time:.1f}s")
+        self._print_slam_analysis()
         self._print_rp_analysis()
+
+    def _print_slam_analysis(self):
+        """Print SLAM drift analysis if odometry was active."""
+        if self._odometry is None or not self._truth_trail:
+            return
+        drifts = [
+            math.sqrt((s[0] - t[0])**2 + (s[1] - t[1])**2)
+            for s, t in zip(self._slam_trail, self._truth_trail)
+        ]
+        if not drifts:
+            return
+        print("\n=== SLAM DRIFT ANALYSIS ===")
+        print(f"Samples: {len(drifts)} ({len(drifts) * 0.1:.1f}s at 10Hz)")
+        print(f"Drift: min={min(drifts):.3f}m  max={max(drifts):.3f}m  "
+              f"mean={sum(drifts)/len(drifts):.3f}m  final={drifts[-1]:.3f}m")
 
     def _print_rp_analysis(self):
         """Print pitch/roll dynamics analysis."""

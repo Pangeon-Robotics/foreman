@@ -231,6 +231,10 @@ def main():
                         help="Spawn targets at any angle (uniform -pi to pi)")
     parser.add_argument("--domain", type=int, default=None,
                         help="DDS domain ID (avoids conflict with running firmware)")
+    parser.add_argument("--slam", action="store_true",
+                        help="Use SLAM odometry instead of ground-truth position")
+    parser.add_argument("--obstacles", action="store_true",
+                        help="Use scene_obstacles.xml with static obstacles")
     args = parser.parse_args()
 
     print(f"Starting target game: robot={args.robot}, targets={args.targets}")
@@ -256,8 +260,35 @@ def main():
             _orig_init(self, *a, **kw)
         FirmwareLauncher.__init__ = _patched_init
 
-    # Use scene with mocap target body for visual markers
-    scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene_target.xml"
+    # Initialize SLAM odometry if requested
+    odometry = None
+    if args.slam:
+        # Add workspace root to path for layer_6 imports
+        if str(_root) not in sys.path:
+            sys.path.insert(0, str(_root))
+        from layer_6.slam.odometry import Odometry
+        odometry = Odometry()
+        print("SLAM odometry enabled (Phase 1: IMU yaw + body velocity)")
+
+    # Initialize telemetry log if SLAM is active
+    telemetry_log = None
+    if args.slam:
+        from layer_6.telemetry import TelemetryLog
+        telem_dir = _root / "tmp" / "telemetry"
+        telem_dir.mkdir(parents=True, exist_ok=True)
+        import time as _time
+        telem_path = telem_dir / f"target_game_{args.robot}_{int(_time.time())}.jsonl"
+        telemetry_log = TelemetryLog(telem_path)
+        print(f"Telemetry: {telem_path}")
+
+    # Select scene variant
+    if args.obstacles:
+        scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene_obstacles.xml"
+        if not scene_path.exists():
+            print(f"Warning: scene_obstacles.xml not found for {args.robot}, falling back")
+            scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene_target.xml"
+    else:
+        scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene_target.xml"
     if not scene_path.exists():
         scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene.xml"
         print(f"Warning: scene_target.xml not found for {args.robot}, using scene.xml")
@@ -283,10 +314,66 @@ def main():
             num_targets=args.targets,
             seed=args.seed,
             angle_range=angle_range,
+            odometry=odometry,
         )
+
+        # Wire up telemetry log
+        if telemetry_log is not None:
+            game.set_telemetry(telemetry_log)
+
+        # Wire up DDS publishers/subscribers if SLAM is active
+        perception = None
+        if odometry is not None:
+            try:
+                from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
+                from messages import PoseEstimate_, PointCloud_
+                from dds import dds_init, stamp_cmd
+                domain = args.domain if args.domain is not None else 1
+                dds_init(domain_id=domain, interface="lo")
+
+                # Pose publisher
+                pose_pub = ChannelPublisher("rt/pose_estimate", PoseEstimate_)
+                pose_pub.Init()
+                game.set_pose_publisher(pose_pub, PoseEstimate_, stamp_cmd)
+                print(f"DDS pose publisher on rt/pose_estimate (domain={domain})")
+
+                # Point cloud subscriber + perception pipeline (if obstacles)
+                if args.obstacles:
+                    from layer_6.config.defaults import get_perception_config
+                    from layer_6.planner.dwa import DWAPlanner, DWAConfig
+                    from .perception import PerceptionPipeline
+                    pcfg = get_perception_config(args.robot)
+                    perception = PerceptionPipeline(odometry, pcfg)
+                    cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
+                    cloud_sub.Init(perception.on_point_cloud, 5)
+                    game._perception = perception
+                    print(f"Perception pipeline active: TSDF + costmap (voxel={pcfg.tsdf_voxel_size}m)")
+
+                    # Wire up DWA planner
+                    dwa_cfg = DWAConfig(
+                        v_max=pcfg.v_max, w_max=pcfg.w_max,
+                        w_clearance=pcfg.dwa_w_clearance,
+                        w_goal_dist=pcfg.dwa_w_goal_dist,
+                        w_goal_heading=pcfg.dwa_w_goal_heading,
+                        w_speed=pcfg.dwa_w_speed,
+                        lethal_threshold=pcfg.dwa_lethal_threshold,
+                    )
+                    game.set_dwa_planner(DWAPlanner(dwa_cfg))
+                    print(f"DWA planner active: v_max={pcfg.v_max}, w_max={pcfg.w_max}")
+
+            except Exception as e:
+                print(f"Warning: DDS setup failed: {e} (SLAM still works)")
+
         stats = game.run()
         print(f"\nFinal: {stats.targets_reached}/{stats.targets_spawned} "
               f"reached ({stats.success_rate:.0%})")
+
+        # Print perception stats
+        if perception is not None:
+            ps = perception.stats
+            if ps["builds"] > 0:
+                print(f"\nPerception: {ps['builds']} costmaps built, "
+                      f"mean={ps['mean_ms']:.1f}ms, max={ps['max_ms']:.1f}ms")
     finally:
         sim.stop()
 
