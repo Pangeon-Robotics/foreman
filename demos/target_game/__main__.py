@@ -12,6 +12,7 @@ if _os.path.exists(_SYS_DDSC):
 import argparse
 import json
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -43,8 +44,18 @@ from config.defaults import MotionCommand  # noqa: F401 — captured for game.py
 _l4_sim = sys.modules["_l4_simulation"]
 L4GaitParams = _l4_sim.GaitParams
 
-from .game import TargetGame, configure_for_robot
+from .game import TargetGame, configure_for_robot, GameStatistics, CONTROL_DT, TARGET_TIMEOUT_STEPS
 from .utils import load_module_by_path, patch_layer_configs
+
+
+@dataclass
+class GameRunResult:
+    """Result from a single game run, consumed by scenario critics."""
+    stats: GameStatistics
+    telemetry_path: Path | None = None
+    slam_trail: list[tuple[float, float]] = field(default_factory=list)
+    truth_trail: list[tuple[float, float]] = field(default_factory=list)
+    perception_stats: dict | None = None
 
 
 def _expand_v9_genome(params: dict) -> dict:
@@ -219,42 +230,40 @@ def _apply_genome(genome_path: str) -> None:
     print(f"Applied genome gen={gen}, fitness={fitness}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Random Target Game")
-    parser.add_argument("--robot", default="b2")
-    parser.add_argument("--targets", type=int, default=5)
-    parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--genome", type=str, default=None,
-                        help="Path to GA-evolved genome JSON file")
-    parser.add_argument("--full-circle", action="store_true",
-                        help="Spawn targets at any angle (uniform -pi to pi)")
-    parser.add_argument("--domain", type=int, default=None,
-                        help="DDS domain ID (avoids conflict with running firmware)")
-    parser.add_argument("--slam", action="store_true",
-                        help="Use SLAM odometry instead of ground-truth position")
-    parser.add_argument("--obstacles", action="store_true",
-                        help="Use scene_obstacles.xml with static obstacles")
-    args = parser.parse_args()
+def run_game(args) -> GameRunResult:
+    """Run target game with given configuration. Returns structured result.
 
+    Called by both the CLI main() and the scenario runner. The args namespace
+    should have at minimum: robot, targets, headless, seed, genome,
+    full_circle, domain, slam, obstacles.
+
+    Optional attributes (used by scenario runner):
+        scene_path (str): Override scene XML path (bypasses obstacles logic)
+        timeout_per_target (float): Seconds per target before timeout
+        min_dist (float): Min target spawn distance (default 3.0)
+        max_dist (float): Max target spawn distance (default 6.0)
+        angle_range: Override target spawning angle range
+    """
     print(f"Starting target game: robot={args.robot}, targets={args.targets}")
 
     # Configure game constants for this robot (before genome, so genome overrides)
     configure_for_robot(args.robot)
 
-    if args.genome:
-        print(f"\nApplying evolved genome: {args.genome}")
-        _apply_genome(args.genome)
+    genome = getattr(args, 'genome', None)
+    if genome:
+        print(f"\nApplying evolved genome: {genome}")
+        _apply_genome(genome)
 
     # Pre-populate config caches to avoid runtime namespace collision
     patch_layer_configs(args.robot, Path(_root))
 
-    # If --domain specified, monkey-patch FirmwareLauncher to use it
+    # If domain specified, monkey-patch FirmwareLauncher to use it
     # (avoids DDS session conflict with other running firmware)
-    if args.domain is not None:
+    domain = getattr(args, 'domain', None)
+    if domain is not None:
         from launcher import FirmwareLauncher
         _orig_init = FirmwareLauncher.__init__
-        _domain = args.domain
+        _domain = domain
         def _patched_init(self, *a, **kw):
             kw["domain"] = _domain
             _orig_init(self, *a, **kw)
@@ -262,7 +271,8 @@ def main():
 
     # Initialize SLAM odometry if requested
     odometry = None
-    if args.slam:
+    slam = getattr(args, 'slam', False)
+    if slam:
         # Add workspace root to path for layer_6 imports
         if str(_root) not in sys.path:
             sys.path.insert(0, str(_root))
@@ -272,7 +282,8 @@ def main():
 
     # Initialize telemetry log if SLAM is active
     telemetry_log = None
-    if args.slam:
+    telem_path = None
+    if slam:
         from layer_6.telemetry import TelemetryLog
         telem_dir = _root / "tmp" / "telemetry"
         telem_dir.mkdir(parents=True, exist_ok=True)
@@ -281,8 +292,11 @@ def main():
         telemetry_log = TelemetryLog(telem_path)
         print(f"Telemetry: {telem_path}")
 
-    # Select scene variant
-    if args.obstacles:
+    # Select scene variant (scene_path override takes priority)
+    scene_path_override = getattr(args, 'scene_path', None)
+    if scene_path_override:
+        scene_path = Path(scene_path_override)
+    elif getattr(args, 'obstacles', False):
         scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene_obstacles.xml"
         if not scene_path.exists():
             print(f"Warning: scene_obstacles.xml not found for {args.robot}, falling back")
@@ -292,29 +306,52 @@ def main():
     if not scene_path.exists():
         scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene.xml"
         print(f"Warning: scene_target.xml not found for {args.robot}, using scene.xml")
+
+    headless = getattr(args, 'headless', False)
     sim = SimulationManager(
         args.robot,
-        headless=args.headless,
+        headless=headless,
         scene=str(scene_path),
         track_bodies=["target"],
+        domain=domain,
     )
     sim.start()
+    perception = None
     try:
         import math
-        if args.full_circle:
+        full_circle = getattr(args, 'full_circle', False)
+        if full_circle:
             angle_range = (-math.pi, math.pi)
         else:
             # Exclude front cone (+/-30deg): spawn to the sides and behind
             angle_range = [(math.pi / 6, math.pi), (-math.pi, -math.pi / 6)]
+
+        # Allow per-scenario override of angle_range
+        angle_range_override = getattr(args, 'angle_range', None)
+        if angle_range_override is not None:
+            angle_range = angle_range_override
+
+        # Per-scenario timeout override
+        timeout_steps = TARGET_TIMEOUT_STEPS
+        timeout_per_target = getattr(args, 'timeout_per_target', None)
+        if timeout_per_target is not None:
+            timeout_steps = int(timeout_per_target / CONTROL_DT)
+
+        min_dist = getattr(args, 'min_dist', 3.0)
+        max_dist = getattr(args, 'max_dist', 6.0)
+
         game = TargetGame(
             sim,
             L4GaitParams=L4GaitParams,
             make_low_cmd=_l4_sim._make_low_cmd,
             stamp_cmd=_l4_sim._stamp_cmd,
             num_targets=args.targets,
-            seed=args.seed,
+            seed=getattr(args, 'seed', None),
             angle_range=angle_range,
             odometry=odometry,
+            min_dist=min_dist,
+            max_dist=max_dist,
+            timeout_steps=timeout_steps,
         )
 
         # Wire up telemetry log
@@ -322,23 +359,30 @@ def main():
             game.set_telemetry(telemetry_log)
 
         # Wire up DDS publishers/subscribers if SLAM is active
-        perception = None
+        obstacles = getattr(args, 'obstacles', False)
         if odometry is not None:
             try:
                 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
-                from messages import PoseEstimate_, PointCloud_
+                # PoseEstimate_ and PointCloud_ are in layers_1_2/messages.py,
+                # not layer_3/messages.py (which is cached in sys.modules from L5).
+                _l12_msgs = load_module_by_path("_l12_messages", str(_root / "layers_1_2" / "messages.py"))
+                PoseEstimate_ = _l12_msgs.PoseEstimate_
+                PointCloud_ = _l12_msgs.PointCloud_
                 from dds import dds_init, stamp_cmd
-                domain = args.domain if args.domain is not None else 1
-                dds_init(domain_id=domain, interface="lo")
+                dds_domain = domain if domain is not None else 1
+                dds_init(domain_id=dds_domain, interface="lo")
 
                 # Pose publisher
                 pose_pub = ChannelPublisher("rt/pose_estimate", PoseEstimate_)
                 pose_pub.Init()
-                game.set_pose_publisher(pose_pub, PoseEstimate_, stamp_cmd)
-                print(f"DDS pose publisher on rt/pose_estimate (domain={domain})")
+                # PoseEstimate_ is a Layer 6 internal message — no CRC needed.
+                # stamp_cmd only handles Layer 3 motor commands.
+                _noop_stamp = lambda msg: None
+                game.set_pose_publisher(pose_pub, PoseEstimate_, _noop_stamp)
+                print(f"DDS pose publisher on rt/pose_estimate (domain={dds_domain})")
 
                 # Point cloud subscriber + perception pipeline (if obstacles)
-                if args.obstacles:
+                if obstacles:
                     from layer_6.config.defaults import get_perception_config
                     from layer_6.planner.dwa import DWAPlanner, DWAConfig
                     from .perception import PerceptionPipeline
@@ -361,21 +405,61 @@ def main():
                     game.set_dwa_planner(DWAPlanner(dwa_cfg))
                     print(f"DWA planner active: v_max={pcfg.v_max}, w_max={pcfg.w_max}")
 
+                    # Wait for first point cloud (DDS discovery + LiDAR scan)
+                    import time as _time
+                    _pc_deadline = _time.monotonic() + 5.0
+                    while perception.costmap_query is None and _time.monotonic() < _pc_deadline:
+                        _time.sleep(0.1)
+                    if perception.costmap_query is not None:
+                        print(f"First costmap received ({perception.stats['builds']} builds)")
+                    else:
+                        print("Warning: no point cloud received after 5s (DWA will use fallback)")
+
             except Exception as e:
                 print(f"Warning: DDS setup failed: {e} (SLAM still works)")
 
         stats = game.run()
-        print(f"\nFinal: {stats.targets_reached}/{stats.targets_spawned} "
-              f"reached ({stats.success_rate:.0%})")
 
-        # Print perception stats
-        if perception is not None:
-            ps = perception.stats
-            if ps["builds"] > 0:
-                print(f"\nPerception: {ps['builds']} costmaps built, "
-                      f"mean={ps['mean_ms']:.1f}ms, max={ps['max_ms']:.1f}ms")
+        return GameRunResult(
+            stats=stats,
+            telemetry_path=telem_path,
+            slam_trail=list(game.slam_trail),
+            truth_trail=list(game.truth_trail),
+            perception_stats=perception.stats if perception is not None else None,
+        )
     finally:
         sim.stop()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Random Target Game")
+    parser.add_argument("--robot", default="b2")
+    parser.add_argument("--targets", type=int, default=5)
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--genome", type=str, default=None,
+                        help="Path to GA-evolved genome JSON file")
+    parser.add_argument("--full-circle", action="store_true",
+                        help="Spawn targets at any angle (uniform -pi to pi)")
+    parser.add_argument("--domain", type=int, default=None,
+                        help="DDS domain ID (avoids conflict with running firmware)")
+    parser.add_argument("--slam", action="store_true",
+                        help="Use SLAM odometry instead of ground-truth position")
+    parser.add_argument("--obstacles", action="store_true",
+                        help="Use scene_obstacles.xml with static obstacles")
+    args = parser.parse_args()
+
+    result = run_game(args)
+
+    print(f"\nFinal: {result.stats.targets_reached}/{result.stats.targets_spawned} "
+          f"reached ({result.stats.success_rate:.0%})")
+
+    # Print perception stats
+    if result.perception_stats is not None:
+        ps = result.perception_stats
+        if ps.get("builds", 0) > 0:
+            print(f"\nPerception: {ps['builds']} costmaps built, "
+                  f"mean={ps['mean_ms']:.1f}ms, max={ps['max_ms']:.1f}ms")
 
 
 if __name__ == "__main__":

@@ -78,6 +78,12 @@ class PerceptionPipeline:
 
         data = np.array(msg.data[:num_pts * 3], dtype=np.float32).reshape(-1, 3)
 
+        # LiDAR points are in sensor-local frame (Z=0 for horizontal rays).
+        # The costmap height filter uses strict z > z_lo (z_lo=0.0), which
+        # excludes horizontal returns at Z=0. Offset by sensor height above
+        # body center so points register within the costmap z-range.
+        data[:, 2] += getattr(self._cfg, 'lidar_z_offset', 0.18)
+
         # Get current SLAM pose for the costmap origin
         pose = self._odometry.pose
         l6_pose = self._Pose2D(x=pose.x, y=pose.y, yaw=pose.yaw, stamp=pose.stamp)

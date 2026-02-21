@@ -566,7 +566,7 @@ class TargetGame:
         DWA replans at 10Hz (every 10 ticks). Between replans, the last
         DWA command persists. Uses the perception pipeline's costmap for
         obstacle awareness. Falls back to heading controller if no
-        costmap is available yet.
+        costmap is available after 3 seconds.
         """
         x_truth, y_truth, yaw_truth, z, roll, pitch = self._get_robot_pose()
         target = self._spawner.current_target
@@ -577,6 +577,12 @@ class TargetGame:
             self._stats.falls += 1
             print(f"FALL DETECTED at z={z:.3f}m")
             self._state = GameState.SPAWN_TARGET
+            return
+
+        # Fallback: if no DWA result after 3s, use heading controller
+        DWA_FALLBACK_STEPS = 300  # 3 seconds at 100 Hz
+        if self._last_dwa_result is None and self._target_step_count > DWA_FALLBACK_STEPS:
+            self._tick_walk()
             return
 
         nav_x, nav_y, nav_yaw = self._get_nav_pose()
