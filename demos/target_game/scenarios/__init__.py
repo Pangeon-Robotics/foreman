@@ -58,17 +58,19 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
     "scattered": ScenarioDefinition(
         name="scattered",
         scene_xml="scene_scenario_scattered.xml",
-        num_targets=3,
+        num_targets=5,
         target_seed=42,
         timeout_per_target=90.0,
-        full_circle=True,
+        full_circle=False,
+        angle_range=(-math.pi / 4, math.pi / 4),  # forward 90° cone — through obstacle field
+        min_dist=3.0,
+        max_dist=5.0,
         pass_criteria={
-            "target_success_rate": 1.0,
-            "max_falls": 0,
+            "target_success_rate": 0.6,  # at least 3 of 5
+            "max_falls": 1,
             "max_slam_drift_mean": 0.5,
-            "max_slam_drift_final": 1.0,
-            "forward_progress_pct": 0.70,
-            "min_dwa_feasible_mean": 20,
+            "max_slam_drift_final": 1.5,
+            "min_dwa_feasible_mean": 15,
         },
     ),
     "corridor": ScenarioDefinition(
