@@ -43,6 +43,14 @@ TURN_STANCE_WIDTH = 0.08
 TURN_WZ = 1.0
 THETA_THRESHOLD = 0.6
 
+# --- Wheeled robot parameters (set by configure_for_robot) ---
+
+WHEELED = False
+WHEEL_FWD_TORQUE = 2.0
+WHEEL_KP_YAW = 4.0
+WHEEL_MAX_TURN = 12.0
+WHEEL_HOME_Q = None  # Keyframe leg pose for PD hold (12 values, actuator order)
+
 # --- Per-robot defaults ---
 # Scaling rationale: Go2 legs are 60% of B2 (0.213/0.35), mass is 25% (15/60 kg).
 # Step params scale with leg length, gains scale with mass, freq scales inversely.
@@ -73,6 +81,49 @@ ROBOT_DEFAULTS = {
         "TURN_DUTY_CYCLE": 0.65, "TURN_STANCE_WIDTH": 0.04,
         "TURN_WZ": 0.8, "THETA_THRESHOLD": 0.6,
     },
+    "go2w": {
+        "WHEELED": True,
+        "NOMINAL_BODY_HEIGHT": 0.34,       # Proportional go2 target height (73% of B2's 0.465m)
+        # Elegantly poised stance: splayed hips + fore/aft stagger for wide support polygon.
+        # CoM analysis: tipping force (97.6N) > friction limit (74.5N) → can't tip over.
+        # Actuator order: FR, FL, RR, RL — each [hip_abd, thigh, knee]
+        "WHEEL_HOME_Q": [
+            -0.25, 0.85, -1.6,   # FR: hip splay out, front thigh, knee
+            +0.25, 0.85, -1.6,   # FL: hip splay out, front thigh, knee
+            -0.25, 0.75, -1.6,   # RR: hip splay out, rear thigh, knee
+            +0.25, 0.75, -1.6,   # RL: hip splay out, rear thigh, knee
+        ],
+        # Gains: go2w motors max 23.7 Nm. Rigid hold at home pose.
+        "KP_START": 150.0, "KP_FULL": 150.0,
+        "KD_START": 7.5, "KD_FULL": 7.5,
+        # With rigid legs and wide support polygon, robot rolls on wheels like a car.
+        # Higher torque OK because splayed stance prevents tipping.
+        "WHEEL_FWD_TORQUE": 2.0,           # Nm per wheel (5.0 caused 44° nose-dive)
+        "WHEEL_KP_YAW": 4.0,              # Nm/rad heading proportional
+        "WHEEL_MAX_TURN": 6.0,            # Nm max differential
+    },
+    "b2w": {
+        "WHEELED": True,
+        "NOMINAL_BODY_HEIGHT": 0.46,       # B2 target height (~0.465m), splayed stance
+        # Elegantly poised stance: splayed hips + fore/aft stagger.
+        # B2w legs: thigh=0.35m, calf=0.35m. Motors: 200 Nm (hip/thigh), 300 Nm (calf).
+        # Front height: 0.35*cos(0.95) + 0.35*cos(-0.75) = 0.460m
+        # Rear height:  0.35*cos(0.85) + 0.35*cos(-0.85) = 0.460m
+        # Actuator order: FR, FL, RR, RL — each [hip_abd, thigh, knee]
+        "WHEEL_HOME_Q": [
+            -0.25, 0.95, -1.7,   # FR: hip splay out, front thigh, knee
+            +0.25, 0.95, -1.7,   # FL: hip splay out, front thigh, knee
+            -0.25, 0.85, -1.7,   # RR: hip splay out, rear thigh, knee
+            +0.25, 0.85, -1.7,   # RL: hip splay out, rear thigh, knee
+        ],
+        # Gains: b2w is 65 kg, needs high PD to hold pose rigidly.
+        "KP_START": 4000.0, "KP_FULL": 4000.0,
+        "KD_START": 126.5, "KD_FULL": 126.5,
+        # b2w: 65 kg robot, 20 Nm wheel motors. Strong torque OK with splayed stance.
+        "WHEEL_FWD_TORQUE": 15.0,          # Nm per wheel
+        "WHEEL_KP_YAW": 8.0,              # Nm/rad heading proportional
+        "WHEEL_MAX_TURN": 12.0,           # Nm max differential
+    },
 }
 
 
@@ -86,8 +137,12 @@ def configure_for_robot(robot: str) -> None:
     defaults = ROBOT_DEFAULTS.get(robot, ROBOT_DEFAULTS["b2"])
     for name, value in defaults.items():
         setattr(mod, name, value)
-    print(f"Configured game for {robot}: height={defaults['NOMINAL_BODY_HEIGHT']}m, "
-          f"KP={defaults['KP_FULL']}, step_h={defaults['STEP_HEIGHT']}m")
+    if defaults.get('WHEELED'):
+        print(f"Configured game for {robot} (wheeled): height={defaults['NOMINAL_BODY_HEIGHT']}m, "
+              f"KP={defaults['KP_FULL']}, fwd_torque={defaults['WHEEL_FWD_TORQUE']}Nm")
+    else:
+        print(f"Configured game for {robot}: height={defaults['NOMINAL_BODY_HEIGHT']}m, "
+              f"KP={defaults['KP_FULL']}, step_h={defaults['STEP_HEIGHT']}m")
 
 
 STARTUP_SETTLE_STEPS = 100  # 1s at 100 Hz — let robot settle before first gait command
@@ -126,6 +181,8 @@ class TargetGame:
         self,
         sim,
         L4GaitParams=None,
+        make_low_cmd=None,
+        stamp_cmd=None,
         num_targets: int = 5,
         min_dist: float = 3.0,
         max_dist: float = 6.0,
@@ -136,6 +193,8 @@ class TargetGame:
     ):
         self._sim = sim
         self._L4GaitParams = L4GaitParams
+        self._make_low_cmd = make_low_cmd
+        self._stamp_cmd = stamp_cmd
         self._num_targets = num_targets
         self._reach_threshold = reach_threshold
         self._timeout_steps = timeout_steps
@@ -157,6 +216,9 @@ class TargetGame:
         self._target_index = 0
         self._step_count = 0
         self._target_step_count = 0
+
+        # Wheeled mode: use keyframe pose for rigid leg PD hold
+        self._home_q = WHEEL_HOME_Q if WHEELED else None
 
         # Pitch/roll diagnostics
         self._rp_log = []  # (step, roll_deg, pitch_deg, droll, dpitch, mode)
@@ -193,7 +255,10 @@ class TargetGame:
         elif self._state == GameState.SPAWN_TARGET:
             self._tick_spawn()
         elif self._state == GameState.WALK_TO_TARGET:
-            self._tick_walk()
+            if WHEELED:
+                self._tick_walk_wheeled()
+            else:
+                self._tick_walk()
 
         return self._state != GameState.DONE
 
@@ -209,17 +274,33 @@ class TargetGame:
 
     def _tick_startup(self):
         """Hold a neutral stand for STARTUP_SETTLE_STEPS to let the robot settle."""
-        params = self._L4GaitParams(
-            gait_type='trot', step_length=0.0,
-            gait_freq=GAIT_FREQ, step_height=0.0,
-            duty_cycle=1.0, stance_width=0.0, wz=0.0,
-            body_height=BODY_HEIGHT,
-        )
-        self._send_l4(params)
+        if WHEELED and self._home_q is not None:
+            # Pre-specified home pose: hold at keyframe directly.
+            self._send_wheeled(0.0, 0.0)
+        else:
+            # Walking robots or wheeled without pre-specified home (e.g. b2w):
+            # use L4 to bring robot to standing height.
+            params = self._L4GaitParams(
+                gait_type='trot', step_length=0.0,
+                gait_freq=GAIT_FREQ, step_height=0.0,
+                duty_cycle=1.0, stance_width=0.0, wz=0.0,
+                body_height=BODY_HEIGHT,
+            )
+            self._send_l4(params)
         if self._step_count >= STARTUP_SETTLE_STEPS:
             x, y, yaw, z, roll, pitch = self._get_robot_pose()
-            print(f"Startup complete: z={z:.3f}m  R={math.degrees(roll):+.1f}°  "
-                  f"P={math.degrees(pitch):+.1f}°")
+            if WHEELED:
+                if self._home_q is None:
+                    # Capture home pose from L4 standing position
+                    state = self._sim.get_robot_state()
+                    self._home_q = [state.joint_positions[i] for i in range(12)]
+                    print(f"Startup complete (wheeled, L4 pose): z={z:.3f}m  "
+                          f"home_q=[{self._home_q[0]:.3f}, {self._home_q[1]:.3f}, {self._home_q[2]:.3f}]")
+                else:
+                    print(f"Startup complete (wheeled): z={z:.3f}m  home_q={WHEEL_HOME_Q[:3]}")
+            else:
+                print(f"Startup complete: z={z:.3f}m  R={math.degrees(roll):+.1f}°  "
+                      f"P={math.degrees(pitch):+.1f}°")
             self._state = GameState.SPAWN_TARGET
 
     def _tick_spawn(self):
@@ -234,9 +315,12 @@ class TargetGame:
         self._target_step_count = 0
         self._stats.targets_spawned += 1
 
-        # Move visual target marker (mocap body) to target position
+        # Move visual target marker (mocap body) to target position.
+        # Place at robot body height so marker is visible at "eye level."
+        # Capped at 0.30m to prevent tall robots from having targets too high.
+        target_z = min(NOMINAL_BODY_HEIGHT, 0.30)
         try:
-            self._sim.set_mocap_pos(0, [target.x, target.y, 0.15])
+            self._sim.set_mocap_pos(0, [target.x, target.y, target_z])
         except (RuntimeError, AttributeError):
             pass  # No mocap body in scene (headless without target scene)
 
@@ -330,6 +414,97 @@ class TargetGame:
         if self._target_step_count >= self._timeout_steps:
             self._on_timeout()
 
+    def _tick_walk_wheeled(self):
+        """Drive toward target using differential wheel torque.
+
+        No gait generator — legs hold rigid at home pose via PD,
+        wheels get pure torque for forward drive + differential steering.
+        """
+        x, y, yaw, z, roll, pitch = self._get_robot_pose()
+        target = self._spawner.current_target
+        self._target_step_count += 1
+
+        # Fall detection (same threshold as walking)
+        if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
+            self._stats.falls += 1
+            print(f"FALL DETECTED at z={z:.3f}m (threshold={NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:.3f}m)")
+            self._state = GameState.SPAWN_TARGET
+            return
+
+        heading_err = target.heading_error(x, y, yaw)
+        dist = target.distance_to(x, y)
+
+        # Forward: proportional to alignment², taper near target.
+        # Squaring alignment prioritizes turning: at 60° off, fwd drops to 6%
+        # instead of 25%. This prevents heavy robots from spiraling at high
+        # heading errors — they turn first, then drive straight.
+        alignment = max(0.0, math.cos(heading_err))
+        alignment = alignment * alignment
+        dist_taper = min(1.0, dist / 1.0)  # slow in last 1m
+        fwd = WHEEL_FWD_TORQUE * alignment * dist_taper
+
+        # Turn: proportional + saturated
+        turn = _clamp(WHEEL_KP_YAW * heading_err, -WHEEL_MAX_TURN, WHEEL_MAX_TURN)
+
+        self._send_wheeled(fwd, turn)
+
+        # Log pitch/roll every step for diagnostics
+        r_deg = math.degrees(roll)
+        p_deg = math.degrees(pitch)
+        mode = "D"  # Drive (wheeled)
+        if len(self._rp_log) > 0:
+            prev = self._rp_log[-1]
+            droll = (r_deg - prev[1]) / CONTROL_DT
+            dpitch = (p_deg - prev[2]) / CONTROL_DT
+        else:
+            droll = dpitch = 0.0
+        self._rp_log.append((self._step_count, r_deg, p_deg, droll, dpitch, mode))
+
+        if self._target_step_count % TELEMETRY_INTERVAL == 0:
+            t = self._target_step_count * CONTROL_DT
+            body = self._sim.get_body("base")
+            vx = float(body.linvel[0]) if body else 0
+            vy = float(body.linvel[1]) if body else 0
+            print(f"[target {self._target_index}/{self._num_targets}] "
+                  f"DRIVE  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
+                  f"z={z:.2f}  fwd={fwd:.1f}Nm  turn={turn:.1f}Nm  "
+                  f"pos=({x:.1f}, {y:.1f})  v=({vx:+.2f},{vy:+.2f})  t={t:.1f}s")
+
+        if dist < self._reach_threshold:
+            self._on_reached()
+            return
+
+        if self._target_step_count >= self._timeout_steps:
+            self._on_timeout()
+
+    def _send_wheeled(self, fwd_torque, turn_torque, z=None):
+        """Construct and send LowCmd for differential wheel drive.
+
+        Legs (slots 0-11): rigid PD hold at home pose. With a properly
+        splayed stance (wide support polygon + CoM analysis), no tracking
+        or height correction is needed — the robot rolls like a car.
+        Wheels (slots 12-15): pure torque, differential drive.
+          FR=12, FL=13, RR=14, RL=15
+          right wheels (FR, RR) = fwd + turn
+          left wheels (FL, RL) = fwd - turn
+        """
+        cmd = self._make_low_cmd()
+        # All 12 leg joints: rigid hold at home pose
+        for i in range(12):
+            cmd.motor_cmd[i].q = float(self._home_q[i])
+            cmd.motor_cmd[i].kp = self._kp
+            cmd.motor_cmd[i].kd = self._kd
+        # Wheels: pure torque, differential drive
+        right = fwd_torque + turn_torque
+        left = fwd_torque - turn_torque
+        for i, tau in [(12, right), (13, left), (14, right), (15, left)]:
+            cmd.motor_cmd[i].kp = 0.0
+            cmd.motor_cmd[i].kd = 0.0
+            cmd.motor_cmd[i].tau = tau
+        self._stamp_cmd(cmd)
+        self._sim._lowcmd_pub.Write(cmd)
+        self._sim._t += CONTROL_DT
+
     def _on_reached(self):
         t = self._target_step_count * CONTROL_DT
         self._stats.targets_reached += 1
@@ -393,17 +568,11 @@ class TargetGame:
                   f"{dr:+8.0f}  {dp:+8.0f}  {mode}")
 
         # Mode breakdown
-        walk_rolls = [abs(r[1]) for r in self._rp_log if r[5] == "W"]
-        turn_rolls = [abs(r[1]) for r in self._rp_log if r[5] == "T"]
-        walk_pitches = [abs(r[2]) for r in self._rp_log if r[5] == "W"]
-        turn_pitches = [abs(r[2]) for r in self._rp_log if r[5] == "T"]
-        if walk_rolls:
-            print(f"\nWALK ({len(walk_rolls)} steps):  "
-                  f"avg|R|={sum(walk_rolls)/len(walk_rolls):.1f}°  "
-                  f"avg|P|={sum(walk_pitches)/len(walk_pitches):.1f}°  "
-                  f"max|R|={max(walk_rolls):.1f}°  max|P|={max(walk_pitches):.1f}°")
-        if turn_rolls:
-            print(f"TURN ({len(turn_rolls)} steps):  "
-                  f"avg|R|={sum(turn_rolls)/len(turn_rolls):.1f}°  "
-                  f"avg|P|={sum(turn_pitches)/len(turn_pitches):.1f}°  "
-                  f"max|R|={max(turn_rolls):.1f}°  max|P|={max(turn_pitches):.1f}°")
+        for label, code in [("WALK", "W"), ("TURN", "T"), ("DRIVE", "D")]:
+            mode_rolls = [abs(r[1]) for r in self._rp_log if r[5] == code]
+            mode_pitches = [abs(r[2]) for r in self._rp_log if r[5] == code]
+            if mode_rolls:
+                print(f"\n{label} ({len(mode_rolls)} steps):  "
+                      f"avg|R|={sum(mode_rolls)/len(mode_rolls):.1f}°  "
+                      f"avg|P|={sum(mode_pitches)/len(mode_pitches):.1f}°  "
+                      f"max|R|={max(mode_rolls):.1f}°  max|P|={max(mode_pitches):.1f}°")

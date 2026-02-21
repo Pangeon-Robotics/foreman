@@ -278,6 +278,8 @@ def main():
         game = TargetGame(
             sim,
             L4GaitParams=L4GaitParams,
+            make_low_cmd=_l4_sim._make_low_cmd,
+            stamp_cmd=_l4_sim._stamp_cmd,
             num_targets=args.targets,
             seed=args.seed,
             angle_range=angle_range,
