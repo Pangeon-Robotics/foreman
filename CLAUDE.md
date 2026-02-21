@@ -27,15 +27,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 3 | `layer_3/` | Complete | Inverse Kinematics |
 | 4 | `layer_4/` | Complete | Cartesian Positions (gait params to foot positions) |
 | 5 | `layer_5/` | In Progress | Locomotion (motion commands to gait parameters) |
-| 6-8 | Not implemented | | Waypoints, Mission Planning, Application UI |
+| 6 | `layer_6/` | In Progress | Spatial Awareness & Local Navigation (SLAM, costmap, DWA) |
+| 7-8 | Not implemented | | Mission Planning, Application UI |
 
-Layers 1-4 are **instant** (stateless per-timestep). Layers 5-8 are **sequences** (stateful). The DDS boundary sits between Layers 2-3. Commands flow down (5 to 1), observations flow up (1 to 5).
+Layers 1-4 are **instant** (stateless per-timestep). Layers 5-8 are **sequences** (stateful). The DDS boundary sits between Layers 2-3. Commands flow down (6 to 1), observations flow up (1 to 6).
 
 ## Multi-Repo Workspace
 
 Each subdirectory is a **separate Git repo** with its own `.git/`, CLAUDE.md, and VERSION:
 
-- **layers_1_2/**, **layer_3/**, **layer_4/**, **layer_5/** — Sovereign layer implementations
+- **layers_1_2/**, **layer_3/**, **layer_4/**, **layer_5/**, **layer_6/** — Sovereign layer implementations
 - **philosophy/** — Source of truth for architecture, principles, workflows
 - **training/** — Offline ML training (HNN, RL) — separate from the layer stack
 - **improvements/** — Architectural planning and research proposals
@@ -105,6 +106,8 @@ python -m foreman.demos.target_game --robot b2 --slam --obstacles  # SLAM + obst
 Supported robots: **b2** (legged), **go2** (legged), **go2w** (wheeled), **b2w** (wheeled). Per-robot defaults (gains, step params, body height) live in `game.py:ROBOT_DEFAULTS`.
 
 Runs Layers 1-4 together (legged robots use L4 GaitParams directly, wheeled robots use differential wheel torque). Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time (see gotcha below).
+
+With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body velocity) via `perception.py:PerceptionPipeline`. With `--obstacles`: loads `scene_target_obstacles.xml` and enables LiDAR point cloud processing into costmaps + DWA local planning. Costmap visualization is handled by `viz.py:CostmapOverlay`.
 
 ### Troubleshooting
 ```bash
@@ -234,9 +237,11 @@ Genomes are JSON files (either `{"genome": {...}}` or `{"locomotion": {...}, "st
 
 ## Cross-Repo Shared Utilities
 
-`foreman/demos/target_game/utils.py` is the canonical location for cross-layer utilities that multiple repos need. Currently provides: `quat_to_yaw`, `quat_to_rpy`, `normalize_angle`, `clamp`, `load_module_by_path`, `patch_layer_configs`.
+`foreman/demos/target_game/utils.py` is the canonical location for cross-layer utilities that multiple repos need. Currently provides: `quat_to_yaw`, `quat_to_rpy`, `normalize_angle`, `clamp`, `frame_transform`, `load_module_by_path`, `patch_layer_configs`.
 
 Training imports from here (`from foreman.demos.target_game.utils import ...`). Never duplicate these functions into other repos. If a new cross-layer utility is needed, add it to utils.py and import it.
+
+**Exception**: Layer 6 core modules (`slam/`, `world_model/`, `planner/`) maintain their own copies of `frame_transform` and `normalize_angle` in `layer_6/transforms.py` to preserve layer sovereignty. Only `simulation.py` (demo wrapper) imports from foreman utils.
 
 The DDS preload has a separate canonical location per repo: `training/ga/dds_preload.py` for training, inline in `__main__.py` for foreman. This is intentional — the preload must happen before any DDS imports, and the two repos have different boot sequences.
 
