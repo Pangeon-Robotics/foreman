@@ -80,6 +80,11 @@ class ScenarioRunner:
         # Import run_game lazily (triggers DDS preload and Layer 5 imports)
         from ..__main__ import run_game
 
+        # Build spawn_fn if scenario has a factory
+        spawn_fn = None
+        if scenario.spawn_fn_factory is not None:
+            spawn_fn = scenario.spawn_fn_factory(scenario.target_seed)
+
         # Build args namespace matching what run_game expects
         args = SimpleNamespace(
             robot=self._robot,
@@ -96,6 +101,7 @@ class ScenarioRunner:
             min_dist=scenario.min_dist,
             max_dist=scenario.max_dist,
             angle_range=scenario.angle_range,
+            spawn_fn=spawn_fn,
         )
 
         try:

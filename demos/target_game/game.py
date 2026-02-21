@@ -227,6 +227,7 @@ class TargetGame:
             reach_threshold=reach_threshold,
             seed=seed,
         )
+        self._spawn_fn = None  # Optional: (robot_x, robot_y, robot_yaw, idx) -> Target
 
         self._state = GameState.STARTUP  # Settle before first gait command
         self._stats = GameStatistics()
@@ -445,7 +446,11 @@ class TargetGame:
 
         # Use SLAM pose for spawning (target relative to estimated position)
         nav_x, nav_y, nav_yaw = self._get_nav_pose()
-        target = self._spawner.spawn_relative(nav_x, nav_y, nav_yaw, angle_range=self._angle_range)
+        if self._spawn_fn is not None:
+            target = self._spawn_fn(nav_x, nav_y, nav_yaw, self._target_index)
+            self._spawner._current_target = target
+        else:
+            target = self._spawner.spawn_relative(nav_x, nav_y, nav_yaw, angle_range=self._angle_range)
         self._target_index += 1
         self._target_step_count = 0
         self._stats.targets_spawned += 1

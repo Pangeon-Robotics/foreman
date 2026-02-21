@@ -354,6 +354,11 @@ def run_game(args) -> GameRunResult:
             timeout_steps=timeout_steps,
         )
 
+        # Optional custom spawn function (e.g. scattered scenario back-and-forth)
+        spawn_fn = getattr(args, 'spawn_fn', None)
+        if spawn_fn is not None:
+            game._spawn_fn = spawn_fn
+
         # Wire up telemetry log
         if telemetry_log is not None:
             game.set_telemetry(telemetry_log)
