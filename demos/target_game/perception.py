@@ -86,7 +86,12 @@ class PerceptionPipeline:
 
         # Get current SLAM pose for the costmap origin
         pose = self._odometry.pose
-        l6_pose = self._Pose2D(x=pose.x, y=pose.y, yaw=pose.yaw, stamp=pose.stamp)
+        # Build costmap in BODY frame (yaw=0) so it aligns with DWA's
+        # body-frame arc queries.  build_costmap_2d_direct rotates LiDAR
+        # points by pose.yaw via frame_transform — passing yaw=0 keeps
+        # points in sensor/body frame, which is the same frame the DWA
+        # planner uses for its arc waypoints.
+        l6_pose = self._Pose2D(x=pose.x, y=pose.y, yaw=0.0, stamp=pose.stamp)
 
         # Build 2D costmap directly (Phase 1: skip 3D TSDF for speed)
         cloud = self._PointCloud(points=data, ring_index=None, stamp=msg.timestamp)
@@ -96,6 +101,7 @@ class PerceptionPipeline:
             z_range=(self._cfg.costmap_z_lo, self._cfg.costmap_z_hi),
             resolution=self._cfg.tsdf_voxel_size,
             truncation=self._cfg.tsdf_truncation,
+            square_cost=getattr(self._cfg, 'square_cost', False),
         )
 
         from layer_6.types import Costmap2D

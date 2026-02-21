@@ -238,6 +238,9 @@ class TargetGame:
         # Wheeled mode: use keyframe pose for rigid leg PD hold
         self._home_q = WHEEL_HOME_Q if WHEELED else None
 
+        # Obstacle proximity (foreman ground-truth referee, not robot sensors)
+        self._obstacle_bodies: list[str] = []
+
         # Pitch/roll diagnostics
         self._rp_log = []  # (step, roll_deg, pitch_deg, droll, dpitch, mode)
 
@@ -297,6 +300,19 @@ class TargetGame:
         controller to avoid the v12 train/demo parity issue.
         """
         self._dwa_planner = planner
+
+    def set_obstacle_bodies(self, names: list[str]) -> None:
+        """Register obstacle body names for ground-truth proximity checking.
+
+        FOREMAN VALIDATION ONLY — not used by the robot's control loop.
+        The robot avoids obstacles using its sensors (LiDAR → costmap → DWA).
+        This uses MuJoCo physics ground truth as a referee to verify the
+        robot actually maintained clearance.
+
+        Requires obstacle bodies in SimulationManager's track_bodies list
+        so their positions are published over DDS.
+        """
+        self._obstacle_bodies = names
 
     def set_pose_publisher(self, pub, msg_class, stamp_fn) -> None:
         """Set DDS publisher for rt/pose_estimate topic.
@@ -621,12 +637,40 @@ class TargetGame:
                         "dist": round(dist, 2),
                     })
 
+            # Ground-truth obstacle proximity (foreman referee, not robot sensors).
+            # Uses physics engine body positions via Layer 3's get_body() API.
+            if self._obstacle_bodies and self._telemetry is not None:
+                robot = self._sim.get_body("base")
+                if robot is not None:
+                    rx, ry = float(robot.pos[0]), float(robot.pos[1])
+                    min_clearance = float('inf')
+                    closest = ""
+                    for name in self._obstacle_bodies:
+                        obs = self._sim.get_body(name)
+                        if obs is None:
+                            continue
+                        d = math.sqrt((rx - float(obs.pos[0]))**2 +
+                                      (ry - float(obs.pos[1]))**2)
+                        if d < min_clearance:
+                            min_clearance = d
+                            closest = name
+                    if min_clearance < float('inf'):
+                        self._telemetry.record("proximity", {
+                            "min_clearance": round(min_clearance, 3),
+                            "closest": closest,
+                        })
+
         # Convert DWA result to L4 gait params
         if self._last_dwa_result is not None and self._last_dwa_result.n_feasible > 0:
             dwa = self._last_dwa_result
             # Map DWA (forward, turn) to L4 commands
             heading_mod = dwa.forward  # 0.0 to 1.0
-            wz = _clamp(dwa.turn * WZ_LIMIT, -WZ_LIMIT, WZ_LIMIT)
+            # Speed-dependent turn rate limit: at full forward speed, cap wz
+            # to 40% of WZ_LIMIT to prevent the gait from destabilizing.
+            # At zero forward speed, full WZ_LIMIT is available for turning.
+            wz_scale = 1.0 - 0.6 * heading_mod
+            wz_limit = WZ_LIMIT * wz_scale
+            wz = _clamp(dwa.turn * WZ_LIMIT, -wz_limit, wz_limit)
 
             if heading_mod < 0.1 and abs(wz) > 0.3:
                 # DWA says turn — use arc mode

@@ -51,6 +51,10 @@ def run_all_critics(result, criteria: dict, telemetry_path: Path | None) -> list
         results.append(dwa_oscillation(result, telem, criteria))
         results.append(collision_free(telem, criteria))
 
+    # Ground-truth proximity critic (foreman referee using physics engine)
+    if "proximity" in telem:
+        results.append(obstacle_proximity(telem, criteria))
+
     return results
 
 
@@ -249,4 +253,40 @@ def collision_free(telem: dict, criteria: dict) -> CriticResult:
         score=max(0.0, 1.0 - max_run / (max_consecutive * 3)),
         details=(f"max {max_run} consecutive e-stops (limit {max_consecutive}), "
                  f"{total_estops} total out of {len(feasible_counts)} samples"),
+    )
+
+
+def obstacle_proximity(telem: dict, criteria: dict) -> CriticResult:
+    """Check robot maintained minimum clearance from obstacles.
+
+    FOREMAN REFEREE — uses MuJoCo ground-truth body positions, not robot
+    sensors. The robot's control loop uses only LiDAR/costmap/DWA for
+    obstacle avoidance; this critic validates the outcome using the
+    physics engine's omniscient view.
+
+    Measures center-to-center distance from robot base to each obstacle
+    body. Since obstacle radii are 0.2-0.3m and the robot half-width is
+    ~0.25m, a center distance below ~0.5m indicates contact.
+    """
+    min_clearance_threshold = criteria.get("min_obstacle_clearance", 0.5)
+
+    prox_records = telem.get("proximity", [])
+    if not prox_records:
+        return CriticResult("obstacle_proximity", True, 1.0, "No proximity data (skipped)")
+
+    clearances = [r["min_clearance"] for r in prox_records]
+    min_seen = min(clearances)
+    mean_clearance = sum(clearances) / len(clearances)
+    # Count how many samples were below threshold (potential collisions)
+    violations = sum(1 for c in clearances if c < min_clearance_threshold)
+
+    passed = min_seen >= min_clearance_threshold
+    score = min(1.0, min_seen / min_clearance_threshold) if min_clearance_threshold > 0 else 1.0
+    return CriticResult(
+        name="obstacle_proximity",
+        passed=passed,
+        score=score,
+        details=(f"min clearance {min_seen:.2f}m (threshold {min_clearance_threshold:.1f}m), "
+                 f"mean {mean_clearance:.2f}m, "
+                 f"{violations}/{len(clearances)} samples below threshold"),
     )

@@ -115,13 +115,23 @@ def draw_costmap_voxels(viewer, costmap, threshold: float = 0.5, max_geoms: int 
         ix = ix[indices]
         iy = iy[indices]
 
+    # Grid is in body frame — rotate cells to world frame for rendering.
+    # origin_x/y = robot world position, robot_yaw = heading at scan time.
+    half_ext = grid.shape[0] * res / 2.0
+    c_yaw = math.cos(costmap.robot_yaw)
+    s_yaw = math.sin(costmap.robot_yaw)
+
     added = 0
     for i, j in zip(ix, iy):
         if scn.ngeom >= scn.maxgeom:
             break
         cost = float(grid[i, j])
-        wx = costmap.origin_x + j * res + half
-        wy = costmap.origin_y + i * res + half
+        # Cell center in body frame (robot at origin, +X = forward)
+        bx = j * res + half - half_ext
+        by = i * res + half - half_ext
+        # Rotate to world frame
+        wx = costmap.origin_x + c_yaw * bx - s_yaw * by
+        wy = costmap.origin_y + s_yaw * bx + c_yaw * by
 
         # Color: red intensity proportional to cost
         r = min(1.0, cost)

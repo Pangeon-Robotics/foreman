@@ -230,6 +230,25 @@ def _apply_genome(genome_path: str) -> None:
     print(f"Applied genome gen={gen}, fitness={fitness}")
 
 
+def _find_obstacle_bodies(scene_path: Path) -> list[str]:
+    """Parse scene XML to discover obstacle body names (obs_*).
+
+    Foreman-level utility — reads the scene to learn what obstacles exist
+    so it can track their physics state for ground-truth proximity checking.
+    """
+    import xml.etree.ElementTree as ET
+    names = []
+    try:
+        tree = ET.parse(scene_path)
+        for body in tree.iter("body"):
+            name = body.get("name", "")
+            if name.startswith("obs_"):
+                names.append(name)
+    except (ET.ParseError, FileNotFoundError):
+        pass
+    return names
+
+
 def run_game(args) -> GameRunResult:
     """Run target game with given configuration. Returns structured result.
 
@@ -307,12 +326,17 @@ def run_game(args) -> GameRunResult:
         scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene.xml"
         print(f"Warning: scene_target.xml not found for {args.robot}, using scene.xml")
 
+    # Discover obstacle bodies from scene XML for ground-truth proximity
+    # checking (foreman referee, not robot sensors).
+    obstacle_bodies = _find_obstacle_bodies(scene_path)
+    track_bodies = ["target"] + obstacle_bodies
+
     headless = getattr(args, 'headless', False)
     sim = SimulationManager(
         args.robot,
         headless=headless,
         scene=str(scene_path),
-        track_bodies=["target"],
+        track_bodies=track_bodies,
         domain=domain,
     )
     sim.start()
@@ -354,6 +378,10 @@ def run_game(args) -> GameRunResult:
             timeout_steps=timeout_steps,
         )
 
+        # Register obstacle bodies for ground-truth proximity checking
+        if obstacle_bodies:
+            game.set_obstacle_bodies(obstacle_bodies)
+
         # Optional custom spawn function (e.g. scattered scenario back-and-forth)
         spawn_fn = getattr(args, 'spawn_fn', None)
         if spawn_fn is not None:
@@ -392,6 +420,14 @@ def run_game(args) -> GameRunResult:
                     from layer_6.planner.dwa import DWAPlanner, DWAConfig
                     from .perception import PerceptionPipeline
                     pcfg = get_perception_config(args.robot)
+
+                    # Apply perception overrides (from tuning script)
+                    for key, val in getattr(args, 'perception_overrides', {}).items():
+                        setattr(pcfg, key, val)
+                    # Apply DWA overrides to pcfg fields (tuning names → pcfg names)
+                    for key, val in getattr(args, 'dwa_overrides', {}).items():
+                        setattr(pcfg, key, val)
+
                     perception = PerceptionPipeline(odometry, pcfg)
                     cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
                     cloud_sub.Init(perception.on_point_cloud, 5)
@@ -406,6 +442,11 @@ def run_game(args) -> GameRunResult:
                         w_goal_heading=pcfg.dwa_w_goal_heading,
                         w_speed=pcfg.dwa_w_speed,
                         lethal_threshold=pcfg.dwa_lethal_threshold,
+                        n_forward=getattr(pcfg, 'dwa_n_forward', 5),
+                        n_turn=getattr(pcfg, 'dwa_n_turn', 21),
+                        horizon=getattr(pcfg, 'dwa_horizon', 0.5),
+                        n_steps=getattr(pcfg, 'dwa_n_steps', 10),
+                        clearance_mean_weight=getattr(pcfg, 'dwa_clearance_mean_weight', 0.6),
                     )
                     game.set_dwa_planner(DWAPlanner(dwa_cfg))
                     print(f"DWA planner active: v_max={pcfg.v_max}, w_max={pcfg.w_max}")

@@ -109,6 +109,7 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             "max_slam_drift_final": 2.0,
             "min_dwa_feasible_mean": 15,
             "max_consecutive_estops": 5,  # tight spaces cause brief 0-feasible
+            "min_obstacle_clearance": 0.5,  # center-to-center (obs radius + robot half-width)
         },
     ),
     "corridor": ScenarioDefinition(
@@ -126,6 +127,7 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             "max_falls": 2,
             "max_slam_drift_mean": 0.5,
             "min_dwa_feasible_mean": 15,
+            "min_obstacle_clearance": 0.5,
         },
     ),
     "L_wall": ScenarioDefinition(
@@ -142,6 +144,7 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             "target_success_rate": 0.5,  # at least 1 of 2
             "max_falls": 0,
             "min_dwa_feasible_mean": 15,
+            "min_obstacle_clearance": 0.5,
         },
     ),
     "dead_end": ScenarioDefinition(
@@ -158,6 +161,7 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             "target_success_rate": 0.5,
             "max_falls": 0,
             "min_dwa_feasible_mean": 10,
+            "min_obstacle_clearance": 0.5,
         },
     ),
     "dense": ScenarioDefinition(
@@ -173,6 +177,7 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             "target_success_rate": 0.5,
             "max_falls": 1,
             "min_dwa_feasible_mean": 10,
+            "min_obstacle_clearance": 0.5,
         },
     ),
 }
