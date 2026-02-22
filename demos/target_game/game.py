@@ -47,6 +47,19 @@ TURN_STANCE_WIDTH = 0.08
 TURN_WZ = 1.0
 THETA_THRESHOLD = 0.6
 
+# --- Gait parameter smoothing (context-dependent EMA) ---
+# Near obstacles: slow decel preserves smooth avoidance curves
+_EMA_ALPHA_DOWN_OBSTACLE = 0.02   # tau ~0.5s
+_EMA_ALPHA_UP_OBSTACLE = 0.08     # tau ~0.125s
+# Open field: faster tracking prevents orbit, still smooth enough to prevent falls
+_EMA_ALPHA_DOWN_OPEN = 0.05       # tau ~0.2s — 20 ticks decel, safe for 65kg B2
+_EMA_ALPHA_UP_OPEN = 0.15         # tau ~0.07s — fast turn→walk recovery
+# Wz smoothing
+_EMA_ALPHA_WZ_OBSTACLE = 0.10     # tau ~0.1s
+_EMA_ALPHA_WZ_OPEN = 0.15         # tau ~0.07s
+# Minimum decel before walk→turn mode switch
+_MIN_DECEL_TICKS = 15             # 0.15s at 100 Hz
+
 # --- Wheeled robot parameters (set by configure_for_robot) ---
 
 WHEELED = False
@@ -216,6 +229,16 @@ class TargetGame:
         self._dwa_planner = None    # DWAPlanner, set via set_dwa_planner()
         self._last_dwa_result = None
         self._telemetry = None      # TelemetryLog, set via set_telemetry()
+
+        # Avoidance commitment — holds turn direction to prevent flickering
+        self._avoidance_sign = 0       # +1 left, -1 right, 0 no commitment
+        self._avoidance_since = 0.0    # tick time when direction was chosen
+        self._goal_bearing = 0.0       # cached goal bearing for reactive scan
+
+        # Gait parameter smoothing (EMA state for DWA mode)
+        self._smooth_heading_mod = 1.0
+        self._smooth_wz = 0.0
+        self._decel_tick_count = 0
 
         # Gains — start low, ramp during first 2.5s of navigation
         self._kp = KP_START
@@ -624,6 +647,7 @@ class TargetGame:
 
                 result = self._dwa_planner.plan(costmap_q, goal_x=goal_rx, goal_y=goal_ry)
                 self._last_dwa_result = result
+                self._goal_bearing = math.atan2(goal_ry, goal_rx)
 
                 # Telemetry: DWA decision
                 if self._telemetry is not None:
@@ -663,17 +687,94 @@ class TargetGame:
         # Convert DWA result to L4 gait params
         if self._last_dwa_result is not None and self._last_dwa_result.n_feasible > 0:
             dwa = self._last_dwa_result
-            # Map DWA (forward, turn) to L4 commands
-            heading_mod = dwa.forward  # 0.0 to 1.0
+
+            # Reactive forward scan: probe costmap beyond DWA horizon and
+            # modulate (forward, turn) before gait conversion.
+            threat_active = False  # gates EMA smoothing (only near obstacles)
+            costmap_q = self._perception.costmap_query if self._perception else None
+            if costmap_q is not None:
+                from .perception import reactive_scan
+                scan = reactive_scan(costmap_q, dwa.forward, dwa.turn,
+                                     goal_bearing=self._goal_bearing)
+                heading_mod = scan.mod_forward
+                turn_cmd = scan.mod_turn
+
+                # A4: Avoidance commitment — hold direction for 2s to
+                # prevent flickering when DWA oscillates ±0.1.
+                now = self._target_step_count * CONTROL_DT
+                if scan.threat > 0.3:
+                    if (self._avoidance_sign == 0
+                            or (now - self._avoidance_since) > 2.0):
+                        self._avoidance_sign = 1 if turn_cmd >= 0 else -1
+                        self._avoidance_since = now
+                    # If scan output is weak, enforce committed direction
+                    if abs(turn_cmd) < 0.2:
+                        turn_cmd = self._avoidance_sign * 0.4 * scan.threat
+                elif scan.threat < 0.1:
+                    self._avoidance_sign = 0  # clear in open field
+
+                threat_active = scan.threat > 0.1
+
+                # Telemetry: reactive scan events (only when modulating)
+                if self._telemetry is not None and scan.threat > 0.05:
+                    self._telemetry.record("reactive_scan", {
+                        "threat": round(scan.threat, 3),
+                        "asymmetry": round(scan.asymmetry, 3),
+                        "emergency": scan.emergency,
+                        "dwa_fwd": round(dwa.forward, 3),
+                        "dwa_turn": round(dwa.turn, 3),
+                        "mod_fwd": round(scan.mod_forward, 3),
+                        "mod_turn": round(turn_cmd, 3),
+                        "smooth_fwd": round(self._smooth_heading_mod, 3),
+                        "smooth_wz": round(self._smooth_wz, 3),
+                        "avoidance_sign": self._avoidance_sign,
+                    })
+            else:
+                heading_mod = dwa.forward
+                turn_cmd = dwa.turn
+
+            # Forward-turn coupling: decelerate for tight turns.
+            # At full speed + max turn, L4 walk-mode differential stride can't
+            # deliver the commanded turn rate (~0.4 rad/s actual vs 1.05 commanded).
+            # Linear taper: heading_mod → 0 at turn_cmd=1.0, which triggers
+            # turn-in-place mode (pure pivot at full WZ_LIMIT).
+            if abs(turn_cmd) > 0.3:
+                turn_frac = min(1.0, (abs(turn_cmd) - 0.3) / 0.7)
+                heading_mod = min(heading_mod, 1.0 - turn_frac)
+
+            # --- Always-on heading_mod smoothing (AFTER coupling) ---
+            # Context-dependent alphas: slow near obstacles, faster in open field
+            if heading_mod < self._smooth_heading_mod:
+                alpha_hm = _EMA_ALPHA_DOWN_OBSTACLE if threat_active else _EMA_ALPHA_DOWN_OPEN
+            else:
+                alpha_hm = _EMA_ALPHA_UP_OBSTACLE if threat_active else _EMA_ALPHA_UP_OPEN
+            self._smooth_heading_mod += alpha_hm * (heading_mod - self._smooth_heading_mod)
+            heading_mod = self._smooth_heading_mod
+
             # Speed-dependent turn rate limit: at full forward speed, cap wz
             # to 40% of WZ_LIMIT to prevent the gait from destabilizing.
             # At zero forward speed, full WZ_LIMIT is available for turning.
             wz_scale = 1.0 - 0.6 * heading_mod
             wz_limit = WZ_LIMIT * wz_scale
-            wz = _clamp(dwa.turn * WZ_LIMIT, -wz_limit, wz_limit)
+            wz = _clamp(turn_cmd * WZ_LIMIT, -wz_limit, wz_limit)
 
-            if heading_mod < 0.1 and abs(wz) > 0.3:
-                # DWA says turn — use arc mode
+            # --- Always-on wz smoothing ---
+            alpha_wz = _EMA_ALPHA_WZ_OBSTACLE if threat_active else _EMA_ALPHA_WZ_OPEN
+            self._smooth_wz += alpha_wz * (wz - self._smooth_wz)
+            wz = self._smooth_wz
+
+            # --- Mode switch with decel guard ---
+            # Require heading_mod to be low AND sustained for _MIN_DECEL_TICKS
+            # before switching to turn-in-place. This prevents the 65kg B2 from
+            # pitching forward when forward momentum is killed in a single tick.
+            wants_turn = heading_mod < 0.1 and abs(wz) > 0.3
+            if wants_turn:
+                self._decel_tick_count += 1
+            else:
+                self._decel_tick_count = 0
+
+            if wants_turn and self._decel_tick_count >= _MIN_DECEL_TICKS:
+                # DWA says turn — use arc mode (decel guard satisfied)
                 params = self._L4GaitParams(
                     gait_type='trot', turn_in_place=True, wz=wz,
                     gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
@@ -706,7 +807,9 @@ class TargetGame:
                 d = self._last_dwa_result
                 dwa_info = f"  dwa=({d.forward:.2f},{d.turn:.2f}) score={d.score:.2f} feasible={d.n_feasible}"
             print(f"[target {self._target_index}/{self._num_targets}] "
-                  f"DWA  dist={dist:.1f}m  pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s{dwa_info}")
+                  f"DWA  dist={dist:.1f}m  smooth_fwd={self._smooth_heading_mod:.2f}  "
+                  f"decel={self._decel_tick_count}  "
+                  f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s{dwa_info}")
 
         if dist < self._reach_threshold:
             self._on_reached()
