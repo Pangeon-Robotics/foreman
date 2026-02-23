@@ -696,7 +696,7 @@ class TargetGame:
                 goal_rx = c * goal_x - s * goal_y
                 goal_ry = s * goal_x + c * goal_y
 
-                result = self._dwa_planner.plan(costmap_q, goal_x=goal_rx, goal_y=goal_ry)
+                result = self._dwa_planner.plan(costmap_q, goal_x=goal_rx, goal_y=goal_ry, dist_to_target=dist)
 
                 # Smooth raw DWA turn to suppress frame-to-frame oscillation.
                 # DWA flips sign when multiple arcs score similarly.
@@ -715,7 +715,7 @@ class TargetGame:
 
                 # Telemetry: DWA decision
                 if self._telemetry is not None:
-                    self._telemetry.record("dwa", {
+                    dwa_telemetry = {
                         "forward": round(result.forward, 3),
                         "turn": round(result.turn, 3),
                         "score": round(result.score, 3),
@@ -723,7 +723,13 @@ class TargetGame:
                         "goal_rx": round(goal_rx, 2),
                         "goal_ry": round(goal_ry, 2),
                         "dist": round(dist, 2),
-                    })
+                    }
+                    # CurvatureDWAResult has extra fields
+                    if hasattr(result, 'arc_length'):
+                        dwa_telemetry["arc_length"] = round(result.arc_length, 2)
+                    if hasattr(result, 'kappa'):
+                        dwa_telemetry["kappa"] = round(result.kappa, 4)
+                    self._telemetry.record("dwa", dwa_telemetry)
 
             # Ground-truth obstacle proximity (foreman referee, not robot sensors).
             # Uses physics engine body positions via Layer 3's get_body() API.

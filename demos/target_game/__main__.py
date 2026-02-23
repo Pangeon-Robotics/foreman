@@ -427,10 +427,10 @@ def run_game(args) -> GameRunResult:
 
                 # Point cloud subscriber + perception pipeline (if obstacles)
                 if obstacles:
-                    from layer_6.config.defaults import get_perception_config
-                    from layer_6.planner.dwa import DWAPlanner, DWAConfig
+                    from layer_6.config.defaults import load_config
+                    from layer_6.planner.dwa import CurvatureDWAPlanner
                     from .perception import PerceptionPipeline
-                    pcfg = get_perception_config(args.robot)
+                    pcfg = load_config(args.robot)
 
                     # Apply perception overrides (from tuning script)
                     for key, val in getattr(args, 'perception_overrides', {}).items():
@@ -443,24 +443,14 @@ def run_game(args) -> GameRunResult:
                     cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
                     cloud_sub.Init(perception.on_point_cloud, 5)
                     game._perception = perception
-                    print(f"Perception pipeline active: TSDF + costmap (voxel={pcfg.tsdf_voxel_size}m)")
+                    print(f"Persistent TSDF active: ±{pcfg.tsdf_xy_extent}m, "
+                          f"voxel={pcfg.tsdf_voxel_size}m, Bayesian log-odds")
 
-                    # Wire up DWA planner
-                    dwa_cfg = DWAConfig(
-                        v_max=pcfg.v_max, w_max=pcfg.w_max,
-                        w_clearance=pcfg.dwa_w_clearance,
-                        w_goal_dist=pcfg.dwa_w_goal_dist,
-                        w_goal_heading=pcfg.dwa_w_goal_heading,
-                        w_speed=pcfg.dwa_w_speed,
-                        lethal_threshold=pcfg.dwa_lethal_threshold,
-                        n_forward=getattr(pcfg, 'dwa_n_forward', 5),
-                        n_turn=getattr(pcfg, 'dwa_n_turn', 21),
-                        horizon=getattr(pcfg, 'dwa_horizon', 0.5),
-                        n_steps=getattr(pcfg, 'dwa_n_steps', 10),
-                        clearance_mean_weight=getattr(pcfg, 'dwa_clearance_mean_weight', 0.6),
-                    )
-                    game.set_dwa_planner(DWAPlanner(dwa_cfg))
-                    print(f"DWA planner active: v_max={pcfg.v_max}, w_max={pcfg.w_max}")
+                    # Wire up curvature-based DWA planner
+                    game.set_dwa_planner(CurvatureDWAPlanner(pcfg))
+                    print(f"Curvature DWA active: {pcfg.dwa_n_curvatures} arcs, "
+                          f"max_arc={pcfg.dwa_max_arc_length}m, "
+                          f"v_max={pcfg.v_max}, w_max={pcfg.w_max}")
 
                     # Wait for first point cloud (DDS discovery + LiDAR scan)
                     import time as _time

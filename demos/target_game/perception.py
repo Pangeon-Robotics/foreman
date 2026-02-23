@@ -134,28 +134,15 @@ class PerceptionPipeline:
     """
 
     def __init__(self, odometry, perception_config):
-        from layer_6.world_model.tsdf import TSDFGrid, build_costmap_2d_direct
-        from layer_6.world_model.costmap import CostmapBuilder, CostmapQuery
+        from layer_6.world_model.tsdf import PersistentTSDF
+        from layer_6.world_model.costmap import CostmapQuery
         from layer_6.types import Costmap2D, Pose2D, PointCloud
 
         self._odometry = odometry
         self._cfg = perception_config
 
-        # TSDF grid (reused each scan)
-        self._tsdf = TSDFGrid(
-            xy_extent=perception_config.tsdf_xy_extent,
-            z_range=perception_config.tsdf_z_range,
-            voxel_size=perception_config.tsdf_voxel_size,
-            truncation=perception_config.tsdf_truncation,
-        )
-
-        # Costmap projection
-        self._costmap_builder = CostmapBuilder(
-            z_slice=(perception_config.costmap_z_lo, perception_config.costmap_z_hi),
-            truncation=perception_config.tsdf_truncation,
-            z_min=perception_config.tsdf_z_range[0],
-            voxel_size=perception_config.tsdf_voxel_size,
-        )
+        # Persistent world-frame TSDF (Bayesian, accumulates across scans)
+        self._tsdf = PersistentTSDF(perception_config)
 
         # Thread-safe costmap storage
         self._lock = threading.Lock()
@@ -165,7 +152,6 @@ class PerceptionPipeline:
         self._build_times: list[float] = []
 
         # Keep references to avoid re-importing
-        self._build_costmap_2d_direct = build_costmap_2d_direct
         self._CostmapQuery = CostmapQuery
         self._PointCloud = PointCloud
         self._Pose2D = Pose2D
@@ -173,7 +159,8 @@ class PerceptionPipeline:
     def on_point_cloud(self, msg) -> None:
         """DDS callback: new point cloud received.
 
-        Runs in the DDS listener thread. Builds costmap and stores it.
+        Runs in the DDS listener thread. Integrates scan into persistent
+        TSDF and extracts a body-frame costmap for the DWA planner.
         """
         t0 = time.monotonic()
 
@@ -185,39 +172,37 @@ class PerceptionPipeline:
         data = np.array(msg.data[:num_pts * 3], dtype=np.float32).reshape(-1, 3)
 
         # LiDAR points are in sensor-local frame (Z=0 for horizontal rays).
-        # The costmap height filter uses strict z > z_lo (z_lo=0.0), which
-        # excludes horizontal returns at Z=0. Offset by sensor height above
-        # body center so points register within the costmap z-range.
+        # Offset by sensor height above body center so points register
+        # within the TSDF z-range.
         data[:, 2] += getattr(self._cfg, 'lidar_z_offset', 0.18)
 
-        # Get current SLAM pose for the costmap origin
+        # Get current SLAM pose — full world-frame for TSDF integration.
+        # PersistentTSDF is world-frame; it uses the pose to place points
+        # correctly and extract_body_costmap rotates the output back to
+        # body frame for DWA.
         pose = self._odometry.pose
-        # Build costmap in BODY frame (yaw=0) so it aligns with DWA's
-        # body-frame arc queries.  build_costmap_2d_direct rotates LiDAR
-        # points by pose.yaw via frame_transform — passing yaw=0 keeps
-        # points in sensor/body frame, which is the same frame the DWA
-        # planner uses for its arc waypoints.
-        l6_pose = self._Pose2D(x=pose.x, y=pose.y, yaw=0.0, stamp=pose.stamp)
+        sensor_pose = self._Pose2D(x=pose.x, y=pose.y, yaw=pose.yaw, stamp=pose.stamp)
 
-        # Build 2D costmap directly (Phase 1: skip 3D TSDF for speed)
         cloud = self._PointCloud(points=data, ring_index=None, stamp=msg.timestamp)
-        cost_grid = self._build_costmap_2d_direct(
-            cloud, l6_pose,
-            xy_extent=self._cfg.tsdf_xy_extent,
-            z_range=(self._cfg.costmap_z_lo, self._cfg.costmap_z_hi),
-            resolution=self._cfg.tsdf_voxel_size,
-            truncation=self._cfg.tsdf_truncation,
-            square_cost=getattr(self._cfg, 'square_cost', False),
+
+        # Integrate into persistent world-frame TSDF (Bayesian update)
+        self._tsdf.integrate_scan(cloud, sensor_pose)
+
+        # Extract body-frame costmap for DWA (extent covers full arc range)
+        costmap_extent = self._cfg.tsdf_xy_extent
+        cost_grid, unknown_mask = self._tsdf.extract_body_costmap(
+            sensor_pose, costmap_extent=costmap_extent,
         )
 
         from layer_6.types import Costmap2D
         costmap = Costmap2D(
             grid=cost_grid,
             resolution=self._cfg.tsdf_voxel_size,
-            origin_x=pose.x - self._cfg.tsdf_xy_extent,
-            origin_y=pose.y - self._cfg.tsdf_xy_extent,
+            origin_x=pose.x - costmap_extent,
+            origin_y=pose.y - costmap_extent,
             robot_yaw=pose.yaw,
             stamp=msg.timestamp,
+            unknown_mask=unknown_mask,
         )
 
         query = self._CostmapQuery(costmap)
