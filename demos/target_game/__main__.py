@@ -273,6 +273,17 @@ def run_game(args) -> GameRunResult:
         print(f"\nApplying evolved genome: {genome}")
         _apply_genome(genome)
 
+    # Safety cap: untrained genomes may have unstable turn params for heavy robots.
+    # B2 (65kg) topples at TURN_WZ > 0.7 and needs wider stance (>= 0.12).
+    from . import game as game_mod
+    if args.robot == "b2":
+        if game_mod.TURN_WZ > 0.7:
+            game_mod.TURN_WZ = 0.6
+            print(f"  Safety cap: TURN_WZ capped to {game_mod.TURN_WZ} for B2")
+        if game_mod.TURN_STANCE_WIDTH < 0.12:
+            game_mod.TURN_STANCE_WIDTH = 0.12
+            print(f"  Safety cap: TURN_STANCE_WIDTH raised to {game_mod.TURN_STANCE_WIDTH} for B2")
+
     # Pre-populate config caches to avoid runtime namespace collision
     patch_layer_configs(args.robot, Path(_root))
 

@@ -23,6 +23,7 @@ TARGET_TIMEOUT_STEPS = 6000  # 60 seconds at 100 Hz
 TELEMETRY_INTERVAL = 100    # steps between prints (1 Hz at 100 Hz)
 NOMINAL_BODY_HEIGHT = 0.465 # m (B2)
 FALL_THRESHOLD = 0.5        # fraction of nominal height
+FALL_CONFIRM_TICKS = 20     # consecutive ticks below threshold to confirm fall (0.2s)
 
 # --- Startup gain ramp (bypasses L5 to avoid vibration) ---
 KP_START = 500.0
@@ -43,8 +44,8 @@ WZ_LIMIT = 1.5
 TURN_FREQ = 1.0
 TURN_STEP_HEIGHT = 0.06
 TURN_DUTY_CYCLE = 0.65
-TURN_STANCE_WIDTH = 0.08
-TURN_WZ = 1.0
+TURN_STANCE_WIDTH = 0.12
+TURN_WZ = 0.6
 THETA_THRESHOLD = 0.6
 
 # --- Gait parameter smoothing (context-dependent EMA) ---
@@ -52,11 +53,13 @@ THETA_THRESHOLD = 0.6
 _EMA_ALPHA_DOWN_OBSTACLE = 0.02   # tau ~0.5s
 _EMA_ALPHA_UP_OBSTACLE = 0.08     # tau ~0.125s
 # Open field: faster tracking prevents orbit, still smooth enough to prevent falls
-_EMA_ALPHA_DOWN_OPEN = 0.05       # tau ~0.2s — 20 ticks decel, safe for 65kg B2
+_EMA_ALPHA_DOWN_OPEN = 0.08       # tau ~0.13s — 13 ticks decel, tracks DWA better
 _EMA_ALPHA_UP_OPEN = 0.15         # tau ~0.07s — fast turn→walk recovery
 # Wz smoothing
 _EMA_ALPHA_WZ_OBSTACLE = 0.10     # tau ~0.1s
 _EMA_ALPHA_WZ_OPEN = 0.15         # tau ~0.07s
+# DWA turn smoothing: suppress frame-to-frame oscillation
+_DWA_TURN_ALPHA = 0.15            # tau ~0.7s at 10Hz replan — moderate smoothing to suppress oscillation
 # Minimum decel before walk→turn mode switch
 _MIN_DECEL_TICKS = 15             # 0.15s at 100 Hz
 
@@ -81,8 +84,8 @@ ROBOT_DEFAULTS = {
         "DUTY_CYCLE": 0.65, "STANCE_WIDTH": 0.0,
         "KP_YAW": 2.0, "WZ_LIMIT": 1.5,
         "TURN_FREQ": 1.0, "TURN_STEP_HEIGHT": 0.06,
-        "TURN_DUTY_CYCLE": 0.65, "TURN_STANCE_WIDTH": 0.08,
-        "TURN_WZ": 1.0, "THETA_THRESHOLD": 0.6,
+        "TURN_DUTY_CYCLE": 0.65, "TURN_STANCE_WIDTH": 0.12,
+        "TURN_WZ": 0.6, "THETA_THRESHOLD": 0.6,
     },
     "go2": {
         "NOMINAL_BODY_HEIGHT": 0.27,       # MJCF keyframe z (actual sim standing height)
@@ -235,6 +238,14 @@ class TargetGame:
         self._avoidance_since = 0.0    # tick time when direction was chosen
         self._goal_bearing = 0.0       # cached goal bearing for reactive scan
 
+        # DWA turn smoothing
+        self._smooth_dwa_turn = 0.0
+
+        # Fall detection: require sustained low z to avoid false positives
+        # from dynamic gait oscillation. Body dips during turns/walks are
+        # temporary; real falls are sustained.
+        self._fall_tick_count = 0
+
         # Gait parameter smoothing (EMA state for DWA mode)
         self._smooth_heading_mod = 1.0
         self._smooth_wz = 0.0
@@ -267,15 +278,34 @@ class TargetGame:
         # Pitch/roll diagnostics
         self._rp_log = []  # (step, roll_deg, pitch_deg, droll, dpitch, mode)
 
+        # Pose glitch rejection: DDS buffer reuse can return stale/zeroed data
+        self._cached_pose: tuple[float, float, float, float, float, float] | None = None
+
     def _get_robot_pose(self) -> tuple[float, float, float, float, float, float]:
-        """Return (x, y, yaw, z, roll, pitch) from simulation ground truth."""
+        """Return (x, y, yaw, z, roll, pitch) from simulation ground truth.
+
+        Includes glitch rejection: if position jumps > 2m in a single tick
+        (impossible for a walking robot at ~0.5 m/s), return the cached pose
+        instead. This guards against CycloneDDS buffer reuse races in
+        simulation_manager._on_world_physics.
+        """
         body = self._sim.get_body("base")
         x = float(body.pos[0])
         y = float(body.pos[1])
         z = float(body.pos[2])
         yaw = _quat_to_yaw(body.quat)
         roll, pitch, _ = _quat_to_rpy(body.quat)
-        return x, y, yaw, z, roll, pitch
+        pose = (x, y, yaw, z, roll, pitch)
+
+        if self._cached_pose is not None:
+            dx = x - self._cached_pose[0]
+            dy = y - self._cached_pose[1]
+            jump = math.sqrt(dx * dx + dy * dy)
+            if jump > 2.0:
+                return self._cached_pose
+
+        self._cached_pose = pose
+        return pose
 
     def _update_slam(self, truth_yaw: float) -> None:
         """Feed SLAM odometry with current sensor data.
@@ -367,11 +397,12 @@ class TargetGame:
     def _get_nav_pose(self) -> tuple[float, float, float]:
         """Return (x, y, yaw) for navigation decisions.
 
-        Uses SLAM estimate when available, ground truth otherwise.
+        Always uses ground truth.  SLAM dead-reckoning drifts too fast
+        for reliable navigation (yaw drift > 0.5 rad causes DWA goal
+        vector to rotate so robot walks away from target).  SLAM still
+        runs for drift analysis/telemetry; when loop-closure or
+        magnetometer correction is added to Layer 6, switch back.
         """
-        if self._odometry is not None:
-            p = self._odometry.pose
-            return p.x, p.y, p.yaw
         x, y, yaw, _, _, _ = self._get_robot_pose()
         return x, y, yaw
 
@@ -384,6 +415,25 @@ class TargetGame:
     def truth_trail(self) -> list[tuple[float, float]]:
         """Ground truth positions (10Hz), for visualization."""
         return self._truth_trail
+
+    def _check_fall(self, z: float) -> bool:
+        """Check for sustained fall. Returns True if robot has fallen.
+
+        Requires z below threshold for FALL_CONFIRM_TICKS consecutive ticks
+        to avoid false positives from dynamic gait oscillation. Body height
+        dips during turns/walks are temporary; real falls are sustained.
+        """
+        if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
+            self._fall_tick_count += 1
+            if self._fall_tick_count >= FALL_CONFIRM_TICKS:
+                self._stats.falls += 1
+                self._fall_tick_count = 0
+                print(f"FALL DETECTED at z={z:.3f}m (sustained {FALL_CONFIRM_TICKS} ticks)")
+                self._state = GameState.SPAWN_TARGET
+                return True
+        else:
+            self._fall_tick_count = 0
+        return False
 
     def _send_l4(self, params):
         """Send L4 GaitParams directly to Layer 4 (bypassing L5)."""
@@ -463,6 +513,15 @@ class TargetGame:
             self._send_l4(params)
         if self._step_count >= STARTUP_SETTLE_STEPS:
             x, y, yaw, z, roll, pitch = self._get_robot_pose()
+            # Bail out if robot fell or settled unstably (DDS timing race).
+            roll_deg = abs(math.degrees(roll))
+            if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD or roll_deg > 5.0:
+                print(f"Startup FAILED: z={z:.3f}m  "
+                      f"R={math.degrees(roll):+.1f}°  P={math.degrees(pitch):+.1f}°  "
+                      f"(fell or unstable settle)")
+                self._stats.falls += 1
+                self._state = GameState.DONE
+                return
             if WHEELED:
                 if self._home_q is None:
                     # Capture home pose from L4 standing position
@@ -524,11 +583,8 @@ class TargetGame:
         target = self._spawner.current_target
         self._target_step_count += 1
 
-        # Fall detection uses ground truth (z-height is not estimated by SLAM)
-        if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
-            self._stats.falls += 1
-            print(f"FALL DETECTED at z={z:.3f}m (threshold={NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:.3f}m)")
-            self._state = GameState.SPAWN_TARGET
+        # Fall detection uses ground truth (sustained check)
+        if self._check_fall(z):
             return
 
         # Navigation uses SLAM pose when available
@@ -616,24 +672,19 @@ class TargetGame:
         target = self._spawner.current_target
         self._target_step_count += 1
 
-        # Fall detection uses ground truth
-        if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
-            self._stats.falls += 1
-            print(f"FALL DETECTED at z={z:.3f}m")
-            self._state = GameState.SPAWN_TARGET
-            return
-
-        # Fallback: if no DWA result after 3s, use heading controller
-        DWA_FALLBACK_STEPS = 300  # 3 seconds at 100 Hz
-        if self._last_dwa_result is None and self._target_step_count > DWA_FALLBACK_STEPS:
-            self._tick_walk()
+        # Fall detection uses ground truth (sustained check)
+        if self._check_fall(z):
             return
 
         nav_x, nav_y, nav_yaw = self._get_nav_pose()
         dist = target.distance_to(nav_x, nav_y)
+        heading_err = target.heading_error(nav_x, nav_y, nav_yaw)
+        goal_behind = abs(heading_err) > math.pi / 2
 
-        # Replan at 10Hz (every 10 ticks)
-        if self._target_step_count % 10 == 0:
+        # Replan at 10Hz (every 10 ticks), or immediately if no result yet.
+        # The immediate trigger on first tick ensures DWA activates right away
+        # instead of falling through to _tick_walk() forever.
+        if self._target_step_count % 10 == 0 or self._last_dwa_result is None:
             costmap_q = self._perception.costmap_query if self._perception else None
             if costmap_q is not None:
                 # Goal in robot-centered frame
@@ -646,6 +697,19 @@ class TargetGame:
                 goal_ry = s * goal_x + c * goal_y
 
                 result = self._dwa_planner.plan(costmap_q, goal_x=goal_rx, goal_y=goal_ry)
+
+                # Smooth raw DWA turn to suppress frame-to-frame oscillation.
+                # DWA flips sign when multiple arcs score similarly.
+                self._smooth_dwa_turn += _DWA_TURN_ALPHA * (result.turn - self._smooth_dwa_turn)
+                result.turn = self._smooth_dwa_turn
+
+                # Goal-behind lock: when target is behind (heading_err > pi/2),
+                # DWA oscillates because left and right arcs score similarly.
+                # Lock the turn direction to face the target.
+                if goal_behind:
+                    result.turn = math.copysign(max(abs(result.turn), 0.5), heading_err)
+                    self._smooth_dwa_turn = result.turn
+
                 self._last_dwa_result = result
                 self._goal_bearing = math.atan2(goal_ry, goal_rx)
 
@@ -736,10 +800,10 @@ class TargetGame:
             # Forward-turn coupling: decelerate for tight turns.
             # At full speed + max turn, L4 walk-mode differential stride can't
             # deliver the commanded turn rate (~0.4 rad/s actual vs 1.05 commanded).
-            # Linear taper: heading_mod → 0 at turn_cmd=1.0, which triggers
+            # Linear taper: heading_mod -> 0 at turn_cmd=1.0, which triggers
             # turn-in-place mode (pure pivot at full WZ_LIMIT).
-            if abs(turn_cmd) > 0.3:
-                turn_frac = min(1.0, (abs(turn_cmd) - 0.3) / 0.7)
+            if abs(turn_cmd) > 0.4:
+                turn_frac = min(1.0, (abs(turn_cmd) - 0.4) / 0.6)
                 heading_mod = min(heading_mod, 1.0 - turn_frac)
 
             # --- Always-on heading_mod smoothing (AFTER coupling) ---
@@ -754,7 +818,7 @@ class TargetGame:
             # Speed-dependent turn rate limit: at full forward speed, cap wz
             # to 40% of WZ_LIMIT to prevent the gait from destabilizing.
             # At zero forward speed, full WZ_LIMIT is available for turning.
-            wz_scale = 1.0 - 0.6 * heading_mod
+            wz_scale = 1.0 - 0.5 * heading_mod
             wz_limit = WZ_LIMIT * wz_scale
             wz = _clamp(turn_cmd * WZ_LIMIT, -wz_limit, wz_limit)
 
@@ -774,9 +838,13 @@ class TargetGame:
                 self._decel_tick_count = 0
 
             if wants_turn and self._decel_tick_count >= _MIN_DECEL_TICKS:
-                # DWA says turn — use arc mode (decel guard satisfied)
+                # DWA says turn — use arc mode (decel guard satisfied).
+                # Cap wz to TURN_WZ: the GA-evolved turn rate is safe for B2's
+                # mass. WZ_LIMIT (1.5) is for walk-mode differential stride,
+                # not for turn-in-place pivots which stress the stance legs.
+                turn_wz = _clamp(wz, -TURN_WZ, TURN_WZ)
                 params = self._L4GaitParams(
-                    gait_type='trot', turn_in_place=True, wz=wz,
+                    gait_type='trot', turn_in_place=True, wz=turn_wz,
                     gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                     duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
                     body_height=BODY_HEIGHT,
@@ -806,10 +874,11 @@ class TargetGame:
             if self._last_dwa_result is not None:
                 d = self._last_dwa_result
                 dwa_info = f"  dwa=({d.forward:.2f},{d.turn:.2f}) score={d.score:.2f} feasible={d.n_feasible}"
+            behind_str = f"  BEHIND({math.degrees(heading_err):.0f}deg)" if goal_behind else ""
             print(f"[target {self._target_index}/{self._num_targets}] "
                   f"DWA  dist={dist:.1f}m  smooth_fwd={self._smooth_heading_mod:.2f}  "
                   f"decel={self._decel_tick_count}  "
-                  f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s{dwa_info}")
+                  f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s{dwa_info}{behind_str}")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -828,11 +897,8 @@ class TargetGame:
         target = self._spawner.current_target
         self._target_step_count += 1
 
-        # Fall detection uses ground truth (same threshold as walking)
-        if z < NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:
-            self._stats.falls += 1
-            print(f"FALL DETECTED at z={z:.3f}m (threshold={NOMINAL_BODY_HEIGHT * FALL_THRESHOLD:.3f}m)")
-            self._state = GameState.SPAWN_TARGET
+        # Fall detection uses ground truth (sustained check)
+        if self._check_fall(z):
             return
 
         # Navigation uses SLAM pose when available
