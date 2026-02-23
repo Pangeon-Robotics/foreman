@@ -803,13 +803,15 @@ class TargetGame:
                 heading_mod = dwa.forward
                 turn_cmd = dwa.turn
 
-            # Forward-turn coupling: decelerate for tight turns.
-            # At full speed + max turn, L4 walk-mode differential stride can't
-            # deliver the commanded turn rate (~0.4 rad/s actual vs 1.05 commanded).
-            # Linear taper: heading_mod -> 0 at turn_cmd=1.0, which triggers
-            # turn-in-place mode (pure pivot at full WZ_LIMIT).
-            if abs(turn_cmd) > 0.4:
-                turn_frac = min(1.0, (abs(turn_cmd) - 0.4) / 0.6)
+            # Forward-turn coupling: decelerate only for extreme turns.
+            # The DWA's two-zone kappa mapping already outputs forward=1.0
+            # for walkable curvatures (|turn| <= ~0.53) and tapers forward
+            # for the transition zone.  This coupling is a safety net for
+            # the transition zone, not the primary speed control.
+            # Threshold 0.65: above the walking-zone max turn (~0.53), so
+            # walk-while-turning at full speed is never clipped.
+            if abs(turn_cmd) > 0.65:
+                turn_frac = min(1.0, (abs(turn_cmd) - 0.65) / 0.35)
                 heading_mod = min(heading_mod, 1.0 - turn_frac)
 
             # --- Always-on heading_mod smoothing (AFTER coupling) ---
