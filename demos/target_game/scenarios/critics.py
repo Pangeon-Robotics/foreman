@@ -50,6 +50,8 @@ def run_all_critics(result, criteria: dict, telemetry_path: Path | None) -> list
         results.append(dwa_feasibility(telem, criteria))
         results.append(dwa_oscillation(result, telem, criteria))
         results.append(collision_free(telem, criteria))
+        results.append(wrong_way_turn(telem, criteria))
+        results.append(walking_away(telem, criteria))
 
     # Ground-truth proximity critic (foreman referee using physics engine)
     if "proximity" in telem:
@@ -289,4 +291,82 @@ def obstacle_proximity(telem: dict, criteria: dict) -> CriticResult:
         details=(f"min clearance {min_seen:.2f}m (threshold {min_clearance_threshold:.1f}m), "
                  f"mean {mean_clearance:.2f}m, "
                  f"{violations}/{len(clearances)} samples below threshold"),
+    )
+
+
+def wrong_way_turn(telem: dict, criteria: dict) -> CriticResult:
+    """Check robot isn't consistently turning away from the target.
+
+    Uses DWA telemetry: goal_ry (target lateral offset in robot frame)
+    and turn (yaw rate command). When target is to the left (goal_ry > 0),
+    the robot should turn left (turn > 0), and vice versa. Sustained
+    disagreement means the robot is turning the wrong way.
+
+    Only counts samples where both signals are significant — small
+    values near zero are noise, not wrong-way decisions.
+    """
+    max_rate = criteria.get("max_wrong_turn_rate", 0.30)
+
+    dwa_records = telem.get("dwa", [])
+    violations = 0
+    significant = 0
+    for r in dwa_records:
+        goal_ry = r.get("goal_ry", 0)
+        turn = r.get("turn", 0)
+        # Only count when both are significant (not noise)
+        if abs(goal_ry) > 0.3 and abs(turn) > 0.1:
+            significant += 1
+            if turn * goal_ry < 0:  # signs disagree — turning wrong way
+                violations += 1
+
+    if significant < 5:
+        return CriticResult("wrong_way_turn", True, 1.0, "Not enough data (skipped)")
+
+    violation_rate = violations / significant
+    passed = violation_rate <= max_rate
+    return CriticResult(
+        name="wrong_way_turn",
+        passed=passed,
+        score=max(0.0, 1.0 - violation_rate),
+        details=(f"{violations}/{significant} wrong-way turns "
+                 f"({violation_rate:.0%}, max {max_rate:.0%})"),
+    )
+
+
+def walking_away(telem: dict, criteria: dict) -> CriticResult:
+    """Check robot isn't walking forward when target is behind it.
+
+    Uses DWA telemetry: goal_rx (target forward offset in robot frame)
+    and forward (speed command 0-1). When goal_rx < 0 the target is
+    behind the robot. Walking forward with purpose (forward > 0.3)
+    in this state means the robot is moving away from the target.
+
+    Some walk-away is expected during obstacle detours, but sustained
+    walk-away indicates a control failure (wrong heading, bad DWA).
+    """
+    max_rate = criteria.get("max_walking_away_rate", 0.15)
+
+    dwa_records = telem.get("dwa", [])
+    violations = 0
+    significant = 0
+    for r in dwa_records:
+        goal_rx = r.get("goal_rx", 1.0)
+        forward = r.get("forward", 0)
+        # Only count purposeful forward motion
+        if forward > 0.3:
+            significant += 1
+            if goal_rx < -0.5:  # target clearly behind robot
+                violations += 1
+
+    if significant < 5:
+        return CriticResult("walking_away", True, 1.0, "Not enough data (skipped)")
+
+    violation_rate = violations / significant
+    passed = violation_rate <= max_rate
+    return CriticResult(
+        name="walking_away",
+        passed=passed,
+        score=max(0.0, 1.0 - violation_rate),
+        details=(f"{violations}/{significant} walk-away samples "
+                 f"({violation_rate:.0%}, max {max_rate:.0%})"),
     )

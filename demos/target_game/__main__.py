@@ -56,6 +56,7 @@ class GameRunResult:
     slam_trail: list[tuple[float, float]] = field(default_factory=list)
     truth_trail: list[tuple[float, float]] = field(default_factory=list)
     perception_stats: dict | None = None
+    ato_score: float | None = None
 
 
 def _expand_v9_genome(params: dict) -> dict:
@@ -274,15 +275,22 @@ def run_game(args) -> GameRunResult:
         _apply_genome(genome)
 
     # Safety cap: untrained genomes may have unstable turn params for heavy robots.
-    # B2 (65kg) topples at TURN_WZ > 0.7 and needs wider stance (>= 0.12).
+    # At TURN_FREQ >= 2.5 (small arcs), B2 is stable up to TURN_WZ=1.0.
     from . import game as game_mod
     if args.robot == "b2":
-        if game_mod.TURN_WZ > 0.7:
-            game_mod.TURN_WZ = 0.6
+        if game_mod.TURN_WZ > 1.0:
+            game_mod.TURN_WZ = 1.0
             print(f"  Safety cap: TURN_WZ capped to {game_mod.TURN_WZ} for B2")
         if game_mod.TURN_STANCE_WIDTH < 0.12:
             game_mod.TURN_STANCE_WIDTH = 0.12
             print(f"  Safety cap: TURN_STANCE_WIDTH raised to {game_mod.TURN_STANCE_WIDTH} for B2")
+        # Turn gait: faster cycle + shorter stance = less slippage per step
+        if game_mod.TURN_FREQ < 3.0:
+            game_mod.TURN_FREQ = 3.0
+            print(f"  Safety cap: TURN_FREQ raised to {game_mod.TURN_FREQ} for B2")
+        if game_mod.TURN_DUTY_CYCLE > 0.55:
+            game_mod.TURN_DUTY_CYCLE = 0.55
+            print(f"  Safety cap: TURN_DUTY_CYCLE lowered to {game_mod.TURN_DUTY_CYCLE} for B2")
 
     # Pre-populate config caches to avoid runtime namespace collision
     patch_layer_configs(args.robot, Path(_root))
@@ -462,10 +470,27 @@ def run_game(args) -> GameRunResult:
                     else:
                         print("Warning: no point cloud received after 5s (DWA will use fallback)")
 
+                    # Path critic with A* on TSDF
+                    from .path_critic import PathCritic
+                    from .game import ROBOT_DEFAULTS
+                    _v_ref = ROBOT_DEFAULTS.get(args.robot, {}).get("V_REF", 2.0)
+                    critic = PathCritic(robot_radius=0.35, v_ref=_v_ref)
+                    critic.set_tsdf(perception._tsdf)
+                    game.set_path_critic(critic)
+
             except Exception as e:
                 print(f"Warning: DDS setup failed: {e} (SLAM still works)")
 
+        # Path critic for non-obstacle runs (straight-line only, no A*)
+        if game._path_critic is None:
+            from .path_critic import PathCritic
+            from .game import ROBOT_DEFAULTS
+            _v_ref = ROBOT_DEFAULTS.get(args.robot, {}).get("V_REF", 2.0)
+            game.set_path_critic(PathCritic(robot_radius=0.35, v_ref=_v_ref))
+
         stats = game.run()
+
+        ato = game._path_critic.aggregate_ato() if game._path_critic else None
 
         return GameRunResult(
             stats=stats,
@@ -473,6 +498,7 @@ def run_game(args) -> GameRunResult:
             slam_trail=list(game.slam_trail),
             truth_trail=list(game.truth_trail),
             perception_stats=perception.stats if perception is not None else None,
+            ato_score=ato,
         )
     finally:
         sim.stop()

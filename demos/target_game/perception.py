@@ -40,9 +40,9 @@ _DIST_WEIGHTS_NORM = _DIST_WEIGHTS / _DIST_WEIGHTS.sum()
 _LATERAL_WEIGHTS = np.sin(_RAY_ANGLES)  # [-sin50, -sin25, 0, sin25, sin50]
 
 # Tuning constants
-_MIN_SPEED_FACTOR = 0.55        # floor -- always maintain walking gait
+_MIN_SPEED_FACTOR = 0.40        # floor -- 0.40 * 0.30m = 0.12m stride, above minimum effective
 _ASYMMETRY_GAIN = 3.0           # turn bias per unit asymmetry
-_SYMMETRY_TIEBREAKER = 0.2      # forced asymmetry when obstacle is dead-ahead
+_SYMMETRY_TIEBREAKER = 0.35     # stronger goal-bearing bias when obstacle dead-ahead
 _HIGH_THREAT = 0.55             # above this, override DWA turn entirely
 
 
@@ -104,7 +104,12 @@ def reactive_scan(
     # Override it entirely with the reactive scan's avoidance direction.
     if threat > _HIGH_THREAT:
         avoidance = -asymmetry * _ASYMMETRY_GAIN
-        mod_turn = max(-1.0, min(1.0, avoidance))
+        if abs(asymmetry) < 0.15:
+            # Symmetric corridor: DWA has better spatial awareness than 5-ray scan.
+            # Blend rather than override.
+            mod_turn = 0.5 * dwa_turn + 0.5 * max(-1.0, min(1.0, avoidance))
+        else:
+            mod_turn = max(-1.0, min(1.0, avoidance))
     else:
         # Blend: add scan bias to DWA's output
         mod_turn = dwa_turn + (-asymmetry * _ASYMMETRY_GAIN * threat)
@@ -205,7 +210,7 @@ class PerceptionPipeline:
             unknown_mask=unknown_mask,
         )
 
-        query = self._CostmapQuery(costmap)
+        query = self._CostmapQuery(costmap, oob_cost=self._cfg.tsdf_unknown_cell_cost)
 
         with self._lock:
             self._costmap_query = query

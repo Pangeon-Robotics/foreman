@@ -111,6 +111,8 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             "max_dwa_oscillation_per_target": 30,  # cluttered scenes cause legitimate reversals
             "max_consecutive_estops": 50,  # near obstacles, DWA can have extended 0-feasible runs
             "min_obstacle_clearance": 0.45,  # center-to-center minus margin for dynamic gait sway
+            "max_wrong_turn_rate": 0.30,  # ≤30% of significant turn samples may oppose goal
+            "max_walking_away_rate": 0.15,  # ≤15% of forward-walking samples may have target behind
         },
     ),
     "corridor": ScenarioDefinition(

@@ -22,7 +22,7 @@ def print_report(results: dict) -> None:
 
     # Header
     header = (f"{'Scenario':<15} {'Targets':>8} {'Success':>8} {'Falls':>6} "
-              f"{'SLAM Drift':>11} {'DWA Feas':>9} {'Critics':>10} {'Result':>8}")
+              f"{'ATO':>6} {'SLAM Drift':>11} {'DWA Feas':>9} {'Critics':>10} {'Result':>8}")
     print(header)
     print("-" * len(header))
 
@@ -37,6 +37,11 @@ def print_report(results: dict) -> None:
         targets_str = f"{stats.targets_reached}/{stats.targets_spawned}"
         success_str = f"{stats.success_rate:.0%}"
         falls_str = str(stats.falls)
+
+        # ATO fitness
+        ato_str = "n/a"
+        if gr.ato_score is not None:
+            ato_str = f"{gr.ato_score:.1f}"
 
         # SLAM drift
         slam_str = "n/a"
@@ -66,7 +71,7 @@ def print_report(results: dict) -> None:
         result_str = "PASS" if all_passed else "FAIL"
 
         print(f"{name:<15} {targets_str:>8} {success_str:>8} {falls_str:>6} "
-              f"{slam_str:>11} {dwa_str:>9} {critics_str:>10} {result_str:>8}")
+              f"{ato_str:>6} {slam_str:>11} {dwa_str:>9} {critics_str:>10} {result_str:>8}")
 
     # Detailed failures
     failures = [
