@@ -43,14 +43,14 @@ STANCE_WIDTH = 0.0
 BODY_HEIGHT = 0.465
 KP_YAW = 2.0
 WZ_LIMIT = 1.5
-TURN_FREQ = 2.5
-TURN_STEP_HEIGHT = 0.06
-TURN_DUTY_CYCLE = 0.65
+TURN_FREQ = 3.0
+TURN_STEP_HEIGHT = 0.08
+TURN_DUTY_CYCLE = 0.55
 TURN_STANCE_WIDTH = 0.12
-TURN_WZ = 0.6
+TURN_WZ = 1.0
 THETA_THRESHOLD = 0.6
 TIP_STEP_LENGTH = 0.10   # m — stride for differential TIP (minimal forward drift)
-_TIP_WZ_SCALE = 2.0      # multiplier: gentle differential (one side walks, other stationary)
+_TIP_WZ_SCALE = 1.0      # 1:1 — TURN_WZ is the actual TIP yaw rate (matches tip_demo.py)
 
 # --- Gait parameter smoothing (context-dependent EMA) ---
 # Near obstacles: slow decel preserves smooth avoidance curves
@@ -87,9 +87,9 @@ ROBOT_DEFAULTS = {
         "GAIT_FREQ": 1.5, "STEP_LENGTH": 0.30, "STEP_HEIGHT": 0.07,
         "DUTY_CYCLE": 0.65, "STANCE_WIDTH": 0.0,
         "KP_YAW": 2.0, "WZ_LIMIT": 1.5,
-        "TURN_FREQ": 2.5, "TURN_STEP_HEIGHT": 0.06,
-        "TURN_DUTY_CYCLE": 0.60, "TURN_STANCE_WIDTH": 0.10,
-        "TURN_WZ": 0.8, "THETA_THRESHOLD": 0.6,
+        "TURN_FREQ": 3.0, "TURN_STEP_HEIGHT": 0.08,
+        "TURN_DUTY_CYCLE": 0.55, "TURN_STANCE_WIDTH": 0.12,
+        "TURN_WZ": 1.0, "THETA_THRESHOLD": 0.6,
         "V_REF": 0.30,
     },
     "go2": {
@@ -774,7 +774,7 @@ class TargetGame:
                 gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                 duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
                 body_height=BODY_HEIGHT,
-                turn_in_place=True, leg_scales=self._get_tip_scales(),
+                turn_in_place=True,
             )
         else:
             # WALK — L4 differential stride (layer_4/generator.py:134-164)
@@ -1082,7 +1082,7 @@ class TargetGame:
                     gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                     duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
                     body_height=BODY_HEIGHT,
-                    turn_in_place=True, leg_scales=self._get_tip_scales(),
+                    turn_in_place=True,
                 )
                 mode_str = "CLOSE-T"
             else:
@@ -1145,11 +1145,11 @@ class TargetGame:
                 # instantaneous dwa.turn which oscillates at feas < 5.
                 # Fall back to heading error sign.
                 if abs(self._smooth_dwa_turn) > 0.1:
-                    self._stuck_recovery_wz = math.copysign(1.5, self._smooth_dwa_turn)
+                    self._stuck_recovery_wz = math.copysign(TURN_WZ, self._smooth_dwa_turn)
                 elif abs(heading_err) > 0.05:
-                    self._stuck_recovery_wz = math.copysign(1.5, heading_err)
+                    self._stuck_recovery_wz = math.copysign(TURN_WZ, heading_err)
                 else:
-                    self._stuck_recovery_wz = 1.5  # arbitrary but consistent
+                    self._stuck_recovery_wz = TURN_WZ  # arbitrary but consistent
                 # Clear waypoint so A* replans fresh after recovery.
                 self._current_waypoint = None
                 self._wp_commit_until = 0
@@ -1176,7 +1176,7 @@ class TargetGame:
                     gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                     duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
                     body_height=BODY_HEIGHT,
-                    turn_in_place=True, leg_scales=self._get_tip_scales(),
+                    turn_in_place=True,
                 )
             if self._stuck_recovery_countdown == 0:
                 self._stuck_check_dist = dist  # reset baseline after recovery
@@ -1274,7 +1274,7 @@ class TargetGame:
                     gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                     duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
                     body_height=BODY_HEIGHT,
-                    turn_in_place=True, leg_scales=self._get_tip_scales(),
+                    turn_in_place=True,
                 )
                 self._in_tip_mode = True
             else:
