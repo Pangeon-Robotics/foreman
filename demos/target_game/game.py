@@ -710,6 +710,7 @@ class TargetGame:
         self._stuck_recovery_countdown = 0
         self._stuck_recovery_wz = 0.0
         self._prev_no_progress = False
+        self._last_good_heading_step = -999  # SLAM drift guard
         self._progress_window_dist = float('inf')
         self._progress_window_step = 0
         self._dist_ring = []
@@ -1298,7 +1299,19 @@ class TargetGame:
             # until heading converges below THETA_THRESHOLD (34°).  TIP turns
             # at ~57°/s vs walk-turn at ~15°/s, so keeping TIP through the
             # 90°→34° range saves ~3-4s of slow arcing walk.
-            enter_tip = goal_behind and abs(heading_err) > THETA_THRESHOLD
+            #
+            # SLAM yaw drift guard: after ~10m of travel, SLAM yaw can
+            # drift 10-20°, making a forward target suddenly appear behind.
+            # If heading was good (<45°) within the last 2s, suppress TIP
+            # entry — the 140° heading flip is noise, not physical motion.
+            if abs(heading_err) < 0.8:  # within ~45°
+                self._last_good_heading_step = self._target_step_count
+            heading_was_good = (
+                (self._target_step_count
+                 - getattr(self, '_last_good_heading_step', -999)) < 200
+            )
+            enter_tip = (goal_behind and abs(heading_err) > THETA_THRESHOLD
+                         and not heading_was_good)
             stay_tip = self._in_tip_mode and abs(heading_err) > THETA_THRESHOLD
             if enter_tip or stay_tip:
                 turn_wz = (TURN_WZ if heading_err > 0 else -TURN_WZ) * _TIP_WZ_SCALE
