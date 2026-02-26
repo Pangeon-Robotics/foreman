@@ -298,9 +298,13 @@ def wrong_way_turn(telem: dict, criteria: dict) -> CriticResult:
     """Check robot isn't consistently turning away from the target.
 
     Uses DWA telemetry: goal_ry (target lateral offset in robot frame)
-    and turn (yaw rate command). When target is to the left (goal_ry > 0),
-    the robot should turn left (turn > 0), and vice versa. Sustained
-    disagreement means the robot is turning the wrong way.
+    and sent_wz (actual yaw rate command sent to L4, after heading-
+    proportional blend and smoothing). When target is to the left
+    (goal_ry > 0), sent_wz should be positive, and vice versa.
+
+    Uses sent_wz (not raw DWA turn) because the DWA legitimately
+    turns away from the target during obstacle avoidance — what matters
+    is the actual command after blending with heading control.
 
     Only counts samples where both signals are significant — small
     values near zero are noise, not wrong-way decisions.
@@ -312,7 +316,7 @@ def wrong_way_turn(telem: dict, criteria: dict) -> CriticResult:
     significant = 0
     for r in dwa_records:
         goal_ry = r.get("goal_ry", 0)
-        turn = r.get("turn", 0)
+        turn = r.get("sent_wz", r.get("turn", 0))
         # Only count when both are significant (not noise)
         if abs(goal_ry) > 0.3 and abs(turn) > 0.1:
             significant += 1

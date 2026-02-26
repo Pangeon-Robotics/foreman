@@ -41,6 +41,10 @@ Scenarios (easiest to hardest):
                         help="DDS domain ID (default: 2)")
     parser.add_argument("--headed", action="store_true",
                         help="Run with MuJoCo viewer (default: headless)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Override target seed (default: use scenario's seed)")
+    parser.add_argument("--targets", type=int, default=None,
+                        help="Override number of targets (default: use scenario's count)")
     parser.add_argument("--list", action="store_true",
                         help="List available scenarios and exit")
     args = parser.parse_args()
@@ -70,7 +74,8 @@ Scenarios (easiest to hardest):
         headless=not args.headed,
     )
 
-    results = runner.run_all(scenarios)
+    results = runner.run_all(scenarios, seed_override=args.seed,
+                             targets_override=args.targets)
     print_report(results)
 
     # Exit code: 0 if all passed, 1 if any failed

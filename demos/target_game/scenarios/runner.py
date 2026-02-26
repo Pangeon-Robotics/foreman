@@ -50,15 +50,24 @@ class ScenarioRunner:
         self._domain = domain
         self._headless = headless
 
-    def run_all(self, scenarios: dict[str, ScenarioDefinition]) -> dict[str, ScenarioResult]:
+    def run_all(
+        self,
+        scenarios: dict[str, ScenarioDefinition],
+        seed_override: int | None = None,
+        targets_override: int | None = None,
+    ) -> dict[str, ScenarioResult]:
         """Run all scenarios and return results keyed by name."""
+        self._seed_override = seed_override
+        self._targets_override = targets_override
         results = {}
         total = len(scenarios)
         for i, (name, scenario) in enumerate(scenarios.items(), 1):
+            seed = seed_override if seed_override is not None else scenario.target_seed
+            n_targets = targets_override if targets_override is not None else scenario.num_targets
             print(f"\n{'='*60}")
             print(f"SCENARIO [{i}/{total}]: {name}")
             print(f"  scene: {scenario.scene_xml}")
-            print(f"  targets: {scenario.num_targets}, seed: {scenario.target_seed}")
+            print(f"  targets: {n_targets}, seed: {seed}")
             print(f"  timeout: {scenario.timeout_per_target}s/target")
             print(f"{'='*60}")
             result = self._run_one(name, scenario)
@@ -81,16 +90,19 @@ class ScenarioRunner:
         from ..__main__ import run_game
 
         # Build spawn_fn if scenario has a factory
+        seed = (self._seed_override if self._seed_override is not None
+                else scenario.target_seed)
         spawn_fn = None
         if scenario.spawn_fn_factory is not None:
-            spawn_fn = scenario.spawn_fn_factory(scenario.target_seed)
+            spawn_fn = scenario.spawn_fn_factory(seed)
 
         # Build args namespace matching what run_game expects
         args = SimpleNamespace(
             robot=self._robot,
-            targets=scenario.num_targets,
+            targets=(self._targets_override if self._targets_override is not None
+                     else scenario.num_targets),
             headless=self._headless,
-            seed=scenario.target_seed,
+            seed=seed,
             genome=self._genome,
             full_circle=scenario.full_circle,
             domain=self._domain,

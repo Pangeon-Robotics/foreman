@@ -49,6 +49,8 @@ TURN_DUTY_CYCLE = 0.65
 TURN_STANCE_WIDTH = 0.12
 TURN_WZ = 0.6
 THETA_THRESHOLD = 0.6
+TIP_STEP_LENGTH = 0.10   # m — stride for differential TIP (minimal forward drift)
+_TIP_WZ_SCALE = 2.0      # multiplier: gentle differential (one side walks, other stationary)
 
 # --- Gait parameter smoothing (context-dependent EMA) ---
 # Near obstacles: slow decel preserves smooth avoidance curves
@@ -88,7 +90,7 @@ ROBOT_DEFAULTS = {
         "TURN_FREQ": 2.0, "TURN_STEP_HEIGHT": 0.06,
         "TURN_DUTY_CYCLE": 0.60, "TURN_STANCE_WIDTH": 0.10,
         "TURN_WZ": 0.8, "THETA_THRESHOLD": 0.6,
-        "V_REF": 2.0,
+        "V_REF": 0.30,
     },
     "go2": {
         "NOMINAL_BODY_HEIGHT": 0.27,       # MJCF keyframe z (actual sim standing height)
@@ -396,6 +398,48 @@ class TargetGame:
         """
         self._dwa_planner = planner
 
+    _PATH_VIZ_FILE = "/tmp/dwa_best_arc.bin"
+
+    def _export_path(self, nav_x, nav_y, target_x, target_y):
+        """Write A* path to temp file for headed viewer rendering.
+
+        Computes shortest obstacle-free path from robot to target using
+        the PathCritic's A* on the TSDF distance field.  Writes world-
+        frame (x, y) pairs as flat float32 for the firmware viewer.
+        """
+        import struct
+
+        path = None
+        if self._path_critic is not None and self._path_critic._tsdf is not None:
+            path = self._path_critic._astar_core(
+                (nav_x, nav_y), (target_x, target_y), return_path=True,
+            )
+
+        if path is None or len(path) < 2:
+            # No A* path — fall back to straight line
+            path = [(nav_x, nav_y), (target_x, target_y)]
+
+        # Subsample to ~0.3m spacing for viz (A* grid is 0.1m)
+        filtered = [path[0]]
+        for i in range(1, len(path)):
+            dx = path[i][0] - filtered[-1][0]
+            dy = path[i][1] - filtered[-1][1]
+            if dx * dx + dy * dy >= 0.09:  # 0.3m squared
+                filtered.append(path[i])
+        # Always include the final point (the target)
+        if filtered[-1] != path[-1]:
+            filtered.append(path[-1])
+
+        n = len(filtered)
+        buf = bytearray(n * 8)
+        for i, (wx, wy) in enumerate(filtered):
+            struct.pack_into('ff', buf, i * 8, wx, wy)
+        try:
+            with open(self._PATH_VIZ_FILE, 'wb') as f:
+                f.write(buf)
+        except OSError:
+            pass
+
     def set_path_critic(self, critic) -> None:
         """Set PathCritic for path quality evaluation."""
         self._path_critic = critic
@@ -699,14 +743,13 @@ class TargetGame:
             self._path_critic.record(nav_x, nav_y, t=self._target_step_count * CONTROL_DT)
 
         if abs(heading_err) > THETA_THRESHOLD:
-            # TURN IN PLACE — L4 arc mode (layer_4/generator.py:100-132)
-            wz = TURN_WZ if heading_err > 0 else -TURN_WZ
+            # TURN IN PLACE — differential stride (zero lateral slippage)
+            wz = (TURN_WZ if heading_err > 0 else -TURN_WZ) * _TIP_WZ_SCALE
             params = self._L4GaitParams(
-                gait_type='trot', turn_in_place=True, wz=wz,
+                gait_type='trot', wz=wz, step_length=TIP_STEP_LENGTH,
                 gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                 duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
                 body_height=BODY_HEIGHT,
-                leg_scales=self._get_tip_scales(),
             )
         else:
             # WALK — L4 differential stride (layer_4/generator.py:134-164)
@@ -882,17 +925,10 @@ class TargetGame:
                 goal_rx = c * gx_world - s * gy_world
                 goal_ry = s * gx_world + c * gy_world
 
-                result = self._dwa_planner.plan(costmap_q, goal_x=goal_rx, goal_y=goal_ry, dist_to_target=dist)
+                result = self._dwa_planner.plan(costmap_q, goal_x=goal_rx, goal_y=goal_ry)
 
-                # Smooth raw DWA turn to suppress frame-to-frame oscillation.
-                # DWA flips sign when multiple arcs score similarly.
-                # Adaptive alpha: heavier smoothing in corridors (low feasibility)
-                # where sign-flipping is most severe.
-                if result.n_feasible < 25:
-                    dwa_alpha = 0.04  # ~1.2s tau at 20Hz — suppresses corridor oscillation
-                else:
-                    dwa_alpha = _DWA_TURN_ALPHA  # 0.10 — standard smoothing
-                self._smooth_dwa_turn += dwa_alpha * (result.turn - self._smooth_dwa_turn)
+                # Light DWA turn smoothing to suppress frame-to-frame oscillation.
+                self._smooth_dwa_turn += _DWA_TURN_ALPHA * (result.turn - self._smooth_dwa_turn)
                 result.turn = self._smooth_dwa_turn
 
                 # Goal-behind lock: when target is behind (heading_err > pi/2),
@@ -911,11 +947,17 @@ class TargetGame:
                 self._last_dwa_result = result
                 self._goal_bearing = math.atan2(goal_ry, goal_rx)
 
+                # Export A* path to temp file for headed viewer rendering.
+                # Run at 2Hz (every 50 ticks) — A* is heavier than arc export.
+                if self._target_step_count % 50 == 0:
+                    self._export_path(nav_x, nav_y, target.x, target.y)
+
                 # Telemetry: DWA decision
                 if self._telemetry is not None:
                     dwa_telemetry = {
                         "forward": round(result.forward, 3),
                         "turn": round(result.turn, 3),
+                        "sent_wz": round(self._smooth_wz, 3),
                         "score": round(result.score, 3),
                         "n_feasible": result.n_feasible,
                         "goal_rx": round(goal_rx, 2),
@@ -957,21 +999,21 @@ class TargetGame:
         # DWA multi-arc scoring oscillates, EMA can't track, robot orbits.
         # Use simple proportional heading control with distance-scaled speed.
         # When heading error is large (>THETA_THRESHOLD), turn in place first.
-        if dist < 1.5 and self._last_dwa_result is not None and self._last_dwa_result.n_feasible > 0:
+        if dist < 1.5:
             if abs(heading_err) > THETA_THRESHOLD:
                 # Too far off — turn in place to re-orient before approaching
                 turn_wz = _clamp(heading_err * KP_YAW, -TURN_WZ, TURN_WZ)
                 self._smooth_wz += 0.15 * (turn_wz - self._smooth_wz)
-                turn_wz = self._smooth_wz
+                turn_wz = self._smooth_wz * _TIP_WZ_SCALE
                 self._smooth_heading_mod = 0.0
                 self._decel_tick_count = _MIN_DECEL_TICKS  # pre-satisfy guard
                 self._in_tip_mode = True
+                # Differential stride TIP: zero lateral slippage
                 params = self._L4GaitParams(
-                    gait_type='trot', turn_in_place=True, wz=turn_wz,
+                    gait_type='trot', wz=turn_wz, step_length=TIP_STEP_LENGTH,
                     gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                     duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
                     body_height=BODY_HEIGHT,
-                    leg_scales=self._get_tip_scales(),
                 )
                 mode_str = "CLOSE-T"
             else:
@@ -1018,331 +1060,69 @@ class TargetGame:
                 self._on_timeout()
             return
 
-        # Convert DWA result to L4 gait params
-        if self._last_dwa_result is not None and self._last_dwa_result.n_feasible > 0:
+        # Convert DWA result to L4 gait params.
+        #
+        # Heading-proportional control is the base turn controller (matches
+        # GA training path).  DWA provides obstacle avoidance: when some
+        # arcs are blocked, blend DWA's turn direction to steer around them.
+        if self._last_dwa_result is not None:
             dwa = self._last_dwa_result
 
-            # Reactive forward scan: probe costmap beyond DWA horizon and
-            # modulate (forward, turn) before gait conversion.
-            threat_active = False  # gates EMA smoothing (only near obstacles)
+            # --- Turn: heading-proportional + DWA obstacle avoidance ---
+            heading_turn = _clamp(heading_err * KP_YAW, -1.0, 1.0)
+
+            # Blend DWA turn as a nudge, not an override.
+            # The DWA is a local planner — it picks the best 10m arc, but
+            # can't reason about going AROUND obstacles.  When it overrides
+            # heading control, it steers the robot away from the target
+            # indefinitely.  Cap blend at 0.5 so heading control always
+            # retains influence.  The reactive scan (1.5m) handles close-
+            # range avoidance.
+            n_total = self._dwa_planner._n_curvatures
+            obstacle_fraction = 1.0 - (dwa.n_feasible / n_total)
+            dwa_blend = min(0.5, obstacle_fraction)
+            turn_cmd = (1.0 - dwa_blend) * heading_turn + dwa_blend * dwa.turn
+
+            # --- Speed: heading alignment with obstacle braking ---
+            cos_heading = max(0.0, math.cos(heading_err))
+            heading_mod = max(0.3, cos_heading)
+
+            # Reactive scan: reduce speed near obstacles
+            threat_active = False
             costmap_q = self._perception.costmap_query if self._perception else None
             if costmap_q is not None:
                 from .perception import reactive_scan
-                scan = reactive_scan(costmap_q, dwa.forward, dwa.turn,
+                scan = reactive_scan(costmap_q, heading_mod, turn_cmd,
                                      goal_bearing=self._goal_bearing)
-                heading_mod = scan.mod_forward
-                turn_cmd = scan.mod_turn
-
-                # Pre-blend: inject A* waypoint direction into DWA turn
-                # in moderate threat zones (0.1-0.3) where DWA oscillates
-                # but obstacles aren't immediate.  In high threat (>0.3),
-                # DWA's local avoidance must dominate to maintain clearance.
-                if (self._current_waypoint is not None and dist > 2.0
-                        and dwa.n_feasible > 8
-                        and 0.1 < scan.threat <= 0.3):
-                    wp_dx = self._current_waypoint[0] - nav_x
-                    wp_dy = self._current_waypoint[1] - nav_y
-                    wp_b = math.atan2(wp_dy, wp_dx) - nav_yaw
-                    if wp_b > math.pi:
-                        wp_b -= 2 * math.pi
-                    elif wp_b < -math.pi:
-                        wp_b += 2 * math.pi
-                    wp_turn = _clamp(wp_b * 2.0, -1.0, 1.0)
-                    # 50% blend in moderate threat — reduce DWA zigzag
-                    if turn_cmd * wp_turn >= 0 or abs(turn_cmd) < 0.15:
-                        turn_cmd = 0.50 * turn_cmd + 0.50 * wp_turn
-
-                # A4: Avoidance commitment — hold direction for 1.5s to
-                # prevent corridor oscillation.  DWA flips sign every
-                # replan when multiple arcs score similarly.
-                # Uses A* waypoint direction when available (planning_radius=0.45m
-                # guarantees collision-safe direction choice).
-                # Regression breaker (0.5m) catches wrong-direction commitment.
-                now = self._target_step_count * CONTROL_DT
-                if scan.threat > 0.3:
-                    regression_break = (self._avoidance_sign != 0
-                                        and dist > self._avoidance_dist + 0.5)
-                    if (self._avoidance_sign == 0
-                            or (now - self._avoidance_since) > 1.5
-                            or regression_break):
-                        if self._current_waypoint is not None:
-                            wp_dx = self._current_waypoint[0] - nav_x
-                            wp_dy = self._current_waypoint[1] - nav_y
-                            wp_b = math.atan2(wp_dy, wp_dx) - nav_yaw
-                            if wp_b > math.pi:
-                                wp_b -= 2 * math.pi
-                            elif wp_b < -math.pi:
-                                wp_b += 2 * math.pi
-                            self._avoidance_sign = 1 if wp_b >= 0 else -1
-                        else:
-                            self._avoidance_sign = 1 if turn_cmd >= 0 else -1
-                        self._avoidance_since = now
-                        self._avoidance_dist = dist
-                    # Weak signal: push in committed direction
-                    if abs(turn_cmd) < 0.2:
-                        turn_cmd = self._avoidance_sign * 0.7 * scan.threat
-                    elif turn_cmd * self._avoidance_sign < 0:
-                        # Turn opposes commitment — dampen.
-                        turn_cmd *= 0.15
-                elif scan.threat < 0.1:
-                    self._avoidance_sign = 0  # clear in open field
-
-                threat_active = scan.threat > 0.1
-                self._last_threat_level = scan.threat  # for adaptive replan rate
-                if threat_active:
+                if scan.threat > 0.1:
+                    heading_mod = min(heading_mod, scan.mod_forward)
+                    threat_active = True
+                    self._last_threat_level = scan.threat
                     self._last_threat_time = self._target_step_count * CONTROL_DT
 
-                # Telemetry: reactive scan events (only when modulating)
-                if self._telemetry is not None and scan.threat > 0.05:
-                    self._telemetry.record("reactive_scan", {
-                        "threat": round(scan.threat, 3),
-                        "asymmetry": round(scan.asymmetry, 3),
-                        "emergency": scan.emergency,
-                        "dwa_fwd": round(dwa.forward, 3),
-                        "dwa_turn": round(dwa.turn, 3),
-                        "mod_fwd": round(scan.mod_forward, 3),
-                        "mod_turn": round(turn_cmd, 3),
-                        "smooth_fwd": round(self._smooth_heading_mod, 3),
-                        "smooth_wz": round(self._smooth_wz, 3),
-                        "avoidance_sign": self._avoidance_sign,
-                    })
-            else:
-                heading_mod = dwa.forward
-                turn_cmd = dwa.turn
-
-            # Waypoint-guided heading blend: replace noisy DWA turn with
-            # heading-proportional control toward A* waypoint.  Strength
-            # depends on how constrained the environment is:
-            #   Open field (feas > 35): 85% waypoint — DWA turn is pure noise
-            #   Semi-constrained (feas 15-35): 70% waypoint — reduces zigzag
-            #   Tight (feas < 15): 0% waypoint — trust DWA for collision avoidance
-            # DISABLED when: threat_active (obstacle ahead), slam_drift_detected.
-            if not threat_active and dwa.n_feasible >= 15 and not slam_drift_detected:
-                # Steering heading: toward A* waypoint if available, else target
-                if self._current_waypoint is not None and dist > 2.0:
-                    wp_dx = self._current_waypoint[0] - nav_x
-                    wp_dy = self._current_waypoint[1] - nav_y
-                    steer_bearing = math.atan2(wp_dy, wp_dx)
-                    steer_err = steer_bearing - nav_yaw
-                    # Normalize to [-pi, pi]
-                    if steer_err > math.pi:
-                        steer_err -= 2 * math.pi
-                    elif steer_err < -math.pi:
-                        steer_err += 2 * math.pi
-                else:
-                    steer_err = heading_err
-
-                gain = max(1.0, dist / 2.0)  # 1.0 at 2m, 5.0 at 10m
-                heading_turn = _clamp(steer_err * gain / (math.pi / 4), -1.0, 1.0)
-                if dwa.n_feasible > 35:
-                    # Open field: strong waypoint (DWA is noise)
-                    turn_cmd = 0.15 * turn_cmd + 0.85 * heading_turn
-                    heading_mod = max(0.5, math.cos(steer_err))
-                elif self._current_waypoint is not None:
-                    # Semi-constrained: adaptive blend based on DWA agreement.
-                    if turn_cmd * heading_turn >= 0 or abs(turn_cmd) < 0.15:
-                        turn_cmd = 0.40 * turn_cmd + 0.60 * heading_turn
-                    else:
-                        turn_cmd = 0.80 * turn_cmd + 0.20 * heading_turn
-
-            # --- Regression tracking: detect sustained wrong-way walking ---
-            # Sample at 10Hz (every 10 ticks) to avoid noise.
-            # Keep a 2-second window (20 samples at 10Hz).
-            if self._target_step_count % 10 == 0:
-                self._dist_ring.append((self._target_step_count, dist))
-                # Trim to last 2 seconds (200 ticks = 20 samples at 10Hz)
-                cutoff = self._target_step_count - 200
-                while self._dist_ring and self._dist_ring[0][0] < cutoff:
-                    self._dist_ring.pop(0)
-                # Compute regression in this window
-                reg = 0.0
-                for j in range(1, len(self._dist_ring)):
-                    delta = self._dist_ring[j][1] - self._dist_ring[j - 1][1]
-                    if delta > 0:
-                        reg += delta
-                self._recent_regression = reg
-
-            # SLAM drift failsafe: slow to 30% when distance is growing.
-            # Latched min_dist prevents oscillation reset, so robot stays
-            # slow once drift is detected.  30% (not 0%) lets robot crawl
-            # toward targets reachable despite moderate drift.
             if slam_drift_detected:
                 heading_mod = min(heading_mod, 0.3)
 
-            # Forward-turn coupling: decelerate only for extreme turns.
-            # The DWA's two-zone kappa mapping already outputs forward=1.0
-            # for walkable curvatures (|turn| <= ~0.53) and tapers forward
-            # for the transition zone.  This coupling is a safety net for
-            # the transition zone, not the primary speed control.
-            # Threshold 0.65: above the walking-zone max turn (~0.53), so
-            # walk-while-turning at full speed is never clipped.
-            if abs(turn_cmd) > 0.65:
-                turn_frac = min(1.0, (abs(turn_cmd) - 0.65) / 0.35)
-                heading_mod = min(heading_mod, 1.0 - turn_frac)
+            # Smooth to prevent jerky changes
+            self._smooth_heading_mod += 0.10 * (heading_mod - self._smooth_heading_mod)
+            heading_mod = self._smooth_heading_mod
 
-            # Early cooldown check (needed by heading_mod smoothing below)
-            tip_on_cooldown = self._target_step_count < self._tip_cooldown_until
-
-            # --- Always-on heading_mod smoothing (AFTER coupling) ---
-            # When target is behind, snap heading_mod low immediately.
-            # Don't let EMA oscillation delay the walk→turn transition by 3-4s.
-            # Exception: on TIP cooldown after a stuck exit, allow a forward
-            # creep to physically move past the obstacle blocking rotation.
-            if goal_behind and not tip_on_cooldown:
-                self._smooth_heading_mod = min(self._smooth_heading_mod, 0.05)
-                heading_mod = self._smooth_heading_mod
-            elif goal_behind and tip_on_cooldown:
-                # Stuck TIP recovery: creep forward ONLY when heading is close
-                # to 90° (obstacle blocks final rotation). When heading is
-                # >120° (target well behind), creeping forward adds regression
-                # without helping the turn.
-                if abs(heading_err) < math.radians(120):
-                    heading_mod = 0.20
-                    self._smooth_heading_mod = 0.20
-                else:
-                    self._smooth_heading_mod = min(self._smooth_heading_mod, 0.05)
-                    heading_mod = self._smooth_heading_mod
-            else:
-                # Context-dependent alphas: slow near obstacles, faster in open field
-                if heading_mod < self._smooth_heading_mod:
-                    alpha_hm = _EMA_ALPHA_DOWN_OBSTACLE if threat_active else _EMA_ALPHA_DOWN_OPEN
-                else:
-                    alpha_hm = _EMA_ALPHA_UP_OBSTACLE if threat_active else _EMA_ALPHA_UP_OPEN
-                self._smooth_heading_mod += alpha_hm * (heading_mod - self._smooth_heading_mod)
-                heading_mod = self._smooth_heading_mod
-
-            # Minimum forward floor: prevent stalling when heading is fine.
-            # Graduated: full floor (0.30) in open areas, reduced (0.25) in
-            # tight spaces (low feasibility). This prevents dead-end forcing
-            # while still maintaining enough creep to escape tight spots.
-            if not goal_behind and abs(heading_err) < math.pi / 2:
-                floor = 0.30 if dwa.n_feasible >= 15 else 0.25
-                if heading_mod < floor:
-                    heading_mod = floor
-                    self._smooth_heading_mod = floor
-
-            # Regression brake: slow down when the robot has been walking
-            # away from the target.  Limits magnitude of wrong-way distance.
-            # 0.5m in 2s = moderate regression.  1.0m+ = severe oscillation.
-            if self._recent_regression > 0.5:
-                reg_brake = max(0.3, 1.0 - (self._recent_regression - 0.5))
-                heading_mod = min(heading_mod, reg_brake)
-                self._smooth_heading_mod = min(self._smooth_heading_mod, reg_brake)
-
-            # Speed-dependent turn rate limit: at full forward speed, cap wz
-            # to 40% of WZ_LIMIT to prevent the gait from destabilizing.
-            # At zero forward speed, full WZ_LIMIT is available for turning.
-            # Extra stability guard: at low heading_mod (slow walk), cap wz
-            # proportionally to prevent the destabilizing slow-walk-fast-turn
-            # combination that trips the 65kg B2.
-            wz_scale = 1.0 - 0.5 * heading_mod
-            wz_limit = WZ_LIMIT * wz_scale
-            if heading_mod < 0.5:
-                slow_walk_limit = heading_mod * 2.0 * WZ_LIMIT
-                wz_limit = min(wz_limit, slow_walk_limit)
-            wz = _clamp(turn_cmd * WZ_LIMIT, -wz_limit, wz_limit)
-
-            # --- Always-on wz smoothing ---
-            alpha_wz = _EMA_ALPHA_WZ_OBSTACLE if threat_active else _EMA_ALPHA_WZ_OPEN
-            self._smooth_wz += alpha_wz * (wz - self._smooth_wz)
+            wz = _clamp(turn_cmd * WZ_LIMIT, -WZ_LIMIT, WZ_LIMIT)
+            self._smooth_wz += 0.15 * (wz - self._smooth_wz)
             wz = self._smooth_wz
 
-            # --- Stuck recovery: force action when no progress ---
-            # Check every 3s: if distance hasn't decreased by 0.2m and the
-            # robot is stuck, take corrective action:
-            # 1. If waypoint heading > 45°: force TIP toward waypoint
-            # 2. If waypoint roughly ahead but feas low: force avoidance
-            #    commitment toward waypoint direction
-            if (self._target_step_count - self._stuck_check_step) >= 300:
-                progress = self._stuck_check_dist - dist
-                if (progress < 0.2 and not self._in_tip_mode
-                        and self._current_waypoint is not None):
-                    wp_dx = self._current_waypoint[0] - nav_x
-                    wp_dy = self._current_waypoint[1] - nav_y
-                    wp_heading = math.atan2(wp_dy, wp_dx) - nav_yaw
-                    if wp_heading > math.pi:
-                        wp_heading -= 2 * math.pi
-                    elif wp_heading < -math.pi:
-                        wp_heading += 2 * math.pi
-                    if abs(wp_heading) > math.pi / 4:
-                        # Force TIP toward waypoint
-                        goal_behind = True  # triggers mode switch below
-                        heading_err = wp_heading  # TIP direction
-                    elif dwa.n_feasible < 15:
-                        # Stuck but waypoint roughly ahead: DWA is confused
-                        # in tight space.  Force avoidance commitment toward
-                        # waypoint to break out of oscillation.
-                        self._avoidance_sign = 1 if wp_heading >= 0 else -1
-                        self._avoidance_since = self._target_step_count * CONTROL_DT
-                self._stuck_check_dist = dist
-                self._stuck_check_step = self._target_step_count
-
-            # --- Progress-gated early timeout ---
-            # Check every 20s: if distance hasn't decreased by 0.5m, the target
-            # is hopeless (stuck in oscillation loop near obstacles).  Timing
-            # out early limits aggregate ATO damage — 120s of futile walking
-            # adds massive regression and time that tanks the aggregate score.
-            # Skip the first 20s to allow initial turning and approach.
-            if (self._target_step_count - self._progress_window_step) >= 2000:
-                if self._progress_window_dist < float('inf'):
-                    progress = self._progress_window_dist - dist
-                    if progress < 0.5:
-                        print(f"  EARLY TIMEOUT: only {progress:.1f}m progress in 20s "
-                              f"(dist={dist:.1f}m)")
-                        self._on_timeout()
-                        return
-                self._progress_window_dist = dist
-                self._progress_window_step = self._target_step_count
-
-            # --- Mode switch with decel guard ---
-            # TIP when goal is behind (>90° heading error).
-            # Exit when heading drops below 90° (walk-while-turning handles rest).
-            # 6-second time limit prevents orbit at 90° boundary.
-            # After time-limited exit, 3s cooldown prevents rapid re-entry.
-            # Stuck TIP: if heading hasn't improved by >20° in 5s, TIP is
-            # ineffective (near obstacles) — exit and let walk-while-turning
-            # creep forward to break the stall.
-            tip_elapsed = (self._target_step_count - self._tip_start_step) * CONTROL_DT
-            tip_time_limit = self._in_tip_mode and tip_elapsed > 6.0
-            tip_stuck = (self._in_tip_mode and tip_elapsed > 5.0
-                         and abs(abs(heading_err) - abs(self._tip_start_heading)) < 0.35)
-            tip_on_cooldown = self._target_step_count < self._tip_cooldown_until
-            if self._in_tip_mode:
-                wants_turn = goal_behind and not tip_time_limit and not tip_stuck
-            else:
-                wants_turn = (goal_behind and heading_mod < 0.15
-                              and not tip_on_cooldown)
-            if wants_turn:
-                self._decel_tick_count += 1
-            else:
-                self._decel_tick_count = 0
-
-            if wants_turn and self._decel_tick_count >= _MIN_DECEL_TICKS:
-                if not self._in_tip_mode:
-                    self._tip_start_step = self._target_step_count
-                    self._tip_start_heading = heading_err
-                self._in_tip_mode = True
-                # Use heading_err directly for TIP turn direction with full
-                # TURN_WZ.  DWA's wz oscillates at the 90° BEHIND boundary,
-                # averaging ~0.3 rad/s — too slow.  Full TURN_WZ (1.0) gives
-                # consistent rotation matching _tick_walk() TIP behavior.
-                turn_wz = TURN_WZ if heading_err > 0 else -TURN_WZ
+            # TIP mode: turn in place when target is behind
+            if goal_behind and abs(heading_err) > THETA_THRESHOLD:
+                turn_wz = (TURN_WZ if heading_err > 0 else -TURN_WZ) * _TIP_WZ_SCALE
                 params = self._L4GaitParams(
-                    gait_type='trot', turn_in_place=True, wz=turn_wz,
+                    gait_type='trot', wz=turn_wz, step_length=TIP_STEP_LENGTH,
                     gait_freq=TURN_FREQ, step_height=TURN_STEP_HEIGHT,
                     duty_cycle=TURN_DUTY_CYCLE, stance_width=TURN_STANCE_WIDTH,
                     body_height=BODY_HEIGHT,
-                    leg_scales=self._get_tip_scales(),
                 )
+                self._in_tip_mode = True
             else:
-                if self._in_tip_mode:
-                    # Exiting TIP — reset drift baseline and set cooldown
-                    self._min_target_dist = dist
-                    if tip_time_limit or tip_stuck:
-                        # Time-limited or stuck exit: 3s cooldown before re-entry
-                        self._tip_cooldown_until = self._target_step_count + 300
                 self._in_tip_mode = False
-                self._reset_tip()
                 params = self._L4GaitParams(
                     gait_type='trot', step_length=STEP_LENGTH * heading_mod,
                     gait_freq=GAIT_FREQ, step_height=STEP_HEIGHT,
@@ -1350,10 +1130,7 @@ class TargetGame:
                     body_height=BODY_HEIGHT,
                 )
         else:
-            # Emergency stop or no costmap yet — stand still.
-            # Zero EMA state so robot doesn't resume at high speed.
-            self._smooth_heading_mod = 0.0
-            self._smooth_wz = 0.0
+            # No DWA result yet (first tick) — stand still until planner runs.
             params = self._L4GaitParams(
                 gait_type='trot', step_length=0.0,
                 gait_freq=GAIT_FREQ, step_height=0.0,
@@ -1367,9 +1144,7 @@ class TargetGame:
         if self._target_step_count % TELEMETRY_INTERVAL == 0:
             t = self._target_step_count * CONTROL_DT
             # Determine actual mode sent
-            tip_active = (wants_turn and self._decel_tick_count >= _MIN_DECEL_TICKS
-                          if self._last_dwa_result is not None and self._last_dwa_result.n_feasible > 0
-                          else False)
+            tip_active = self._in_tip_mode
             if dist < self._reach_threshold + 1.5:
                 mode_str = "CLOSE"
             elif tip_active:
@@ -1532,6 +1307,12 @@ class TargetGame:
         self._stats.total_time = time.monotonic() - start_time
         if self._telemetry is not None:
             self._telemetry.close()
+        # Clean up viz temp file
+        import os
+        try:
+            os.unlink(self._PATH_VIZ_FILE)
+        except OSError:
+            pass
         self._print_summary()
         if self._path_critic is not None:
             self._path_critic.print_summary()

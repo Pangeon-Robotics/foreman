@@ -284,10 +284,8 @@ def run_game(args) -> GameRunResult:
         if game_mod.TURN_STANCE_WIDTH < 0.12:
             game_mod.TURN_STANCE_WIDTH = 0.12
             print(f"  Safety cap: TURN_STANCE_WIDTH raised to {game_mod.TURN_STANCE_WIDTH} for B2")
-        # Turn gait: faster cycle + shorter stance = less slippage per step
-        if game_mod.TURN_FREQ < 3.0:
-            game_mod.TURN_FREQ = 3.0
-            print(f"  Safety cap: TURN_FREQ raised to {game_mod.TURN_FREQ} for B2")
+        # TURN_FREQ cap removed: differential stride TIP has zero lateral
+        # slippage by construction, no need for fast cycling.
         if game_mod.TURN_DUTY_CYCLE > 0.55:
             game_mod.TURN_DUTY_CYCLE = 0.55
             print(f"  Safety cap: TURN_DUTY_CYCLE lowered to {game_mod.TURN_DUTY_CYCLE} for B2")

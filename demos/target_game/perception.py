@@ -199,6 +199,18 @@ class PerceptionPipeline:
             sensor_pose, costmap_extent=costmap_extent,
         )
 
+        # Mask robot footprint: zero cost within 0.5m of robot origin.
+        # The robot's own body produces LiDAR returns that register as
+        # obstacles in the persistent TSDF, poisoning the DWA's origin
+        # and causing all arcs to fail the lethal check (feas=0).
+        voxel = self._cfg.tsdf_voxel_size
+        n = cost_grid.shape[0]
+        center = n // 2
+        mask_radius_cells = int(0.5 / voxel)
+        y_idx, x_idx = np.ogrid[:n, :n]
+        robot_mask = (x_idx - center)**2 + (y_idx - center)**2 <= mask_radius_cells**2
+        cost_grid[robot_mask] = 0.0
+
         from layer_6.types import Costmap2D
         costmap = Costmap2D(
             grid=cost_grid,

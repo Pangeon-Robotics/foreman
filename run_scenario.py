@@ -48,6 +48,10 @@ Scenarios (easiest to hardest):
                         help="Run headless instead of with viewer")
     parser.add_argument("--domain", type=int, default=2,
                         help="DDS domain ID (default: 2)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Override target seed (default: use scenario's seed)")
+    parser.add_argument("--targets", type=int, default=None,
+                        help="Override number of targets (default: use scenario's count)")
     args = parser.parse_args()
 
     if args.scenario is None:
@@ -75,6 +79,12 @@ Scenarios (easiest to hardest):
 
     if args.scenario != "all":
         cmd.extend(["--scenario", args.scenario])
+
+    if args.seed is not None:
+        cmd.extend(["--seed", str(args.seed)])
+
+    if args.targets is not None:
+        cmd.extend(["--targets", str(args.targets)])
 
     # Genome handling
     if not args.no_genome:
