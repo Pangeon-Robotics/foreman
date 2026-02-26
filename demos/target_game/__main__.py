@@ -161,11 +161,15 @@ def _apply_genome(genome_path: str) -> None:
             params.update(genome[group])
 
     from . import game as game_mod
+    from . import game_config as game_cfg
 
     if _is_v12_genome(params):
         # v12+ sovereign genome: dual patch
 
-        # 1. Patch game module constants for L4-direct walk/turn control
+        # 1. Patch game module constants for L4-direct walk/turn control.
+        # Must patch both game_config (authoritative, read by navigator
+        # mixins via `C.XXX`) and game (re-exported copy, read by
+        # __main__.py safety caps via `game_mod.XXX`).
         v12_game_params = [
             "GAIT_FREQ", "STEP_LENGTH", "STEP_HEIGHT", "DUTY_CYCLE", "STANCE_WIDTH",
             "KP_YAW", "WZ_LIMIT", "TURN_FREQ", "TURN_STEP_HEIGHT", "TURN_DUTY_CYCLE",
@@ -173,6 +177,7 @@ def _apply_genome(genome_path: str) -> None:
         ]
         for name in v12_game_params:
             if name in params:
+                setattr(game_cfg, name, params[name])
                 setattr(game_mod, name, params[name])
                 print(f"  game.{name} = {params[name]:.4f}")
 
@@ -277,17 +282,21 @@ def run_game(args) -> GameRunResult:
     # Safety cap: untrained genomes may have unstable turn params for heavy robots.
     # At TURN_FREQ >= 2.5 (small arcs), B2 is stable up to TURN_WZ=1.0.
     from . import game as game_mod
+    from . import game_config as game_cfg
     if args.robot == "b2":
         if game_mod.TURN_WZ > 1.0:
             game_mod.TURN_WZ = 1.0
+            game_cfg.TURN_WZ = 1.0
             print(f"  Safety cap: TURN_WZ capped to {game_mod.TURN_WZ} for B2")
         if game_mod.TURN_STANCE_WIDTH < 0.12:
             game_mod.TURN_STANCE_WIDTH = 0.12
+            game_cfg.TURN_STANCE_WIDTH = 0.12
             print(f"  Safety cap: TURN_STANCE_WIDTH raised to {game_mod.TURN_STANCE_WIDTH} for B2")
         # TURN_FREQ cap removed: differential stride TIP has zero lateral
         # slippage by construction, no need for fast cycling.
         if game_mod.TURN_DUTY_CYCLE > 0.55:
             game_mod.TURN_DUTY_CYCLE = 0.55
+            game_cfg.TURN_DUTY_CYCLE = 0.55
             print(f"  Safety cap: TURN_DUTY_CYCLE lowered to {game_mod.TURN_DUTY_CYCLE} for B2")
 
     # Pre-populate config caches to avoid runtime namespace collision
