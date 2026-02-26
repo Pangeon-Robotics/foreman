@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 
-from . import game_config as C  # runtime module ref so configure_for_robot() patches are visible
+from . import game_config as C
 from .utils import clamp as _clamp
 
 

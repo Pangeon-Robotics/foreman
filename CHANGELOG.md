@@ -3,13 +3,16 @@
 All notable changes to foreman are documented in this file.
 
 ## 0.2.3 — 2026-02-26
-- Split `game.py` (1657 lines) into 4 files: `game_config.py` (199), `game.py` (592), `navigator.py` (212), `navigator_dwa.py` (549)
-- Extract constants, enums, and per-robot defaults into `game_config.py`
-- Extract heading-based and wheeled navigation into `navigator.py` (NavigatorMixin)
-- Extract DWA obstacle-avoidance navigation into `navigator_dwa.py` (NavigatorDWAMixin)
+- Split `game.py` (1657 lines) into 6 files, all under 400 lines:
+  - `game_config.py` (199): constants, enums, per-robot defaults, configure_for_robot
+  - `game.py` (364): TargetGame core -- init, tick, pose helpers, SLAM
+  - `navigator.py` (212): NavigatorMixin -- heading-based and wheeled navigation
+  - `dwa_nav.py` (295): DWANavigatorMixin -- DWA planning and waypoint guidance
+  - `dwa_control.py` (344): DWAControlMixin -- DWA gait conversion, stuck recovery
+  - `scoring.py` (278): ScoringMixin -- lifecycle, scoring, run loop, analysis
 - Backward-compatible: all public names still importable from `game.py`
 - References: #1
-Tests: **1/1 target reached (headless, SLAM, seed=42)**
+Tests: **2/2 targets reached (headless, SLAM+obstacles, seed=42)**
 
 ## 0.2.2 — 2026-02-26
 - Add CHANGELOG.md with historical entries for all versions
