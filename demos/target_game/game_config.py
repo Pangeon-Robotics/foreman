@@ -81,7 +81,6 @@ ROBOT_DEFAULTS = {
         "TURN_FREQ": 3.0, "TURN_STEP_HEIGHT": 0.08,
         "TURN_DUTY_CYCLE": 0.55, "TURN_STANCE_WIDTH": 0.12,
         "TURN_WZ": 1.0, "THETA_THRESHOLD": 0.6,
-        "V_REF": 0.30,
     },
     "go2": {
         "NOMINAL_BODY_HEIGHT": 0.27,       # MJCF keyframe z (actual sim standing height)
@@ -96,7 +95,6 @@ ROBOT_DEFAULTS = {
         "TURN_FREQ": 1.5, "TURN_STEP_HEIGHT": 0.04,
         "TURN_DUTY_CYCLE": 0.65, "TURN_STANCE_WIDTH": 0.04,
         "TURN_WZ": 0.8, "THETA_THRESHOLD": 0.6,
-        "V_REF": 1.5,
     },
     "go2w": {
         "WHEELED": True,
@@ -118,7 +116,6 @@ ROBOT_DEFAULTS = {
         "WHEEL_FWD_TORQUE": 2.0,           # Nm per wheel (5.0 caused 44° nose-dive)
         "WHEEL_KP_YAW": 4.0,              # Nm/rad heading proportional
         "WHEEL_MAX_TURN": 6.0,            # Nm max differential
-        "V_REF": 1.5,
     },
     "b2w": {
         "WHEELED": True,
@@ -141,7 +138,6 @@ ROBOT_DEFAULTS = {
         "WHEEL_FWD_TORQUE": 15.0,          # Nm per wheel
         "WHEEL_KP_YAW": 8.0,              # Nm/rad heading proportional
         "WHEEL_MAX_TURN": 12.0,           # Nm max differential
-        "V_REF": 2.0,
     },
 }
 

@@ -4,8 +4,11 @@ ATO score = path_efficiency² × speed_ratio × regression_gate × 100
 
 where:
   path_efficiency  = A*_distance / actual_distance    (0 to 1)
-  speed_ratio      = avg_speed / V_ref                (0 to ~1)
+  speed_ratio      = avg_speed / V_REF                (0 to ~1)
   regression_gate  = max(0, 1 - 2 × regression / ref_dist)²
+
+V_REF is a fixed per-robot objective (m/s), not a tunable parameter.
+It represents a conservative target speed for each platform.
 
 The regression gate severely punishes walking away from the target:
   - 0% regression  → gate 1.00  (no penalty)
@@ -31,13 +34,21 @@ import math
 
 import numpy as np
 
+# Fixed per-robot speed objectives (m/s). Not tunable.
+V_REF = {
+    "b2": 2.0,
+    "go2": 1.5,
+    "go2w": 2.0,
+    "b2w": 3.0,
+}
+
 
 class PathCritic:
     """Evaluate path quality using ATO fitness metric.
 
     Usage::
 
-        critic = PathCritic(robot_radius=0.35, v_ref=2.0)
+        critic = PathCritic(robot="b2")
         critic.set_tsdf(tsdf)  # optional, for obstacle-aware A*
 
         # When target spawns:
@@ -56,9 +67,9 @@ class PathCritic:
         critic.print_summary()
     """
 
-    def __init__(self, robot_radius: float = 0.35, v_ref: float = 2.0):
+    def __init__(self, robot: str = "b2", robot_radius: float = 0.35):
         self._robot_radius = robot_radius
-        self._v_ref = v_ref
+        self._v_ref = V_REF.get(robot, 2.0)
         self._tsdf = None
         self._path: list[tuple[float, float, float]] = []  # (x, y, t)
         self._target: tuple[float, float] | None = None

@@ -51,6 +51,9 @@ Each repo has **agency, scope, and responsibility**. Never edit files belonging 
 # From workspace root (parent of foreman/)
 source env/bin/activate
 
+# Required for DDS — preload system CycloneDDS before pip version
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libddsc.so.0.10.4
+
 # Install per-layer deps
 cd layers_1_2 && make install
 cd ../layer_3 && make install
@@ -103,16 +106,44 @@ python -m foreman.demos.target_game --robot b2 --domain 2  # Separate DDS domain
 python -m foreman.demos.target_game --robot b2 --slam  # SLAM odometry (replaces ground-truth position)
 python -m foreman.demos.target_game --robot b2 --slam --obstacles  # SLAM + obstacle scene
 ```
-Supported robots: **b2** (legged), **go2** (legged), **go2w** (wheeled), **b2w** (wheeled). Per-robot defaults (gains, step params, body height) live in `game.py:ROBOT_DEFAULTS`.
+Supported robots: **b2** (legged), **go2** (legged), **go2w** (wheeled), **b2w** (wheeled). Per-robot defaults (gains, step params, body height) live in `game_config.py:ROBOT_DEFAULTS`.
 
 Runs Layers 1-4 together (legged robots use L4 GaitParams directly, wheeled robots use differential wheel torque). Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time (see gotcha below).
 
 With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body velocity) via `perception.py:PerceptionPipeline`. With `--obstacles`: loads `scene_target_obstacles.xml` and enables LiDAR point cloud processing into costmaps + DWA local planning. Costmap visualization is handled by `viz.py:CostmapOverlay`.
 
+**Target game module map** (split to meet 400-line limit):
+| File | Concern |
+|------|---------|
+| `__main__.py` | Entry point, DDS preload, genome loading, arg parsing |
+| `game.py` | TargetGame core (init, tick, pose helpers) |
+| `game_config.py` | Constants, enums, ROBOT_DEFAULTS, `configure_for_robot()` |
+| `scoring.py` | Lifecycle, scoring, run loop, statistics |
+| `navigator.py` | NavigatorMixin (heading/wheeled nav) |
+| `dwa_nav.py` | DWANavigatorMixin (DWA planning, waypoint guidance) |
+| `dwa_control.py` | DWAControlMixin (gait conversion, stuck recovery) |
+| `path_critic.py` | Path quality evaluation for DWA |
+| `perception.py` | PerceptionPipeline (SLAM, LiDAR → costmap) |
+| `viz.py` | CostmapOverlay, visualization helpers |
+| `target.py` | Target and TargetSpawner classes |
+| `utils.py` | Cross-layer shared utilities (canonical location) |
+
+### Scenario Testing
+Progressive obstacle scenarios for validating DWA navigation:
+```bash
+python foreman/run_scenario.py open              # Empty field baseline
+python foreman/run_scenario.py corridor --headed  # 1.5m gap parallel walls
+python foreman/run_scenario.py dead_end           # U-shaped obstacle, forced detour
+```
+Available scenarios (in `demos/target_game/scenarios/`): **open**, **scattered**, **corridor**, **L_wall**, **dead_end**, **dense**. Each defines obstacle positions, target spawning, and automated evaluation critics.
+
 ### Troubleshooting
 ```bash
 # Kill zombie firmware processes (common after interrupted runs)
 pkill -9 -f "firmware_sim.py"
+
+# Clear stale session files (block startup if left from interrupted runs)
+rm -f /tmp/robo_sessions/*.json
 ```
 
 ## The Cascade Pattern

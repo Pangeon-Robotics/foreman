@@ -479,9 +479,7 @@ def run_game(args) -> GameRunResult:
 
                     # Path critic with A* on TSDF
                     from .path_critic import PathCritic
-                    from .game import ROBOT_DEFAULTS
-                    _v_ref = ROBOT_DEFAULTS.get(args.robot, {}).get("V_REF", 2.0)
-                    critic = PathCritic(robot_radius=0.35, v_ref=_v_ref)
+                    critic = PathCritic(robot=args.robot, robot_radius=0.35)
                     critic.set_tsdf(perception._tsdf)
                     game.set_path_critic(critic)
 
@@ -491,9 +489,7 @@ def run_game(args) -> GameRunResult:
         # Path critic for non-obstacle runs (straight-line only, no A*)
         if game._path_critic is None:
             from .path_critic import PathCritic
-            from .game import ROBOT_DEFAULTS
-            _v_ref = ROBOT_DEFAULTS.get(args.robot, {}).get("V_REF", 2.0)
-            game.set_path_critic(PathCritic(robot_radius=0.35, v_ref=_v_ref))
+            game.set_path_critic(PathCritic(robot=args.robot, robot_radius=0.35))
 
         stats = game.run()
 
