@@ -1436,6 +1436,21 @@ class TargetGame:
             self._on_reached()
             return
 
+        # Progress-based early timeout: if the robot hasn't closed at least
+        # 1m toward the target in 20s, SLAM drift likely makes the target
+        # unreachable.  Timing out early reduces regression accumulation
+        # (60s of wandering → massive regression that zeros aggregate ATO).
+        if self._target_step_count % 2000 == 0 and self._target_step_count >= 2000:
+            if self._progress_window_dist < float('inf'):
+                progress = self._progress_window_dist - dist
+                if progress < 1.0:
+                    print(f"  [EARLY TIMEOUT] progress={progress:.1f}m in 20s "
+                          f"(need 1.0m) — SLAM drift likely")
+                    self._on_timeout()
+                    return
+            self._progress_window_dist = dist
+            self._progress_window_step = self._target_step_count
+
         if self._target_step_count >= self._timeout_steps:
             self._on_timeout()
 
