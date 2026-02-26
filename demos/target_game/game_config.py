@@ -26,10 +26,10 @@ KD_FULL = 126.5             # sqrt(KP_FULL) * 2 — critically damped
 
 # --- Genome parameters (patched by _apply_genome in __main__.py) ---
 
-GAIT_FREQ = 1.5
-STEP_LENGTH = 0.30
-STEP_HEIGHT = 0.07
-DUTY_CYCLE = 0.65
+GAIT_FREQ = 3.0
+STEP_LENGTH = 0.45
+STEP_HEIGHT = 0.10
+DUTY_CYCLE = 0.70
 STANCE_WIDTH = 0.0
 BODY_HEIGHT = 0.465
 KP_YAW = 2.0
@@ -38,7 +38,7 @@ TURN_FREQ = 3.0
 TURN_STEP_HEIGHT = 0.08
 TURN_DUTY_CYCLE = 0.55
 TURN_STANCE_WIDTH = 0.12
-TURN_WZ = 1.0
+TURN_WZ = 2.0
 THETA_THRESHOLD = 0.6
 TIP_STEP_LENGTH = 0.10   # m — stride for differential TIP (minimal forward drift)
 _TIP_WZ_SCALE = 1.0      # 1:1 — TURN_WZ is the actual TIP yaw rate (matches tip_demo.py)
@@ -75,12 +75,12 @@ ROBOT_DEFAULTS = {
         "NOMINAL_BODY_HEIGHT": 0.465, "BODY_HEIGHT": 0.465,
         "KP_START": 500.0, "KP_FULL": 4000.0,
         "KD_START": 25.0, "KD_FULL": 126.5,
-        "GAIT_FREQ": 1.5, "STEP_LENGTH": 0.30, "STEP_HEIGHT": 0.07,
-        "DUTY_CYCLE": 0.65, "STANCE_WIDTH": 0.0,
+        "GAIT_FREQ": 3.0, "STEP_LENGTH": 0.45, "STEP_HEIGHT": 0.10,
+        "DUTY_CYCLE": 0.70, "STANCE_WIDTH": 0.0,
         "KP_YAW": 2.0, "WZ_LIMIT": 1.5,
         "TURN_FREQ": 3.0, "TURN_STEP_HEIGHT": 0.08,
         "TURN_DUTY_CYCLE": 0.55, "TURN_STANCE_WIDTH": 0.12,
-        "TURN_WZ": 1.0, "THETA_THRESHOLD": 0.6,
+        "TURN_WZ": 2.0, "THETA_THRESHOLD": 0.6,
     },
     "go2": {
         "NOMINAL_BODY_HEIGHT": 0.27,       # MJCF keyframe z (actual sim standing height)

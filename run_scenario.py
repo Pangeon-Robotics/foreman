@@ -44,8 +44,10 @@ Scenarios (easiest to hardest):
                         help="Path to genome JSON (default: auto-detect v14 seed)")
     parser.add_argument("--no-genome", action="store_true",
                         help="Run without any genome file")
+    parser.add_argument("--headed", action="store_true",
+                        help="Run with MuJoCo viewer (default: headless)")
     parser.add_argument("--headless", action="store_true",
-                        help="Run headless instead of with viewer")
+                        help="Run headless (default)")
     parser.add_argument("--domain", type=int, default=2,
                         help="DDS domain ID (default: 2)")
     parser.add_argument("--seed", type=int, default=None,
@@ -74,7 +76,7 @@ Scenarios (easiest to hardest):
         "--domain", str(args.domain),
     ]
 
-    if not args.headless:
+    if args.headed:
         cmd.append("--headed")
 
     if args.scenario != "all":
@@ -86,10 +88,12 @@ Scenarios (easiest to hardest):
     if args.targets is not None:
         cmd.extend(["--targets", str(args.targets)])
 
-    # Genome handling
+    # Genome handling — resolve to absolute since subprocess runs from _WORKSPACE
     if not args.no_genome:
         genome = args.genome
-        if genome is None:
+        if genome is not None:
+            genome = str(Path(genome).resolve())
+        else:
             genome = _SEED_GENOMES.get(args.robot)
             if genome and genome.exists():
                 genome = str(genome)

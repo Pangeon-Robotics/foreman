@@ -197,7 +197,7 @@ class DWAControlMixin:
                     self._smooth_dwa_fwd += 0.15 * (
                         dwa_fwd_target - self._smooth_dwa_fwd)
                 else:
-                    self._smooth_dwa_fwd += 0.04 * (
+                    self._smooth_dwa_fwd += 0.08 * (
                         dwa_fwd_target - self._smooth_dwa_fwd)
                 heading_mod = min(heading_mod, self._smooth_dwa_fwd)
             elif dwa.n_feasible < 20:
@@ -240,6 +240,9 @@ class DWAControlMixin:
             wz = self._smooth_wz
 
             # TIP mode: turn in place when target is behind.
+            # With TURN_WZ>=2.0, 180° TIP takes ≤1.6s and produces 0
+            # regression. Walking during turns at 0.3× speed adds arc
+            # distance and regression that kills reg_gate (0.74 vs 0.85).
             enter_tip = (goal_behind
                          and abs(heading_err) > C.THETA_THRESHOLD
                          and not heading_was_good)
@@ -259,6 +262,11 @@ class DWAControlMixin:
                 )
                 self._in_tip_mode = True
             else:
+                if self._in_tip_mode:
+                    # Exiting TIP: _smooth_dwa_fwd decayed toward 0 during
+                    # TIP (behind_factor zeroes dwa.forward). Jumpstart to
+                    # 0.5 so the robot doesn't crawl for 0.5s post-turn.
+                    self._smooth_dwa_fwd = max(self._smooth_dwa_fwd, 0.5)
                 self._in_tip_mode = False
                 params = self._L4GaitParams(
                     gait_type='trot',

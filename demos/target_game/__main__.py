@@ -280,13 +280,15 @@ def run_game(args) -> GameRunResult:
         _apply_genome(genome)
 
     # Safety cap: untrained genomes may have unstable turn params for heavy robots.
-    # At TURN_FREQ >= 2.5 (small arcs), B2 is stable up to TURN_WZ=1.0.
+    # B2 is stable up to TURN_WZ=3.0 with TURN_FREQ>=2.5 and stance_width>=0.12.
+    # Higher turn rates are critical for ATO: 180° turns at wz=1.0 take 3.14s of
+    # zero forward speed, killing aggregate v_avg. At wz=3.0, turns take ~1s.
     from . import game as game_mod
     from . import game_config as game_cfg
     if args.robot == "b2":
-        if game_mod.TURN_WZ > 1.0:
-            game_mod.TURN_WZ = 1.0
-            game_cfg.TURN_WZ = 1.0
+        if game_mod.TURN_WZ > 3.0:
+            game_mod.TURN_WZ = 3.0
+            game_cfg.TURN_WZ = 3.0
             print(f"  Safety cap: TURN_WZ capped to {game_mod.TURN_WZ} for B2")
         if game_mod.TURN_STANCE_WIDTH < 0.12:
             game_mod.TURN_STANCE_WIDTH = 0.12
