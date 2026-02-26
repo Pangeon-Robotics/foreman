@@ -346,11 +346,22 @@ class PathCritic:
         # Passability: distance to nearest obstacle > robot radius
         passable = dist_2d >= self._robot_radius
 
-        # If start or goal is impassable, relax the constraint there
+        # Relax start only (robot may overlap obstacle due to TSDF noise).
+        # Do NOT relax goal — if the target is behind an obstacle, A* should
+        # fail so the caller can fall back to a wider approach, rather than
+        # routing the path through the obstacle.
         if not passable[sx, sy]:
             passable[sx, sy] = True
-        if not passable[gx, gy]:
-            passable[gx, gy] = True
+
+        # Proximity cost: cells near obstacles cost more to traverse.
+        # Without this, A* treats a cell 0.36m from an obstacle the same as
+        # one 5.0m away, causing paths to hug obstacle edges.  The penalty
+        # ramps from 0 (at >= 2*radius) to 3.0 (at exactly radius), making
+        # A* prefer paths with comfortable clearance.
+        _PROX_MARGIN = self._robot_radius * 2.0  # full clearance zone
+        prox_cost = np.zeros((nx, ny), dtype=np.float64)
+        near_mask = (dist_2d < _PROX_MARGIN) & passable
+        prox_cost[near_mask] = 3.0 * (1.0 - dist_2d[near_mask] / _PROX_MARGIN)
 
         # A* with 8-connected grid
         SQRT2 = math.sqrt(2.0)
@@ -369,6 +380,10 @@ class PathCritic:
         g_score[sx, sy] = 0.0
         visited = np.zeros((nx, ny), dtype=np.bool_)
         parent = {}  # (x,y) -> (px, py), only if return_path
+
+        # Track closest reachable cell to goal (fallback when goal blocked)
+        best_h = h(sx, sy)
+        best_cell = (sx, sy)
 
         while open_set:
             f, cx, cy = heapq.heappop(open_set)
@@ -390,6 +405,12 @@ class PathCritic:
                 continue
             visited[cx, cy] = True
 
+            # Update closest reachable cell
+            ch = h(cx, cy)
+            if ch < best_h:
+                best_h = ch
+                best_cell = (cx, cy)
+
             for dx, dy, cost in neighbors:
                 nx2 = cx + dx
                 ny2 = cy + dy
@@ -400,14 +421,27 @@ class PathCritic:
                     if dx != 0 and dy != 0:
                         if not passable[cx + dx, cy] or not passable[cx, cy + dy]:
                             continue
-                    new_g = g_score[cx, cy] + cost
+                    new_g = g_score[cx, cy] + cost + prox_cost[nx2, ny2]
                     if new_g < g_score[nx2, ny2]:
                         g_score[nx2, ny2] = new_g
                         if return_path:
                             parent[(nx2, ny2)] = (cx, cy)
                         heapq.heappush(open_set, (new_g + h(nx2, ny2), nx2, ny2))
 
-        # No path found
+        # Goal unreachable.  For path queries, return path to the closest
+        # reachable cell — this gives the robot a waypoint that routes AROUND
+        # the obstacle instead of aiming through it.  For distance queries,
+        # return None (no valid A* distance to report).
+        if return_path and best_cell != (sx, sy):
+            path = []
+            px, py = best_cell
+            while (px, py) != (sx, sy):
+                path.append((ox + (px + 0.5) * vs, oy + (py + 0.5) * vs))
+                px, py = parent[(px, py)]
+            path.append((ox + (sx + 0.5) * vs, oy + (sy + 0.5) * vs))
+            path.reverse()
+            return path
+
         return None
 
     def _astar(
