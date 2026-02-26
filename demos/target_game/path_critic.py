@@ -73,7 +73,21 @@ class PathCritic:
         self._target = (target_x, target_y)
 
     def record(self, x: float, y: float, t: float = 0.0) -> None:
-        """Record a position sample. Call at DWA replan rate (10Hz)."""
+        """Record a position sample. Call at DWA replan rate (10Hz).
+
+        Filters out SLAM jitter: only records if position moved >= 0.03m from
+        the last sample.  At 10Hz, 0.03m = 0.3 m/s — standing still in SLAM
+        noise won't accumulate phantom regression or inflate path distance.
+        The first sample (after set_target) is always recorded.
+        """
+        if self._path:
+            px, py, _ = self._path[-1]
+            dx, dy = x - px, y - py
+            if dx * dx + dy * dy < 0.03 * 0.03:
+                # Update timestamp but don't record a new position point.
+                # This keeps total_time correct for speed calculation.
+                self._path[-1] = (px, py, t)
+                return
         self._path.append((x, y, t))
 
     def target_reached(self, target_x: float, target_y: float) -> dict:

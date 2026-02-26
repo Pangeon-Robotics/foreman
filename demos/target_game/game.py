@@ -225,6 +225,7 @@ class TargetGame:
         self._make_low_cmd = make_low_cmd
         self._stamp_cmd = stamp_cmd
         self._num_targets = num_targets
+        self._reach_threshold_base = reach_threshold
         self._reach_threshold = reach_threshold
         self._timeout_steps = timeout_steps
         self._angle_range = angle_range
@@ -549,7 +550,7 @@ class TargetGame:
             if self._fall_tick_count >= FALL_CONFIRM_TICKS:
                 self._stats.falls += 1
                 self._fall_tick_count = 0
-                self._post_fall_settle = 200  # 2s settle before next target
+                self._post_fall_settle = 500  # 5s max settle before next target
                 print(f"FALL DETECTED at z={z:.3f}m (sustained {FALL_CONFIRM_TICKS} ticks)")
                 self._state = GameState.SPAWN_TARGET
                 return True
@@ -593,6 +594,16 @@ class TargetGame:
                     "slam_x": round(p.x, 3), "slam_y": round(p.y, 3),
                     "truth_x": round(truth_x, 3), "truth_y": round(truth_y, 3),
                 })
+
+        # Dynamic reach threshold: SLAM drift accumulates over time, so
+        # expand the arrival zone gradually.  +0.02m/s, capped at +1.0m.
+        # After 25s: 0.5+0.5=1.0m.  After 50s: 0.5+1.0=1.5m.
+        if self._state == GameState.WALK_TO_TARGET:
+            t = self._target_step_count * CONTROL_DT
+            self._reach_threshold = min(
+                self._reach_threshold_base + t * 0.02,
+                self._reach_threshold_base + 1.0,
+            )
 
         if self._state == GameState.STARTUP:
             self._tick_startup()
@@ -667,16 +678,21 @@ class TargetGame:
         # Post-fall settle: send neutral stand to let robot recover balance.
         # Without this, the robot goes from lying on the ground to full-speed
         # walking in 1 tick, causing cascading falls.
+        # Wait until body height recovers OR timeout (5s).
         if self._post_fall_settle > 0:
             self._post_fall_settle -= 1
-            params = self._L4GaitParams(
-                gait_type='trot', step_length=0.0,
-                gait_freq=GAIT_FREQ, step_height=0.0,
-                duty_cycle=1.0, stance_width=0.0, wz=0.0,
-                body_height=BODY_HEIGHT,
-            )
-            self._send_l4(params)
-            return
+            _, _, _, z, _, _ = self._get_robot_pose()
+            recovered = z > NOMINAL_BODY_HEIGHT * 0.85
+            if not recovered and self._post_fall_settle > 0:
+                params = self._L4GaitParams(
+                    gait_type='trot', step_length=0.0,
+                    gait_freq=GAIT_FREQ, step_height=0.0,
+                    duty_cycle=1.0, stance_width=0.0, wz=0.0,
+                    body_height=BODY_HEIGHT,
+                )
+                self._send_l4(params)
+                return
+            # Either recovered or timed out — proceed to spawn
 
         # Use SLAM pose for spawning (target relative to estimated position)
         nav_x, nav_y, nav_yaw = self._get_nav_pose()
@@ -687,6 +703,7 @@ class TargetGame:
             target = self._spawner.spawn_relative(nav_x, nav_y, nav_yaw, angle_range=self._angle_range)
         self._target_index += 1
         self._target_step_count = 0
+        self._reach_threshold = self._reach_threshold_base
         self._min_target_dist = float('inf')
         self._slam_drift_latched = False
         self._in_tip_mode = False
@@ -1316,6 +1333,18 @@ class TargetGame:
 
             if slam_drift_detected:
                 heading_mod = min(heading_mod, 0.3)
+
+            # Turn-step floor: L4 differential stride turning is proportional
+            # to step_length.  When heading error is large and wz is saturated,
+            # the cos(heading_err) floor gives step ≈ 0.09m which yields only
+            # ~1-2°/s actual turn rate — 30-60s to resolve a 60° error.  In
+            # open field, set a minimum step so turning is effective even at
+            # large heading errors.  The robot walks somewhat sideways but
+            # turns 10x faster (resolving 60° in 3-4s instead of 40s).
+            if (abs(nav_heading_err) > 0.52  # >30°
+                    and dwa.n_feasible >= 20
+                    and not goal_behind):
+                heading_mod = max(heading_mod, 0.50)
 
             # Smooth to prevent jerky changes (fast alpha for decisive response)
             self._smooth_heading_mod += 0.20 * (heading_mod - self._smooth_heading_mod)
