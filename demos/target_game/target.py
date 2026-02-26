@@ -5,10 +5,7 @@ import math
 import random
 from dataclasses import dataclass
 
-
-def normalize_angle(angle: float) -> float:
-    """Normalize angle to [-pi, pi]."""
-    return math.atan2(math.sin(angle), math.cos(angle))
+from .utils import normalize_angle
 
 
 @dataclass
