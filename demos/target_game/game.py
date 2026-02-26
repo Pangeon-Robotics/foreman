@@ -906,6 +906,15 @@ class TargetGame:
             heading_err = target.heading_error(nav_x, nav_y, nav_yaw)
         goal_behind = abs(heading_err) > math.pi / 2
 
+        # Track heading quality for SLAM drift guard.
+        # Updated here (before DWA and TIP logic) so both can use it.
+        if abs(heading_err) < 0.8:  # within ~45°
+            self._last_good_heading_step = self._target_step_count
+        heading_was_good = (
+            (self._target_step_count
+             - getattr(self, '_last_good_heading_step', -999)) < 200
+        )
+
         # Track minimum distance for SLAM drift detection.
         # Once drift is latched, stop updating min_dist (prevents the
         # oscillate-and-reset pattern where robot accidentally gets closer,
@@ -1222,8 +1231,21 @@ class TargetGame:
         if self._last_dwa_result is not None:
             dwa = self._last_dwa_result
 
+            # --- SLAM drift dampening ---
+            # When heading was recently good (<45°) but now appears behind
+            # the robot (>90°), the heading jump is SLAM yaw noise — not
+            # a physical 90°+ rotation.  Dampen the navigation response:
+            #  - Speed: use cos(45°)=0.71 floor instead of cos(130°)→0
+            #  - Turn: freeze smooth_wz at its pre-flip value so the robot
+            #    keeps walking in the last known-good direction instead of
+            #    waggling ±1.5 rad/s every 1-2s.
+            drift_dampened = heading_was_good and abs(heading_err) > math.pi / 2
+            nav_heading_err = heading_err
+            if drift_dampened:
+                nav_heading_err = math.copysign(math.pi / 4, heading_err)
+
             # --- Turn: heading-proportional + DWA obstacle avoidance ---
-            heading_turn = _clamp(heading_err * KP_YAW, -1.0, 1.0)
+            heading_turn = _clamp(nav_heading_err * KP_YAW, -1.0, 1.0)
 
             # Blend DWA turn as a nudge, not an override.
             # The DWA is a local planner — it picks the best 10m arc, but
@@ -1245,7 +1267,7 @@ class TargetGame:
             turn_cmd = (1.0 - dwa_blend) * heading_turn + dwa_blend * dwa.turn
 
             # --- Speed: heading alignment with obstacle braking ---
-            cos_heading = max(0.0, math.cos(heading_err))
+            cos_heading = max(0.0, math.cos(nav_heading_err))
             heading_mod = max(0.3, cos_heading)
 
             # Scale speed with feasibility: more blocked arcs → slower.
@@ -1264,11 +1286,20 @@ class TargetGame:
             # asymmetry, a 0→1→0 oscillation at 20Hz settles around 0.5 and
             # the robot walks at half speed into the obstacle.
             dwa_fwd_target = max(0.02, dwa.forward)
-            if dwa_fwd_target < self._smooth_dwa_fwd:
-                self._smooth_dwa_fwd += 0.15 * (dwa_fwd_target - self._smooth_dwa_fwd)
-            else:
-                self._smooth_dwa_fwd += 0.04 * (dwa_fwd_target - self._smooth_dwa_fwd)
-            heading_mod = min(heading_mod, self._smooth_dwa_fwd)
+            if not drift_dampened:
+                # Normal: track DWA forward with asymmetric EMA.
+                if dwa_fwd_target < self._smooth_dwa_fwd:
+                    self._smooth_dwa_fwd += 0.15 * (dwa_fwd_target - self._smooth_dwa_fwd)
+                else:
+                    self._smooth_dwa_fwd += 0.04 * (dwa_fwd_target - self._smooth_dwa_fwd)
+                heading_mod = min(heading_mod, self._smooth_dwa_fwd)
+            elif dwa.n_feasible < 20:
+                # Drift dampened but obstacles present — still respect DWA
+                # forward for safety.  Freeze the EMA to prevent ratcheting.
+                heading_mod = min(heading_mod, self._smooth_dwa_fwd)
+            # else: drift dampened, open field (feas >= 20) — DWA forward=0
+            # is from heading noise, not obstacles.  Skip the clamp so the
+            # robot keeps walking at cos(45°) ≈ 0.71 speed.
 
             # Reactive scan: reduce speed near obstacles
             threat_active = False
@@ -1291,7 +1322,10 @@ class TargetGame:
             heading_mod = self._smooth_heading_mod
 
             wz = _clamp(turn_cmd * WZ_LIMIT, -WZ_LIMIT, WZ_LIMIT)
-            self._smooth_wz += 0.25 * (wz - self._smooth_wz)
+            if not drift_dampened:
+                self._smooth_wz += 0.25 * (wz - self._smooth_wz)
+            # When drift_dampened, smooth_wz is frozen at its pre-flip
+            # value — the last stable turn direction.
             wz = self._smooth_wz
 
             # TIP mode: turn in place when target is behind.
@@ -1300,16 +1334,9 @@ class TargetGame:
             # at ~57°/s vs walk-turn at ~15°/s, so keeping TIP through the
             # 90°→34° range saves ~3-4s of slow arcing walk.
             #
-            # SLAM yaw drift guard: after ~10m of travel, SLAM yaw can
-            # drift 10-20°, making a forward target suddenly appear behind.
-            # If heading was good (<45°) within the last 2s, suppress TIP
-            # entry — the 140° heading flip is noise, not physical motion.
-            if abs(heading_err) < 0.8:  # within ~45°
-                self._last_good_heading_step = self._target_step_count
-            heading_was_good = (
-                (self._target_step_count
-                 - getattr(self, '_last_good_heading_step', -999)) < 200
-            )
+            # SLAM yaw drift guard: heading_was_good (computed above) is True
+            # when heading was <45° within the last 2s.  If True and
+            # goal_behind, the heading flip is SLAM noise — suppress TIP.
             enter_tip = (goal_behind and abs(heading_err) > THETA_THRESHOLD
                          and not heading_was_good)
             stay_tip = self._in_tip_mode and abs(heading_err) > THETA_THRESHOLD
