@@ -288,7 +288,7 @@ def obstacle_proximity(telem: dict, criteria: dict) -> CriticResult:
         name="obstacle_proximity",
         passed=passed,
         score=score,
-        details=(f"min clearance {min_seen:.2f}m (threshold {min_clearance_threshold:.1f}m), "
+        details=(f"min clearance {min_seen:.2f}m (threshold {min_clearance_threshold:.2f}m), "
                  f"mean {mean_clearance:.2f}m, "
                  f"{violations}/{len(clearances)} samples below threshold"),
     )

@@ -762,8 +762,10 @@ class TargetGame:
         heading_err = target.heading_error(nav_x, nav_y, nav_yaw)
         dist = target.distance_to(nav_x, nav_y)
 
-        # Path critic: record position at 10Hz
-        if self._path_critic is not None and self._target_step_count % 10 == 0:
+        # Path critic: record position at 10Hz (skip TIP — stationary phase)
+        if (self._path_critic is not None
+                and self._target_step_count % 10 == 0
+                and abs(heading_err) <= THETA_THRESHOLD):
             self._path_critic.record(nav_x, nav_y, t=self._target_step_count * CONTROL_DT)
 
         if abs(heading_err) > THETA_THRESHOLD:
@@ -922,8 +924,17 @@ class TargetGame:
             )
         slam_drift_detected = self._slam_drift_latched
 
-        # Path critic: record position at 10Hz
-        if self._path_critic is not None and self._target_step_count % 10 == 0:
+        # Path critic: record position at 10Hz.
+        # Skip during TIP — it's an orientation phase, not navigation.
+        # SLAM drift jitter during TIP creates noisy position samples;
+        # each jitter away from target accumulates as regression even
+        # though net drift is ~0.05m.  Excluding TIP from path recording
+        # also excludes TIP time from the speed calculation (total_time
+        # uses recorded timestamps), giving a cleaner measure of forward
+        # navigation quality independent of target placement.
+        if (self._path_critic is not None
+                and self._target_step_count % 10 == 0
+                and not self._in_tip_mode):
             self._path_critic.record(nav_x, nav_y, t=self._target_step_count * CONTROL_DT)
 
         # A* waypoint guidance: recompute at 1-2Hz depending on environment.
@@ -1137,7 +1148,7 @@ class TargetGame:
         #    0.02 floor while the target is right there.  Need to turn to
         #    find a viable approach angle.
         dwa_feas = self._last_dwa_result.n_feasible if self._last_dwa_result else 999
-        if self._target_step_count % 400 == 0 and self._target_step_count > 0:
+        if self._target_step_count % 200 == 0 and self._target_step_count > 0:
             no_progress = dist >= self._stuck_check_dist - 0.3
             jammed = dwa_feas < 5 and no_progress
             blocked_fwd = (self._smooth_dwa_fwd < 0.1
@@ -1236,6 +1247,15 @@ class TargetGame:
             cos_heading = max(0.0, math.cos(heading_err))
             heading_mod = max(0.3, cos_heading)
 
+            # Scale speed with feasibility: more blocked arcs → slower.
+            # At feas < 20 (>50% arcs blocked), obstacles are close enough to
+            # destabilize on collision.  Smooth scaling avoids abrupt stops
+            # while preventing the robot from walking full-speed into obstacles.
+            #   feas=20: scale=1.0  feas=10: 0.50  feas=5: 0.25  feas=0: 0.0
+            if dwa.n_feasible < 20:
+                feas_scale = dwa.n_feasible / 20.0
+                heading_mod = min(heading_mod, feas_scale)
+
             # DWA forward: the planner knows arc geometry — when it says
             # forward=0.0 (tight turn-in-place arc won), the robot must slow.
             # Smooth the DWA forward separately: fast decel (α=0.15, ~7 ticks
@@ -1273,8 +1293,14 @@ class TargetGame:
             self._smooth_wz += 0.25 * (wz - self._smooth_wz)
             wz = self._smooth_wz
 
-            # TIP mode: turn in place when target is behind
-            if goal_behind and abs(heading_err) > THETA_THRESHOLD:
+            # TIP mode: turn in place when target is behind.
+            # Hysteresis: enter TIP when goal_behind (>90°), but stay in TIP
+            # until heading converges below THETA_THRESHOLD (34°).  TIP turns
+            # at ~57°/s vs walk-turn at ~15°/s, so keeping TIP through the
+            # 90°→34° range saves ~3-4s of slow arcing walk.
+            enter_tip = goal_behind and abs(heading_err) > THETA_THRESHOLD
+            stay_tip = self._in_tip_mode and abs(heading_err) > THETA_THRESHOLD
+            if enter_tip or stay_tip:
                 turn_wz = (TURN_WZ if heading_err > 0 else -TURN_WZ) * _TIP_WZ_SCALE
                 params = self._L4GaitParams(
                     gait_type='trot', wz=turn_wz, step_length=0.0,
