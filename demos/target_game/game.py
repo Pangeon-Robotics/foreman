@@ -1130,15 +1130,22 @@ class TargetGame:
             return
 
         # --- Stuck detection ---
-        # Trigger when jammed against an obstacle (feas < 5 = nearly all arcs
-        # blocked) and no distance progress in 4s.  Higher-feas stalled states
-        # are handled by the closest-reachable-point A* fallback which provides
-        # detour waypoints.
+        # Two triggers:
+        # 1. Jammed (feas<5, 4s): nearly all arcs blocked, fast recovery
+        # 2. Blocked forward (smooth_dwa_fwd < 0.1, 5s): DWA can't find
+        #    a forward arc but has turning arcs.  The robot creeps at the
+        #    0.02 floor while the target is right there.  Need to turn to
+        #    find a viable approach angle.
         dwa_feas = self._last_dwa_result.n_feasible if self._last_dwa_result else 999
         if self._target_step_count % 400 == 0 and self._target_step_count > 0:
             no_progress = dist >= self._stuck_check_dist - 0.3
             jammed = dwa_feas < 5 and no_progress
-            if jammed:
+            blocked_fwd = (self._smooth_dwa_fwd < 0.1
+                           and no_progress
+                           and getattr(self, '_prev_no_progress', False)
+                           and not self._in_tip_mode)
+            self._prev_no_progress = no_progress
+            if jammed or blocked_fwd:
                 self._stuck_recovery_countdown = 100  # 1s at 100Hz
                 # Turn direction: use the DWA turn signal averaged over the
                 # last few ticks (smooth_dwa_turn) — more stable than the
