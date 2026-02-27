@@ -131,9 +131,9 @@ With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body vel
 ### Scenario Testing
 Progressive obstacle scenarios for validating DWA navigation:
 ```bash
-python foreman/run_scenario.py open              # Empty field baseline
-python foreman/run_scenario.py corridor --headed  # 1.5m gap parallel walls
-python foreman/run_scenario.py dead_end           # U-shaped obstacle, forced detour
+python foreman/run_scenario.py open              # Empty field (headed by default)
+python foreman/run_scenario.py corridor           # 1.5m gap parallel walls
+python foreman/run_scenario.py dead_end --headless  # Headless, max speed
 ```
 Available scenarios (in `demos/target_game/scenarios/`): **open**, **scattered**, **corridor**, **L_wall**, **dead_end**, **dense**. Each defines obstacle positions, target spawning, and automated evaluation critics.
 

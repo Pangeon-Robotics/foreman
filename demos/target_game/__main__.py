@@ -57,6 +57,7 @@ class GameRunResult:
     truth_trail: list[tuple[float, float]] = field(default_factory=list)
     perception_stats: dict | None = None
     ato_score: float | None = None
+    occupancy_accuracy: dict | None = None  # IoU/precision/recall from test_occupancy
 
 
 def _expand_v9_genome(params: dict) -> dict:
@@ -265,6 +266,37 @@ def _find_obstacle_bodies(scene_path: Path) -> list[str]:
     return names
 
 
+def _find_obstacle_geoms(scene_path: Path) -> list[dict]:
+    """Parse scene XML to extract obstacle geom volumes (obs_* bodies).
+
+    Returns list of dicts with 'type' ('box'|'cylinder'), 'pos' (x,y,z),
+    and 'size' (half-extents for box, radius+half-height for cylinder).
+    Used by debug_server (viewer wireframes) and test_occupancy (ground truth).
+    """
+    import xml.etree.ElementTree as ET
+    obstacles = []
+    try:
+        tree = ET.parse(scene_path)
+        for body in tree.iter("body"):
+            name = body.get("name", "")
+            if not name.startswith("obs_"):
+                continue
+            pos_str = body.get("pos", "0 0 0")
+            pos = tuple(float(v) for v in pos_str.split())
+            for geom in body.findall("geom"):
+                gtype = geom.get("type", "sphere")
+                size_str = geom.get("size", "0.25")
+                size = tuple(float(v) for v in size_str.split())
+                obstacles.append({
+                    "type": gtype,
+                    "pos": pos,
+                    "size": size,
+                })
+    except (ET.ParseError, FileNotFoundError):
+        pass
+    return obstacles
+
+
 def run_game(args) -> GameRunResult:
     """Run target game with given configuration. Returns structured result.
 
@@ -379,6 +411,7 @@ def run_game(args) -> GameRunResult:
     )
     sim.start()
     perception = None
+    debug_server = None
     try:
         import math
         full_circle = getattr(args, 'full_circle', False)
@@ -419,6 +452,9 @@ def run_game(args) -> GameRunResult:
         # Register obstacle bodies for ground-truth proximity checking
         if obstacle_bodies:
             game.set_obstacle_bodies(obstacle_bodies)
+
+        # Set scene path for per-tick occupancy accuracy telemetry
+        game.set_scene_path(str(scene_path))
 
         # Optional custom spawn function (e.g. scattered scenario back-and-forth)
         spawn_fn = getattr(args, 'spawn_fn', None)
@@ -498,6 +534,16 @@ def run_game(args) -> GameRunResult:
             except Exception as e:
                 print(f"Warning: DDS setup failed: {e} (SLAM still works)")
 
+        # Debug viewer server
+        viewer = getattr(args, 'viewer', False)
+        if viewer:
+            from .debug_server import DebugServer
+            debug_server = DebugServer(port=9877)
+            debug_server.start()
+            game._debug_server = debug_server
+            # Send ground-truth obstacle volumes (once, on first client connect)
+            game._obstacle_geoms = _find_obstacle_geoms(scene_path)
+
         # Path critic for non-obstacle runs (straight-line only, no A*)
         if game._path_critic is None:
             from .path_critic import PathCritic
@@ -507,6 +553,17 @@ def run_game(args) -> GameRunResult:
 
         ato = game._path_critic.aggregate_ato() if game._path_critic else None
 
+        # Compute occupancy accuracy (TSDF vs ground-truth obstacles)
+        occ_accuracy = None
+        if perception is not None and getattr(args, 'obstacles', False):
+            try:
+                from .test_occupancy import compute_occupancy_2d
+                occ_accuracy = compute_occupancy_2d(
+                    perception._tsdf, str(scene_path),
+                )
+            except Exception as e:
+                print(f"Warning: occupancy accuracy failed: {e}")
+
         return GameRunResult(
             stats=stats,
             telemetry_path=telem_path,
@@ -514,8 +571,11 @@ def run_game(args) -> GameRunResult:
             truth_trail=list(game.truth_trail),
             perception_stats=perception.stats if perception is not None else None,
             ato_score=ato,
+            occupancy_accuracy=occ_accuracy,
         )
     finally:
+        if debug_server is not None:
+            debug_server.stop()
         sim.stop()
 
 
@@ -535,6 +595,8 @@ def main():
                         help="Use SLAM odometry instead of ground-truth position")
     parser.add_argument("--obstacles", action="store_true",
                         help="Use scene_obstacles.xml with static obstacles")
+    parser.add_argument("--viewer", action="store_true",
+                        help="Start TCP debug server for Godot TSDF viewer")
     args = parser.parse_args()
 
     result = run_game(args)

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run an obstacle avoidance scenario in headed (visual) mode.
+"""Run an obstacle avoidance scenario (headed by default).
 
 Usage:
     python run_scenario.py                      # list available scenarios
-    python run_scenario.py open                 # run open field (no obstacles)
+    python run_scenario.py open                 # run open field (headed)
     python run_scenario.py corridor             # run corridor scenario
-    python run_scenario.py dead_end --robot b2  # specify robot
+    python run_scenario.py dead_end --headless  # headless, max speed
     python run_scenario.py all                  # run all scenarios sequentially
 """
 import argparse
@@ -44,10 +44,10 @@ Scenarios (easiest to hardest):
                         help="Path to genome JSON (default: auto-detect v14 seed)")
     parser.add_argument("--no-genome", action="store_true",
                         help="Run without any genome file")
-    parser.add_argument("--headed", action="store_true",
-                        help="Run with MuJoCo viewer (default: headless)")
     parser.add_argument("--headless", action="store_true",
-                        help="Run headless (default)")
+                        help="Run headless at max speed (default: headed)")
+    parser.add_argument("--viewer", action="store_true",
+                        help="Start TCP debug server for Godot TSDF viewer")
     parser.add_argument("--domain", type=int, default=2,
                         help="DDS domain ID (default: 2)")
     parser.add_argument("--seed", type=int, default=None,
@@ -76,8 +76,11 @@ Scenarios (easiest to hardest):
         "--domain", str(args.domain),
     ]
 
-    if args.headed:
+    if not args.headless:
         cmd.append("--headed")
+
+    if args.viewer:
+        cmd.append("--viewer")
 
     if args.scenario != "all":
         cmd.extend(["--scenario", args.scenario])

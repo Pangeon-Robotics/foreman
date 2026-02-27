@@ -45,6 +45,8 @@ Scenarios (easiest to hardest):
                         help="Override target seed (default: use scenario's seed)")
     parser.add_argument("--targets", type=int, default=None,
                         help="Override number of targets (default: use scenario's count)")
+    parser.add_argument("--viewer", action="store_true",
+                        help="Start TCP debug server for Godot TSDF viewer")
     parser.add_argument("--list", action="store_true",
                         help="List available scenarios and exit")
     args = parser.parse_args()
@@ -72,6 +74,7 @@ Scenarios (easiest to hardest):
         genome=args.genome,
         domain=args.domain,
         headless=not args.headed,
+        viewer=args.viewer,
     )
 
     results = runner.run_all(scenarios, seed_override=args.seed,

@@ -30,12 +30,12 @@ class DWANavigatorMixin:
         path = None
         if self._path_critic is not None and self._path_critic._tsdf is not None:
             saved = self._path_critic._robot_radius
-            self._path_critic._robot_radius = 0.25
+            self._path_critic._robot_radius = 0.40
             path = self._path_critic._astar_core(
                 (nav_x, nav_y), (target_x, target_y), return_path=True,
             )
             if path is None:
-                self._path_critic._robot_radius = 0.20
+                self._path_critic._robot_radius = 0.30
                 path = self._path_critic._astar_core(
                     (nav_x, nav_y), (target_x, target_y), return_path=True,
                 )
@@ -62,6 +62,10 @@ class DWANavigatorMixin:
                 f.write(buf)
         except OSError:
             pass
+
+        # Stream to debug viewer
+        if self._debug_server is not None:
+            self._debug_server.send_path(filtered)
 
     def _tick_walk_dwa(self):
         """Walk toward target using DWA obstacle avoidance.
@@ -139,6 +143,19 @@ class DWANavigatorMixin:
         self._dwa_replan(
             nav_x, nav_y, nav_yaw, target, dist,
             heading_err, goal_behind, use_waypoint)
+
+        # Close-range ground-truth override: SLAM yaw drift causes the
+        # robot to orbit the target instead of converging.  Use ground-
+        # truth pose for the final 2m so heading control is accurate.
+        # (Waypoint planning and DWA above still use SLAM — correct for
+        # path planning; only the approach control switches to truth.)
+        truth_dist = math.hypot(target.x - x_truth, target.y - y_truth)
+        if truth_dist < 2.0:
+            dist = truth_dist
+            heading_err = _normalize_angle(
+                math.atan2(target.y - y_truth, target.x - x_truth)
+                - yaw_truth)
+            goal_behind = abs(heading_err) > math.pi / 2
 
         # Close-range approach: bypass DWA oscillation pipeline
         dwa_feas_now = (self._last_dwa_result.n_feasible
@@ -221,11 +238,11 @@ class DWANavigatorMixin:
 
         wp = self._path_critic.plan_waypoints(
             nav_x, nav_y, target.x, target.y, lookahead=2.0,
-            planning_radius=0.25)
+            planning_radius=0.40)
         if wp is None:
             wp = self._path_critic.plan_waypoints(
                 nav_x, nav_y, target.x, target.y, lookahead=2.0,
-                planning_radius=0.20)
+                planning_radius=0.30)
 
         # Waypoint commitment: suppress left/right oscillation.
         if wp is not None and self._current_waypoint is not None:

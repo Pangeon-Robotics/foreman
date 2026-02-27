@@ -65,12 +65,13 @@ class DWAControlMixin:
                     self._path_critic.running_ato())
                 ato_info = (f"  ATO={_a:.0f} pe={_pe:.0%} sr={_sr:.2f} "
                             f"rg={_rg:.2f} reg={_reg:.1f}m")
+            occ_str = self._get_occ_str()
             print(f"[target {self._target_index}/{self._num_targets}] "
                   f"{mode_str:<7} dist={dist:.1f}m  "
                   f"h_err={math.degrees(heading_err):+.0f}deg  "
                   f"step={sent_step:.2f}  wz={self._smooth_wz:+.2f}  "
                   f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s"
-                  f"{ato_info}")
+                  f"{ato_info}{occ_str}")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -94,9 +95,20 @@ class DWAControlMixin:
                 and no_progress
                 and getattr(self, '_prev_no_progress', False)
                 and not self._in_tip_mode)
+            # Prolonged stuck: 3 consecutive no-progress checks (6s)
+            # catches DWA local minima where feas is moderate (10-25)
+            # and smooth_dwa_fwd floor prevents blocked_fwd from firing.
+            streak = getattr(self, '_no_progress_streak', 0)
+            if no_progress:
+                streak += 1
+            else:
+                streak = 0
+            self._no_progress_streak = streak
+            prolonged_stuck = (streak >= 3 and not self._in_tip_mode)
             self._prev_no_progress = no_progress
-            if jammed or blocked_fwd:
+            if jammed or blocked_fwd or prolonged_stuck:
                 self._stuck_recovery_countdown = 100  # 1s at 100Hz
+                self._no_progress_streak = 0
                 if abs(self._smooth_dwa_turn) > 0.1:
                     self._stuck_recovery_wz = math.copysign(
                         C.TURN_WZ, self._smooth_dwa_turn)
@@ -107,9 +119,13 @@ class DWAControlMixin:
                     self._stuck_recovery_wz = C.TURN_WZ
                 self._current_waypoint = None
                 self._wp_commit_until = 0
+                reason = ("jammed" if jammed else
+                          "blocked_fwd" if blocked_fwd else
+                          f"no_progress×{streak}")
                 print(f"  [STUCK] dist={dist:.1f}m "
                       f"(was {self._stuck_check_dist:.1f}m) "
-                      f"feas={dwa_feas} -- recovery: turn "
+                      f"feas={dwa_feas} reason={reason} "
+                      f"-- recovery: turn "
                       f"{math.degrees(self._stuck_recovery_wz):+.0f}"
                       f"deg/s")
             self._stuck_check_dist = dist
@@ -336,13 +352,14 @@ class DWAControlMixin:
                 ato_info = (
                     f"  ATO={_a:.0f} pe={_pe:.0%} sr={_sr:.2f} "
                     f"rg={_rg:.2f} reg={_reg:.1f}m")
+            occ_str = self._get_occ_str()
             print(
                 f"[target {self._target_index}/{self._num_targets}] "
                 f"{mode_str:<7} dist={dist:.1f}m  "
                 f"h_err={math.degrees(heading_err):+.0f}deg  "
                 f"step={sent_step:.2f}  wz={sent_wz:+.2f}  "
                 f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s"
-                f"{dwa_info}{behind_str}{ato_info}")
+                f"{dwa_info}{behind_str}{ato_info}{occ_str}")
 
         if dist < self._reach_threshold:
             self._on_reached()

@@ -44,11 +44,13 @@ class ScenarioRunner:
         genome: str | None = None,
         domain: int = 2,
         headless: bool = True,
+        viewer: bool = False,
     ):
         self._robot = robot
         self._genome = genome
         self._domain = domain
         self._headless = headless
+        self._viewer = viewer
 
     def run_all(
         self,
@@ -114,6 +116,7 @@ class ScenarioRunner:
             max_dist=scenario.max_dist,
             angle_range=scenario.angle_range,
             spawn_fn=spawn_fn,
+            viewer=self._viewer,
         )
 
         try:

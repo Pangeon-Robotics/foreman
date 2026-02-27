@@ -277,17 +277,17 @@ class TargetGame(
         # Recompute every 500 ticks (5s at 100Hz)
         if self._step_count - self._occ_compute_step >= 500:
             try:
-                from .test_occupancy import compute_occupancy_accuracy
+                from .test_occupancy import compute_occupancy_2d
                 tsdf = self._perception._tsdf
                 if tsdf is not None:
-                    self._cached_occ = compute_occupancy_accuracy(
+                    self._cached_occ = compute_occupancy_2d(
                         tsdf, self._scene_xml_path)
                     self._occ_compute_step = self._step_count
             except Exception:
                 pass
         if self._cached_occ is not None:
-            return (f"  occ={self._cached_occ['iou']:.2f}/"
-                    f"{self._cached_occ['precision']:.2f}")
+            o = self._cached_occ
+            return f"  occ={o['iou']:.2f} P={o['precision']:.2f} R={o['recall']:.2f}"
         return ""
 
     def _get_nav_pose(self) -> tuple[float, float, float]:

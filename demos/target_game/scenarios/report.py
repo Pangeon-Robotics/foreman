@@ -22,7 +22,8 @@ def print_report(results: dict) -> None:
 
     # Header
     header = (f"{'Scenario':<15} {'Targets':>8} {'Success':>8} {'Falls':>6} "
-              f"{'ATO':>6} {'SLAM Drift':>11} {'DWA Feas':>9} {'Critics':>10} {'Result':>8}")
+              f"{'ATO':>6} {'SLAM Drift':>11} {'DWA Feas':>9} {'Occ':>12} "
+              f"{'Critics':>10} {'Result':>8}")
     print(header)
     print("-" * len(header))
 
@@ -62,6 +63,12 @@ def print_report(results: dict) -> None:
                 dwa_str = f"{c.score * 105:.0f}/105"
                 break
 
+        # Occupancy accuracy (IoU between TSDF and ground-truth obstacles)
+        occ_str = "n/a"
+        occ = gr.occupancy_accuracy
+        if occ is not None:
+            occ_str = f"{occ['iou']:.2f}/{occ['precision']:.2f}"
+
         # Critics summary
         n_passed = sum(1 for c in result.critic_results if c.passed)
         n_total = len(result.critic_results)
@@ -71,7 +78,8 @@ def print_report(results: dict) -> None:
         result_str = "PASS" if all_passed else "FAIL"
 
         print(f"{name:<15} {targets_str:>8} {success_str:>8} {falls_str:>6} "
-              f"{ato_str:>6} {slam_str:>11} {dwa_str:>9} {critics_str:>10} {result_str:>8}")
+              f"{ato_str:>6} {slam_str:>11} {dwa_str:>9} {occ_str:>12} "
+              f"{critics_str:>10} {result_str:>8}")
 
     # Detailed failures
     failures = [

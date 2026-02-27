@@ -117,6 +117,7 @@ class ScoringMixin:
         self._stuck_recovery_countdown = 0
         self._stuck_recovery_wz = 0.0
         self._prev_no_progress = False
+        self._no_progress_streak = 0
         self._last_good_heading_step = -999
         self._progress_window_dist = float('inf')
         self._progress_window_step = 0
@@ -132,6 +133,11 @@ class ScoringMixin:
                 0, [target.x, target.y, target_z])
         except (RuntimeError, AttributeError):
             pass
+
+        # Update perception with target position so LiDAR filters out
+        # the target marker sphere (not an obstacle).
+        if self._perception is not None:
+            self._perception.set_target_position(target.x, target.y)
 
         dist = target.distance_to(nav_x, nav_y)
         src = "SLAM" if self._odometry else "truth"
@@ -180,8 +186,10 @@ class ScoringMixin:
         """Run the full game loop and return statistics."""
         start_time = time.monotonic()
 
+        headed = not getattr(self._sim, '_headless', False)
         while self.tick():
-            time.sleep(C.CONTROL_DT)
+            if headed:
+                time.sleep(C.CONTROL_DT)
 
         self._stats.total_time = time.monotonic() - start_time
         if self._telemetry is not None:

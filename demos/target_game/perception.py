@@ -170,6 +170,13 @@ class PerceptionPipeline:
         self._imu_pitch = 0.0
         self._imu_yaw = 0.0
 
+        # Target marker positions (set by game, used to filter LiDAR hits).
+        # The target mocap sphere is hit by LiDAR but is not an obstacle.
+        # Tracks ALL historical positions since old TSDF voxels persist.
+        # Default includes scene XML initial position (5, 0).
+        self._target_positions: list[tuple[float, float]] = [(5.0, 0.0)]
+        self._TARGET_FILTER_RADIUS = 0.35  # filter hits within 0.35m of target
+
         # Keep references to avoid re-importing
         self._CostmapQuery = CostmapQuery
         self._PointCloud = PointCloud
@@ -190,6 +197,14 @@ class PerceptionPipeline:
             self._imu_roll = roll
             self._imu_pitch = pitch
             self._imu_yaw = yaw
+
+    def set_target_position(self, x: float, y: float) -> None:
+        """Add target marker position for LiDAR hit filtering.
+
+        Tracks all historical positions since TSDF voxels from old
+        target positions persist until free rays clear them.
+        """
+        self._target_positions.append((x, y))
 
     @staticmethod
     def _build_rotation(roll, pitch, yaw):
@@ -236,11 +251,11 @@ class PerceptionPipeline:
 
     # Minimum world-frame Z for valid LiDAR hits. Points below this are
     # ground-plane artifacts that slip through lidar.py's filter after
-    # 3D rotation shifts their Z. B2's LiDAR is ~0.65m high; downward
-    # channels at 2-3m range produce hits at z=0.05-0.15m (ground zone).
-    # Raising from 0.05 to 0.10 cuts ground false positives that halve
-    # TSDF precision (50% → ~75%+).
-    _MIN_WORLD_Z = 0.10
+    # 3D rotation shifts their Z. B2 LiDAR at ~0.65m height; downward
+    # channels (-15°, -7°) at 2-4m range hit ground at z=0.13-0.25m.
+    # Raising from 0.10 to 0.20 cuts most ground-ring false positives
+    # while preserving obstacle base detection above 0.20m.
+    _MIN_WORLD_Z = 0.20
 
     def on_point_cloud(self, msg) -> None:
         """DDS callback: new point cloud received.
@@ -262,6 +277,15 @@ class PerceptionPipeline:
 
         data = np.array(msg.data[:num_pts * 3], dtype=np.float32).reshape(-1, 3)
 
+        # Filter robot self-hits: discard sensor-local points within 0.8m.
+        # mj_multiRay's bodyexclude only covers the root body, not child
+        # bodies (limbs). Limb hits at 0.3-0.8m create persistent FP voxels
+        # as the robot walks. Real obstacles are always >0.5m from sensor.
+        dist_sq = data[:, 0]**2 + data[:, 1]**2
+        data = data[dist_sq > 0.64]  # 0.8m squared
+        if len(data) == 0:
+            return
+
         # Snapshot IMU pose (set by game tick at 100Hz)
         with self._imu_lock:
             imu_x = self._imu_x
@@ -270,6 +294,11 @@ class PerceptionPipeline:
             imu_roll = self._imu_roll
             imu_pitch = self._imu_pitch
             imu_yaw = self._imu_yaw
+
+        # Skip integration when robot is fallen — disoriented LiDAR creates
+        # TSDF artifacts at wrong z-levels that persist and corrupt the costmap.
+        if imu_z < 0.30:  # B2 nominal height ~0.47, fall threshold ~0.35
+            return
 
         # Build rotation matrix once (used for both points and sensor origin)
         R = self._build_rotation(imu_roll, imu_pitch, imu_yaw)
@@ -289,6 +318,17 @@ class PerceptionPipeline:
 
         if len(pts_world) == 0:
             return
+
+        # Filter target marker hits: the mocap target sphere is hit by
+        # LiDAR but is not an obstacle. Discard points near any historical
+        # target position (old TSDF voxels persist until free rays clear them).
+        r2 = self._TARGET_FILTER_RADIUS ** 2
+        for tx, ty in self._target_positions:
+            dx = pts_world[:, 0] - tx
+            dy = pts_world[:, 1] - ty
+            pts_world = pts_world[dx * dx + dy * dy > r2]
+            if len(pts_world) == 0:
+                return
 
         # Sensor world position (for DDA ray origin — rays originate from
         # the sensor, not body center).
@@ -312,7 +352,7 @@ class PerceptionPipeline:
         vs = tsdf.voxel_size
         cx = int((imu_x - tsdf.origin_x) / vs)
         cy = int((imu_y - tsdf.origin_y) / vs)
-        mask_r = int(0.5 / vs)  # 0.5m radius
+        mask_r = int(0.8 / vs)  # 0.8m radius (covers B2 body + limbs)
         x_lo = max(0, cx - mask_r)
         x_hi = min(tsdf.nx, cx + mask_r + 1)
         y_lo = max(0, cy - mask_r)
