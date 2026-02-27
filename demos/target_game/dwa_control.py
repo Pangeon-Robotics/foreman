@@ -20,7 +20,7 @@ class DWAControlMixin:
         if abs(heading_err) > C.THETA_THRESHOLD:
             turn_wz = _clamp(
                 heading_err * C.KP_YAW, -C.TURN_WZ, C.TURN_WZ)
-            self._smooth_wz += 0.15 * (turn_wz - self._smooth_wz)
+            self._smooth_wz += C.CLOSE_RANGE_WZ_ALPHA * (turn_wz - self._smooth_wz)
             turn_wz = self._smooth_wz * C._TIP_WZ_SCALE
             self._smooth_heading_mod = 0.0
             self._decel_tick_count = C._MIN_DECEL_TICKS
@@ -39,7 +39,7 @@ class DWAControlMixin:
             self._reset_tip()
             wz = _clamp(
                 heading_err * C.KP_YAW, -C.WZ_LIMIT, C.WZ_LIMIT)
-            self._smooth_wz += 0.15 * (wz - self._smooth_wz)
+            self._smooth_wz += C.CLOSE_RANGE_WZ_ALPHA * (wz - self._smooth_wz)
             wz = self._smooth_wz
             cos_heading = max(0.0, math.cos(heading_err))
             speed = min(1.0, dist / 1.5) * cos_heading
@@ -188,17 +188,31 @@ class DWAControlMixin:
 
             if dwa.n_feasible < 20:
                 feas_scale = dwa.n_feasible / 20.0
-                heading_mod = min(heading_mod, feas_scale)
+                # Only hard-brake when forward path is also blocked
+                if dwa.forward < 0.3:
+                    heading_mod = min(heading_mod, feas_scale)
+                else:
+                    heading_mod = min(heading_mod, max(feas_scale, 0.5))
 
             # DWA forward smoothing
             dwa_fwd_target = max(0.02, dwa.forward)
             if not drift_dampened:
                 if dwa_fwd_target < self._smooth_dwa_fwd:
-                    self._smooth_dwa_fwd += 0.15 * (
+                    self._smooth_dwa_fwd += C.DWA_FWD_DECEL_ALPHA * (
                         dwa_fwd_target - self._smooth_dwa_fwd)
                 else:
-                    self._smooth_dwa_fwd += 0.08 * (
+                    self._smooth_dwa_fwd += C.DWA_FWD_ACCEL_ALPHA * (
                         dwa_fwd_target - self._smooth_dwa_fwd)
+                # Floor prevents stalling when DWA forward is low.
+                # feas>=25 (open field): goal is sideways, not blocked.
+                # feas>=10 (moderate obstacles): trot gait needs
+                #   step>=0.13 to execute differential turns.
+                if dwa.n_feasible >= 25:
+                    self._smooth_dwa_fwd = max(
+                        self._smooth_dwa_fwd, 0.4)
+                elif dwa.n_feasible >= 10:
+                    self._smooth_dwa_fwd = max(
+                        self._smooth_dwa_fwd, 0.3)
                 heading_mod = min(heading_mod, self._smooth_dwa_fwd)
             elif dwa.n_feasible < 20:
                 heading_mod = min(heading_mod, self._smooth_dwa_fwd)
@@ -226,17 +240,17 @@ class DWAControlMixin:
             if (abs(nav_heading_err) > 0.52  # >30deg
                     and dwa.n_feasible >= 20
                     and not goal_behind):
-                heading_mod = max(heading_mod, 0.50)
+                heading_mod = max(heading_mod, C.TURN_STEP_FLOOR)
 
             # Smooth to prevent jerky changes
-            self._smooth_heading_mod += 0.20 * (
+            self._smooth_heading_mod += C.DWA_HEADING_MOD_ALPHA * (
                 heading_mod - self._smooth_heading_mod)
             heading_mod = self._smooth_heading_mod
 
             wz = _clamp(
                 turn_cmd * C.WZ_LIMIT, -C.WZ_LIMIT, C.WZ_LIMIT)
             if not drift_dampened:
-                self._smooth_wz += 0.25 * (wz - self._smooth_wz)
+                self._smooth_wz += C.DWA_WZ_SMOOTH_ALPHA * (wz - self._smooth_wz)
             wz = self._smooth_wz
 
             # TIP mode: turn in place when target is behind.
@@ -264,9 +278,9 @@ class DWAControlMixin:
             else:
                 if self._in_tip_mode:
                     # Exiting TIP: _smooth_dwa_fwd decayed toward 0 during
-                    # TIP (behind_factor zeroes dwa.forward). Jumpstart to
-                    # 0.5 so the robot doesn't crawl for 0.5s post-turn.
-                    self._smooth_dwa_fwd = max(self._smooth_dwa_fwd, 0.5)
+                    # TIP (behind_factor zeroes dwa.forward). Jumpstart so
+                    # the robot doesn't crawl for 0.5s post-turn.
+                    self._smooth_dwa_fwd = max(self._smooth_dwa_fwd, C.TIP_EXIT_FWD_BOOST)
                 self._in_tip_mode = False
                 params = self._L4GaitParams(
                     gait_type='trot',

@@ -181,11 +181,21 @@ def _apply_genome(genome_path: str) -> None:
                 setattr(game_mod, name, params[name])
                 print(f"  game.{name} = {params[name]:.4f}")
 
-        # 2. Expand to L5 constants for startup/stand phase (send_motion_command)
+        # 2. Patch extended control parameters (any genome key matching a
+        #    game_config module-level variable not in the v12 core list).
+        for key, val in params.items():
+            if key not in v12_game_params and hasattr(game_cfg, key):
+                setattr(game_cfg, key, val)
+                setattr(game_mod, key, val)
+                print(f"  game.{key} = {val}")
+
+        # 3. Expand to L5 constants for startup/stand phase (send_motion_command)
         expanded = _expand_v12_genome(params)
         theta = params.get("THETA_THRESHOLD", "?")
         turn_wz = params.get("TURN_WZ", "?")
-        print(f"  v12 sovereign genome: 13 genes, theta_threshold={theta}, turn_wz={turn_wz}")
+        n_extra = sum(1 for k in params if k not in v12_game_params and hasattr(game_cfg, k))
+        extra_str = f" + {n_extra} control params" if n_extra else ""
+        print(f"  v12 sovereign genome: 13 genes{extra_str}, theta_threshold={theta}, turn_wz={turn_wz}")
 
     elif _is_v10_genome(params):
         # Extract walk subset (the 8 v9 params) for L5 expansion

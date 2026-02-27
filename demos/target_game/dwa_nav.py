@@ -30,12 +30,12 @@ class DWANavigatorMixin:
         path = None
         if self._path_critic is not None and self._path_critic._tsdf is not None:
             saved = self._path_critic._robot_radius
-            self._path_critic._robot_radius = 0.45
+            self._path_critic._robot_radius = 0.25
             path = self._path_critic._astar_core(
                 (nav_x, nav_y), (target_x, target_y), return_path=True,
             )
             if path is None:
-                self._path_critic._robot_radius = 0.35
+                self._path_critic._robot_radius = 0.20
                 path = self._path_critic._astar_core(
                     (nav_x, nav_y), (target_x, target_y), return_path=True,
                 )
@@ -164,7 +164,7 @@ class DWANavigatorMixin:
         _dwa_feas_for_wp = (self._last_dwa_result.n_feasible
                             if self._last_dwa_result else 41)
         use_waypoint = (self._current_waypoint is not None
-                        and (dist > 2.0 or _dwa_feas_for_wp < 30))
+                        and (dist > 1.5 or _dwa_feas_for_wp < 30))
         if use_waypoint:
             wp_dx = self._current_waypoint[0] - nav_x
             wp_dy = self._current_waypoint[1] - nav_y
@@ -177,40 +177,87 @@ class DWANavigatorMixin:
 
     def _dwa_update_waypoints(self, nav_x, nav_y, nav_yaw, target,
                               dist, use_waypoint):
-        """Recompute A* waypoints at 1-2Hz depending on environment."""
-        wp_interval = 50 if (
+        """Recompute A* waypoints on events, not timers.
+
+        Plans once, then only replans when: waypoint reached (<1m),
+        path severely blocked (feas < 10), or safety interval (5s
+        near obstacles, 10s open field).  This prevents A* from
+        producing different paths each second due to TSDF noise.
+        """
+        if self._path_critic is None or dist <= 1.0:
+            return
+
+        should_replan = False
+
+        # No waypoint yet — need initial plan
+        if self._current_waypoint is None:
+            should_replan = True
+        else:
+            # Reached current waypoint — get next one
+            wp_dist = math.hypot(
+                self._current_waypoint[0] - nav_x,
+                self._current_waypoint[1] - nav_y)
+            if wp_dist < 1.0:
+                should_replan = True
+
+        # Path severely blocked — replan (max 2Hz)
+        if (self._last_dwa_result is not None
+                and self._last_dwa_result.n_feasible < 10
+                and self._target_step_count % 50 == 0):
+            should_replan = True
+
+        # Safety replan: 5s near obstacles, 10s in open field
+        threat_nearby = (
             self._last_dwa_result is not None
             and (self._last_dwa_result.n_feasible < 25
-                 or getattr(self, '_last_threat_level', 0) > 0.2)
-        ) else 100
-        if (self._path_critic is not None and dist > 1.0
-                and self._target_step_count % wp_interval == 0):
+                 or getattr(self, '_last_threat_level', 0) > 0.2))
+        safety_interval = 500 if threat_nearby else 1000
+        if (self._target_step_count % safety_interval == 0
+                and self._target_step_count > 0):
+            should_replan = True
+
+        if not should_replan:
+            return
+
+        wp = self._path_critic.plan_waypoints(
+            nav_x, nav_y, target.x, target.y, lookahead=2.0,
+            planning_radius=0.25)
+        if wp is None:
             wp = self._path_critic.plan_waypoints(
                 nav_x, nav_y, target.x, target.y, lookahead=2.0,
-                planning_radius=0.45)
-            if wp is None:
-                wp = self._path_critic.plan_waypoints(
-                    nav_x, nav_y, target.x, target.y, lookahead=2.0,
-                    planning_radius=0.35)
+                planning_radius=0.20)
 
-            # Waypoint commitment: suppress left/right oscillation.
-            if wp is not None and self._current_waypoint is not None:
-                old_dx = self._current_waypoint[0] - nav_x
-                old_dy = self._current_waypoint[1] - nav_y
-                new_dx = wp[0] - nav_x
-                new_dy = wp[1] - nav_y
-                old_bearing = math.atan2(old_dy, old_dx)
-                new_bearing = math.atan2(new_dy, new_dx)
-                bearing_change = abs(
-                    _normalize_angle(new_bearing - old_bearing))
-                if bearing_change > 1.05:  # >60deg flip
-                    if self._target_step_count < self._wp_commit_until:
-                        wp = self._current_waypoint
-                    else:
+        # Waypoint commitment: suppress left/right oscillation.
+        if wp is not None and self._current_waypoint is not None:
+            old_dx = self._current_waypoint[0] - nav_x
+            old_dy = self._current_waypoint[1] - nav_y
+            new_dx = wp[0] - nav_x
+            new_dy = wp[1] - nav_y
+            old_bearing = math.atan2(old_dy, old_dx)
+            new_bearing = math.atan2(new_dy, new_dx)
+            bearing_change = abs(
+                _normalize_angle(new_bearing - old_bearing))
+            if bearing_change > 0.8:  # >45deg flip
+                if self._target_step_count < self._wp_commit_until:
+                    wp = self._current_waypoint  # keep committed wp
+                else:
+                    # Accept flip only if new wp is meaningfully better
+                    old_to_tgt = math.hypot(
+                        target.x - self._current_waypoint[0],
+                        target.y - self._current_waypoint[1])
+                    new_to_tgt = math.hypot(
+                        target.x - wp[0], target.y - wp[1])
+                    if new_to_tgt < old_to_tgt - 0.3:
+                        # New wp is >0.3m closer to target — accept
                         self._wp_commit_until = (
-                            self._target_step_count + 300)  # 3s
+                            self._target_step_count + 500)  # 5s lockout
+                    else:
+                        wp = self._current_waypoint  # reject flip
 
-            self._current_waypoint = wp
+        self._current_waypoint = wp
+
+        # Update path visualization (green dots) when plan changes
+        self._export_path(nav_x, nav_y, target.x, target.y)
 
     def _dwa_replan(self, nav_x, nav_y, nav_yaw, target, dist,
                     heading_err, goal_behind, use_waypoint):
@@ -250,9 +297,6 @@ class DWANavigatorMixin:
 
         self._last_dwa_result = result
         self._goal_bearing = math.atan2(goal_ry, goal_rx)
-
-        if self._target_step_count % 50 == 0:
-            self._export_path(nav_x, nav_y, target.x, target.y)
 
         if self._telemetry is not None:
             dwa_telemetry = {

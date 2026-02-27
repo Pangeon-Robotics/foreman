@@ -58,6 +58,15 @@ _DWA_TURN_ALPHA = 0.10            # tau ~0.5s at 20Hz replan — moderate smooth
 # Minimum decel before walk→turn mode switch
 _MIN_DECEL_TICKS = 15             # 0.15s at 100 Hz
 
+# --- DWA control flow tuning (tunable via extended genome) ---
+DWA_FWD_DECEL_ALPHA = 0.15     # forward speed deceleration EMA
+DWA_FWD_ACCEL_ALPHA = 0.08     # forward speed acceleration EMA (raised from 0.04)
+DWA_HEADING_MOD_ALPHA = 0.20   # heading_mod EMA smoothing
+DWA_WZ_SMOOTH_ALPHA = 0.25     # wz EMA smoothing in DWA mode
+TIP_EXIT_FWD_BOOST = 0.50      # post-TIP _smooth_dwa_fwd jumpstart
+TURN_STEP_FLOOR = 0.50         # min heading_mod at >30deg heading error (open field)
+CLOSE_RANGE_WZ_ALPHA = 0.15    # wz smoothing in close-range approach
+
 # --- Wheeled robot parameters (set by configure_for_robot) ---
 
 WHEELED = False

@@ -383,7 +383,7 @@ class PathCritic:
         # one 5.0m away, causing paths to hug obstacle edges.  The penalty
         # ramps from 0 (at >= 2*radius) to 3.0 (at exactly radius), making
         # A* prefer paths with comfortable clearance.
-        _PROX_MARGIN = self._robot_radius * 2.0  # full clearance zone
+        _PROX_MARGIN = self._robot_radius * 1.5  # clearance zone
         prox_cost = np.zeros((nx, ny), dtype=np.float64)
         near_mask = (dist_2d < _PROX_MARGIN) & passable
         prox_cost[near_mask] = 3.0 * (1.0 - dist_2d[near_mask] / _PROX_MARGIN)
