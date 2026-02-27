@@ -138,8 +138,16 @@ class TargetGame(
         # Wheeled mode
         self._home_q = WHEEL_HOME_Q if WHEELED else None
 
+        # Debug viewer
+        self._debug_server = None
+
         # Obstacle proximity
         self._obstacle_bodies: list[str] = []
+
+        # Occupancy accuracy (periodic cache)
+        self._scene_xml_path: str | None = None
+        self._cached_occ: dict | None = None
+        self._occ_compute_step: int = -999
 
         # TIP state
         self._step_and_shift = None
@@ -198,7 +206,7 @@ class TargetGame(
         return pose
 
     def _update_slam(self, truth_yaw: float) -> None:
-        """Feed SLAM odometry with current sensor data."""
+        """Feed SLAM odometry and IMU pose to perception pipeline."""
         if self._odometry is None:
             return
         from types import SimpleNamespace
@@ -221,6 +229,12 @@ class TargetGame(
         if self._pose_pub is not None:
             self._publish_pose()
 
+        # Feed full 6-DOF pose to perception for IMU-corrected LiDAR transforms.
+        # Uses ground-truth MuJoCo body pose (x, y, z, roll, pitch, yaw).
+        if self._perception is not None:
+            x, y, yaw, z, roll, pitch = self._get_robot_pose()
+            self._perception.set_imu_pose(x, y, z, roll, pitch, yaw)
+
     # --- Setters ---
 
     def set_dwa_planner(self, planner) -> None:
@@ -230,6 +244,10 @@ class TargetGame(
 
     def set_path_critic(self, critic) -> None:
         self._path_critic = critic
+
+    def set_scene_path(self, path: str) -> None:
+        """Set scene XML path for occupancy accuracy computation."""
+        self._scene_xml_path = path
 
     def set_obstacle_bodies(self, names: list[str]) -> None:
         self._obstacle_bodies = names
@@ -250,6 +268,27 @@ class TargetGame(
             x=p.x, y=p.y, yaw=p.yaw, timestamp=p.stamp, crc=0)
         self._pose_stamp(msg)
         self._pose_pub.Write(msg)
+
+    def _get_occ_str(self) -> str:
+        """Return formatted occupancy accuracy string, recomputing every 500 ticks."""
+        if (self._scene_xml_path is None
+                or self._perception is None):
+            return ""
+        # Recompute every 500 ticks (5s at 100Hz)
+        if self._step_count - self._occ_compute_step >= 500:
+            try:
+                from .test_occupancy import compute_occupancy_accuracy
+                tsdf = self._perception._tsdf
+                if tsdf is not None:
+                    self._cached_occ = compute_occupancy_accuracy(
+                        tsdf, self._scene_xml_path)
+                    self._occ_compute_step = self._step_count
+            except Exception:
+                pass
+        if self._cached_occ is not None:
+            return (f"  occ={self._cached_occ['iou']:.2f}/"
+                    f"{self._cached_occ['precision']:.2f}")
+        return ""
 
     def _get_nav_pose(self) -> tuple[float, float, float]:
         """Return (x, y, yaw) for navigation (always ground truth)."""
@@ -330,6 +369,56 @@ class TargetGame(
                     "truth_x": round(truth_x, 3),
                     "truth_y": round(truth_y, 3),
                 })
+
+        # Debug viewer: stream state at 10Hz, TSDF at 2Hz
+        if self._debug_server is not None and self._debug_server.has_client:
+            # Send ground-truth obstacle volumes once per connection
+            geoms = getattr(self, '_obstacle_geoms', None)
+            if geoms and not getattr(self, '_obstacles_sent', False):
+                self._debug_server.send_obstacles(geoms)
+                self._obstacles_sent = True
+            if self._step_count % 10 == 0:
+                x, y, yaw, z, roll, pitch = self._get_robot_pose()
+                # Send ground-truth pose to Godot viewer (not SLAM).
+                # TSDF voxels, cost map, obstacles, and target are all in
+                # world frame — robot must match to avoid visual offset.
+                slam_x, slam_y, slam_yaw = x, y, yaw
+                target = self._spawner.current_target
+                tx = target.x if target else 0.0
+                ty = target.y if target else 0.0
+                joints = [0.0] * 12
+                try:
+                    st = self._sim.get_state()
+                    joints = list(st.joint_positions[:12])
+                except Exception:
+                    pass
+                dwa = self._last_dwa_result
+                self._debug_server.send_robot_state(
+                    slam_x, slam_y, slam_yaw, z, roll, pitch,
+                    joints, tx, ty,
+                    self._state.value,
+                    dwa.forward if dwa else 0.0,
+                    dwa.turn if dwa else 0.0,
+                    dwa.n_feasible if dwa else 0,
+                    0.0, 0.0,
+                    self._in_tip_mode,
+                )
+            if self._step_count % 50 == 0 and self._perception is not None:
+                tsdf = self._perception._tsdf
+                if tsdf is not None:
+                    self._debug_server.send_tsdf(tsdf)
+                cost_grid = self._perception.world_cost_grid
+                meta = self._perception.world_cost_meta
+                if cost_grid is not None and meta is not None:
+                    self._debug_server.send_costmap_2d(
+                        cost_grid, meta['origin_x'], meta['origin_y'],
+                        meta['voxel_size'])
+                    if self._path_critic is not None:
+                        self._path_critic.set_world_cost(
+                            cost_grid, meta['origin_x'], meta['origin_y'],
+                            meta['voxel_size'])
+                elif tsdf is not None:
+                    self._debug_server.send_observation_map(tsdf)
 
         # Dynamic reach threshold
         if self._state == GameState.WALK_TO_TARGET:

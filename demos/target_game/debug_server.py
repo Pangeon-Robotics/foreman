@@ -205,7 +205,7 @@ class DebugServer:
         self._send(MSG_TSDF_OCCUPIED, header + voxels.tobytes())
 
     def send_observation_map(self, tsdf) -> None:
-        """Pack and send OBSERVATION_MAP (0x04). Packed bit array."""
+        """Pack and send OBSERVATION_MAP (0x04). Packed bit array (legacy)."""
         if not self.has_client:
             return
         log_odds = tsdf._log_odds  # (nx, ny, nz) float32
@@ -221,6 +221,34 @@ class DebugServer:
             tsdf.origin_x, tsdf.origin_y, tsdf.voxel_size,
         )
         self._send(MSG_OBSERVATION_MAP, header + packed.tobytes())
+
+    def send_costmap_2d(
+        self,
+        cost_grid: np.ndarray,
+        origin_x: float,
+        origin_y: float,
+        voxel_size: float,
+    ) -> None:
+        """Pack and send cost map (0x04). Raw uint8 per cell.
+
+        Same message type as observation map. The Godot client distinguishes
+        by payload size: uint8 payload is nx*ny bytes (vs bit-packed which
+        is ceil(nx*ny/8)).
+        """
+        if not self.has_client:
+            return
+        nx, ny = cost_grid.shape
+        header = struct.pack(
+            '<2H 3f',
+            nx, ny,
+            origin_x, origin_y, voxel_size,
+        )
+        # Remap (nx, ny) grid → Godot Image on FACE_Y quad.
+        # Transpose: image columns = X, image rows = Y.
+        # Flip Y: image row 0 (V=0) maps to max MuJoCo Y on the quad.
+        # Verified by test_costmap_axes.py against Godot source.
+        img = np.ascontiguousarray(np.flipud(cost_grid.T))
+        self._send(MSG_OBSERVATION_MAP, header + img.tobytes())
 
     def send_path(self, path_points: list[tuple[float, float]]) -> None:
         """Pack and send ASTAR_PATH (0x03). World-frame waypoints."""

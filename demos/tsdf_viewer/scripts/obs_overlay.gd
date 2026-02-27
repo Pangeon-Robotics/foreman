@@ -1,8 +1,14 @@
 extends MeshInstance3D
-## Ground-plane observation overlay.
+## Ground-plane cost map overlay.
 ##
-## Shows which areas of the TSDF have been scanned (green)
-## vs unknown (dark). Renders as a semi-transparent quad at y=0.01.
+## Renders the unified 2D cost grid as a red gradient:
+##   Cost 0:       transparent (free space)
+##   Cost 1-253:   red gradient (obstacle proximity)
+##   Cost 254:     bright red (lethal)
+##   Cost 255:     dark grey (unknown / unscanned)
+##
+## Backward-compatible: detects uint8 cost map (payload=nx*ny) vs
+## legacy bit-packed observation map (payload=ceil(nx*ny/8)).
 ##
 ## Uses PackedByteArray bulk writes instead of per-pixel set_pixel()
 ## for ~20x speedup on 200x200 grids.
@@ -12,7 +18,7 @@ var _initialized := false
 var _last_nx := 0
 var _last_ny := 0
 
-# Pre-computed RGBA8 byte values (avoids per-pixel Color creation)
+# Legacy bit-packed constants (backward compat)
 const OBS_R := 38   # 0.15 * 255
 const OBS_G := 128  # 0.50 * 255
 const OBS_B := 51   # 0.20 * 255
@@ -53,14 +59,63 @@ func update_observation_map(data: PackedByteArray) -> void:
 	var origin_y := data.decode_float(ofs); ofs += 4
 	var voxel_size := data.decode_float(ofs); ofs += 4
 
-	var n_bits: int = nx * ny
-	var n_bytes: int = ceili(float(n_bits) / 8.0)
+	var n_cells: int = nx * ny
+	var payload_size: int = data.size() - ofs
+
+	# Format detection: uint8 cost map (nx*ny bytes) vs bit-packed (ceil(nx*ny/8))
+	if payload_size >= n_cells:
+		_update_cost_map(data, ofs, nx, ny, n_cells, origin_x, origin_y, voxel_size)
+	else:
+		_update_bit_packed(data, ofs, nx, ny, n_cells, origin_x, origin_y, voxel_size)
+
+
+func _update_cost_map(data: PackedByteArray, ofs: int, nx: int, ny: int,
+		n_cells: int, origin_x: float, origin_y: float, voxel_size: float) -> void:
+	## Render uint8 cost grid as red gradient overlay.
+	var pixel_data := PackedByteArray()
+	pixel_data.resize(n_cells * 4)
+
+	for i in n_cells:
+		var cost: int = data[ofs + i]
+		var p: int = i * 4
+		if cost == 0:
+			# Free space: nearly transparent
+			pixel_data[p] = 0
+			pixel_data[p + 1] = 0
+			pixel_data[p + 2] = 0
+			pixel_data[p + 3] = 13  # alpha ~0.05
+		elif cost == 255:
+			# Unknown: dark grey
+			pixel_data[p] = UNK_R
+			pixel_data[p + 1] = UNK_G
+			pixel_data[p + 2] = UNK_B
+			pixel_data[p + 3] = UNK_A
+		elif cost == 254:
+			# Lethal: bright red
+			pixel_data[p] = 255
+			pixel_data[p + 1] = 0
+			pixel_data[p + 2] = 0
+			pixel_data[p + 3] = 179  # alpha 0.70
+		else:
+			# Gradient: red proportional to cost
+			var t: float = float(cost) / 254.0
+			pixel_data[p] = int(t * 255.0)      # R
+			pixel_data[p + 1] = 0                 # G
+			pixel_data[p + 2] = 0                 # B
+			pixel_data[p + 3] = int(38.0 + t * 140.0)  # alpha 0.15..0.70
+
+	_apply_image(nx, ny, pixel_data, origin_x, origin_y, voxel_size)
+
+
+func _update_bit_packed(data: PackedByteArray, ofs: int, nx: int, ny: int,
+		n_cells: int, origin_x: float, origin_y: float, voxel_size: float) -> void:
+	## Legacy bit-packed observation map (green=observed, grey=unknown).
+	var n_bytes: int = ceili(float(n_cells) / 8.0)
 	if data.size() < ofs + n_bytes:
 		return
 
-	# Build RGBA8 pixel buffer directly (no per-pixel set_pixel calls)
 	var pixel_data := PackedByteArray()
-	pixel_data.resize(n_bits * 4)
+	pixel_data.resize(n_cells * 4)
 
 	var bit_data := data.slice(ofs, ofs + n_bytes)
 	for byte_idx in n_bytes:
@@ -69,7 +124,7 @@ func update_observation_map(data: PackedByteArray) -> void:
 		# Process 8 bits per byte (MSB first — numpy packbits order)
 		for bit in 8:
 			var idx: int = base_bit + (7 - bit)
-			if idx >= n_bits:
+			if idx >= n_cells:
 				break
 			var p: int = idx * 4
 			if b & (1 << bit):
@@ -83,6 +138,12 @@ func update_observation_map(data: PackedByteArray) -> void:
 				pixel_data[p + 2] = UNK_B
 				pixel_data[p + 3] = UNK_A
 
+	_apply_image(nx, ny, pixel_data, origin_x, origin_y, voxel_size)
+
+
+func _apply_image(nx: int, ny: int, pixel_data: PackedByteArray,
+		origin_x: float, origin_y: float, voxel_size: float) -> void:
+	## Create/update texture and position the overlay quad.
 	var img := Image.create_from_data(nx, ny, false, Image.FORMAT_RGBA8, pixel_data)
 
 	if _texture == null or nx != _last_nx or ny != _last_ny:

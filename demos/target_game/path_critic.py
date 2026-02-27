@@ -71,6 +71,10 @@ class PathCritic:
         self._robot_radius = robot_radius
         self._v_ref = V_REF.get(robot, 2.0)
         self._tsdf = None
+        self._cost_grid: np.ndarray | None = None  # uint8 (nx, ny)
+        self._cost_origin_x: float = 0.0
+        self._cost_origin_y: float = 0.0
+        self._cost_voxel_size: float = 0.1
         self._path: list[tuple[float, float, float]] = []  # (x, y, t)
         self._target: tuple[float, float] | None = None
         self._reports: list[dict] = []
@@ -78,6 +82,28 @@ class PathCritic:
     def set_tsdf(self, tsdf) -> None:
         """Set the PersistentTSDF for obstacle-aware A* computation."""
         self._tsdf = tsdf
+
+    def set_world_cost(
+        self,
+        cost_grid: np.ndarray,
+        origin_x: float,
+        origin_y: float,
+        voxel_size: float,
+    ) -> None:
+        """Set the unified world-frame cost grid for A* planning.
+
+        When set, _astar_core() uses this grid instead of computing
+        passability and proximity cost from the raw TSDF distance field.
+
+        Parameters
+        ----------
+        cost_grid : uint8 array (nx, ny)
+            0=free, 1-253=gradient, 254=lethal, 255=unknown
+        """
+        self._cost_grid = cost_grid
+        self._cost_origin_x = origin_x
+        self._cost_origin_y = origin_y
+        self._cost_voxel_size = voxel_size
 
     def set_target(self, target_x: float, target_y: float) -> None:
         """Store current target position for regression computation."""
@@ -341,12 +367,133 @@ class PathCritic:
         goal: tuple[float, float],
         return_path: bool = False,
     ) -> float | list[tuple[float, float]] | None:
-        """Core A* on TSDF 2D distance field.
+        """Core A* on unified 2D cost grid (or TSDF distance field fallback).
 
         If return_path is False, returns path length in meters (or None).
         If return_path is True, returns list of world-frame (x,y) waypoints
         (or None if no path found).
+
+        When a world cost grid is available (via set_world_cost), uses it
+        as the sole authority for passability and traversal cost. Falls back
+        to the legacy TSDF distance field path when no cost grid is set.
         """
+        if self._cost_grid is not None:
+            return self._astar_on_cost_grid(start, goal, return_path)
+        return self._astar_on_tsdf(start, goal, return_path)
+
+    def _astar_on_cost_grid(
+        self,
+        start: tuple[float, float],
+        goal: tuple[float, float],
+        return_path: bool = False,
+    ) -> float | list[tuple[float, float]] | None:
+        """A* using the unified world-frame cost grid."""
+        cost_grid = self._cost_grid
+        vs = self._cost_voxel_size
+        ox = self._cost_origin_x
+        oy = self._cost_origin_y
+        nx, ny = cost_grid.shape
+
+        # Weight for cost gradient influence on traversal cost.
+        # At COST_WEIGHT=3.0, a cell with cost 254 (lethal boundary) adds
+        # 3.0 to the step distance, strongly discouraging near-obstacle routes.
+        _COST_WEIGHT = 3.0
+
+        # Start and goal in grid coordinates
+        sx = max(0, min(nx - 1, int((start[0] - ox) / vs)))
+        sy = max(0, min(ny - 1, int((start[1] - oy) / vs)))
+        gx = max(0, min(nx - 1, int((goal[0] - ox) / vs)))
+        gy = max(0, min(ny - 1, int((goal[1] - oy) / vs)))
+
+        # Passability from cost grid: lethal (254) and unknown (255) block
+        passable = (cost_grid < 254)
+
+        # Relax start cell (robot may sit on high-cost cell due to TSDF noise)
+        if not passable[sx, sy]:
+            passable[sx, sy] = True
+
+        # Precompute normalized cost for traversal weight (float64 for A*)
+        cost_norm = cost_grid.astype(np.float64) / 254.0  # 0.0..1.0
+
+        # A* with 8-connected grid
+        SQRT2 = math.sqrt(2.0)
+        neighbors = [
+            (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+            (-1, -1, SQRT2), (-1, 1, SQRT2), (1, -1, SQRT2), (1, 1, SQRT2),
+        ]
+
+        def h(x, y):
+            return math.sqrt((x - gx) ** 2 + (y - gy) ** 2)
+
+        open_set = [(h(sx, sy), sx, sy)]
+        g_score = np.full((nx, ny), np.inf, dtype=np.float64)
+        g_score[sx, sy] = 0.0
+        visited = np.zeros((nx, ny), dtype=np.bool_)
+        parent = {}
+
+        best_h = h(sx, sy)
+        best_cell = (sx, sy)
+
+        while open_set:
+            f, cx, cy = heapq.heappop(open_set)
+
+            if cx == gx and cy == gy:
+                if not return_path:
+                    return float(g_score[gx, gy]) * vs
+                path = []
+                px, py = gx, gy
+                while (px, py) != (sx, sy):
+                    path.append((ox + (px + 0.5) * vs, oy + (py + 0.5) * vs))
+                    px, py = parent[(px, py)]
+                path.append((ox + (sx + 0.5) * vs, oy + (sy + 0.5) * vs))
+                path.reverse()
+                return path
+
+            if visited[cx, cy]:
+                continue
+            visited[cx, cy] = True
+
+            ch = h(cx, cy)
+            if ch < best_h:
+                best_h = ch
+                best_cell = (cx, cy)
+
+            for dx, dy, step_dist in neighbors:
+                nx2 = cx + dx
+                ny2 = cy + dy
+                if 0 <= nx2 < nx and 0 <= ny2 < ny and not visited[nx2, ny2]:
+                    if not passable[nx2, ny2]:
+                        continue
+                    if dx != 0 and dy != 0:
+                        if not passable[cx + dx, cy] or not passable[cx, cy + dy]:
+                            continue
+                    new_g = (g_score[cx, cy] + step_dist
+                             + _COST_WEIGHT * cost_norm[nx2, ny2])
+                    if new_g < g_score[nx2, ny2]:
+                        g_score[nx2, ny2] = new_g
+                        if return_path:
+                            parent[(nx2, ny2)] = (cx, cy)
+                        heapq.heappush(open_set, (new_g + h(nx2, ny2), nx2, ny2))
+
+        if return_path and best_cell != (sx, sy):
+            path = []
+            px, py = best_cell
+            while (px, py) != (sx, sy):
+                path.append((ox + (px + 0.5) * vs, oy + (py + 0.5) * vs))
+                px, py = parent[(px, py)]
+            path.append((ox + (sx + 0.5) * vs, oy + (sy + 0.5) * vs))
+            path.reverse()
+            return path
+
+        return None
+
+    def _astar_on_tsdf(
+        self,
+        start: tuple[float, float],
+        goal: tuple[float, float],
+        return_path: bool = False,
+    ) -> float | list[tuple[float, float]] | None:
+        """Legacy A* on TSDF distance field (fallback when no cost grid)."""
         tsdf = self._tsdf
         vs = tsdf.voxel_size
         ox = tsdf.origin_x
@@ -371,19 +518,19 @@ class PathCritic:
         # Passability: distance to nearest obstacle > robot radius
         passable = dist_2d >= self._robot_radius
 
-        # Relax start only (robot may overlap obstacle due to TSDF noise).
-        # Do NOT relax goal — if the target is behind an obstacle, A* should
-        # fail so the caller can fall back to a wider approach, rather than
-        # routing the path through the obstacle.
+        # Unobserved cells (log_odds == 0 everywhere in z-range) are
+        # unknown — don't route through them.
+        iz_lo = max(0, int((tsdf.costmap_z_lo - tsdf.z_min) / vs))
+        iz_hi = min(tsdf.nz, int((tsdf.costmap_z_hi - tsdf.z_min) / vs) + 1)
+        observed = np.any(tsdf._log_odds[:, :, iz_lo:iz_hi] != 0.0, axis=2)
+        passable &= observed
+
+        # Relax start only
         if not passable[sx, sy]:
             passable[sx, sy] = True
 
-        # Proximity cost: cells near obstacles cost more to traverse.
-        # Without this, A* treats a cell 0.36m from an obstacle the same as
-        # one 5.0m away, causing paths to hug obstacle edges.  The penalty
-        # ramps from 0 (at >= 2*radius) to 3.0 (at exactly radius), making
-        # A* prefer paths with comfortable clearance.
-        _PROX_MARGIN = self._robot_radius * 1.5  # clearance zone
+        # Proximity cost
+        _PROX_MARGIN = self._robot_radius * 1.5
         prox_cost = np.zeros((nx, ny), dtype=np.float64)
         near_mask = (dist_2d < _PROX_MARGIN) & passable
         prox_cost[near_mask] = 3.0 * (1.0 - dist_2d[near_mask] / _PROX_MARGIN)
@@ -395,18 +542,15 @@ class PathCritic:
             (-1, -1, SQRT2), (-1, 1, SQRT2), (1, -1, SQRT2), (1, 1, SQRT2),
         ]
 
-        # Heuristic: Euclidean distance in grid cells
         def h(x, y):
             return math.sqrt((x - gx) ** 2 + (y - gy) ** 2)
 
-        # Priority queue: (f_score, x, y)
         open_set = [(h(sx, sy), sx, sy)]
         g_score = np.full((nx, ny), np.inf, dtype=np.float64)
         g_score[sx, sy] = 0.0
         visited = np.zeros((nx, ny), dtype=np.bool_)
-        parent = {}  # (x,y) -> (px, py), only if return_path
+        parent = {}
 
-        # Track closest reachable cell to goal (fallback when goal blocked)
         best_h = h(sx, sy)
         best_cell = (sx, sy)
 
@@ -416,7 +560,6 @@ class PathCritic:
             if cx == gx and cy == gy:
                 if not return_path:
                     return float(g_score[gx, gy]) * vs
-                # Reconstruct path
                 path = []
                 px, py = gx, gy
                 while (px, py) != (sx, sy):
@@ -430,7 +573,6 @@ class PathCritic:
                 continue
             visited[cx, cy] = True
 
-            # Update closest reachable cell
             ch = h(cx, cy)
             if ch < best_h:
                 best_h = ch
@@ -442,7 +584,6 @@ class PathCritic:
                 if 0 <= nx2 < nx and 0 <= ny2 < ny and not visited[nx2, ny2]:
                     if not passable[nx2, ny2]:
                         continue
-                    # For diagonal moves, also check that both adjacent cells are passable
                     if dx != 0 and dy != 0:
                         if not passable[cx + dx, cy] or not passable[cx, cy + dy]:
                             continue
@@ -453,10 +594,6 @@ class PathCritic:
                             parent[(nx2, ny2)] = (cx, cy)
                         heapq.heappush(open_set, (new_g + h(nx2, ny2), nx2, ny2))
 
-        # Goal unreachable.  For path queries, return path to the closest
-        # reachable cell — this gives the robot a waypoint that routes AROUND
-        # the obstacle instead of aiming through it.  For distance queries,
-        # return None (no valid A* distance to report).
         if return_path and best_cell != (sx, sy):
             path = []
             px, py = best_cell
