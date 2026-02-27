@@ -217,18 +217,21 @@ class DWANavigatorMixin:
             if wp_dist < 1.0:
                 should_replan = True
 
-        # Path severely blocked — replan (max 2Hz)
+        # Obstacles detected — replan (max 2Hz).
+        # feas < 30 catches moderate obstacles early (before score
+        # drops to 0.01), so A* can route around before impact.
         if (self._last_dwa_result is not None
-                and self._last_dwa_result.n_feasible < 10
+                and self._last_dwa_result.n_feasible < 30
                 and self._target_step_count % 50 == 0):
             should_replan = True
 
-        # Safety replan: 5s near obstacles, 10s in open field
+        # Safety replan: 3s near obstacles, 10s in open field
         threat_nearby = (
             self._last_dwa_result is not None
-            and (self._last_dwa_result.n_feasible < 25
+            and (self._last_dwa_result.n_feasible < 30
+                 or self._last_dwa_result.score < 0.20
                  or getattr(self, '_last_threat_level', 0) > 0.2))
-        safety_interval = 500 if threat_nearby else 1000
+        safety_interval = 300 if threat_nearby else 1000
         if (self._target_step_count % safety_interval == 0
                 and self._target_step_count > 0):
             should_replan = True

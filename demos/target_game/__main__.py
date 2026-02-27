@@ -267,19 +267,21 @@ def _find_obstacle_bodies(scene_path: Path) -> list[str]:
 
 
 def _find_obstacle_geoms(scene_path: Path) -> list[dict]:
-    """Parse scene XML to extract obstacle geom volumes (obs_* bodies).
+    """Parse scene XML to extract obstacle geom volumes.
 
+    Finds bodies whose names start with 'obs_' or 'wall_'.
     Returns list of dicts with 'type' ('box'|'cylinder'), 'pos' (x,y,z),
     and 'size' (half-extents for box, radius+half-height for cylinder).
     Used by debug_server (viewer wireframes) and test_occupancy (ground truth).
     """
     import xml.etree.ElementTree as ET
+    _PREFIXES = ("obs_", "wall_")
     obstacles = []
     try:
         tree = ET.parse(scene_path)
         for body in tree.iter("body"):
             name = body.get("name", "")
-            if not name.startswith("obs_"):
+            if not any(name.startswith(p) for p in _PREFIXES):
                 continue
             pos_str = body.get("pos", "0 0 0")
             pos = tuple(float(v) for v in pos_str.split())
@@ -557,8 +559,8 @@ def run_game(args) -> GameRunResult:
         occ_accuracy = None
         if perception is not None and getattr(args, 'obstacles', False):
             try:
-                from .test_occupancy import compute_occupancy_2d
-                occ_accuracy = compute_occupancy_2d(
+                from .test_occupancy import compute_occupancy_accuracy
+                occ_accuracy = compute_occupancy_accuracy(
                     perception._tsdf, str(scene_path),
                 )
             except Exception as e:

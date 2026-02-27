@@ -105,8 +105,16 @@ class DWAControlMixin:
                 streak = 0
             self._no_progress_streak = streak
             prolonged_stuck = (streak >= 3 and not self._in_tip_mode)
+            # Low-score stuck: score < 0.05 with no progress means
+            # the robot is against an obstacle. Trigger after just 1
+            # no-progress check (2s) instead of waiting for 3 (6s).
+            low_score_stuck = (
+                no_progress
+                and self._last_dwa_result is not None
+                and self._last_dwa_result.score < 0.05
+                and not self._in_tip_mode)
             self._prev_no_progress = no_progress
-            if jammed or blocked_fwd or prolonged_stuck:
+            if jammed or blocked_fwd or prolonged_stuck or low_score_stuck:
                 self._stuck_recovery_countdown = 100  # 1s at 100Hz
                 self._no_progress_streak = 0
                 if abs(self._smooth_dwa_turn) > 0.1:
@@ -121,6 +129,7 @@ class DWAControlMixin:
                 self._wp_commit_until = 0
                 reason = ("jammed" if jammed else
                           "blocked_fwd" if blocked_fwd else
+                          "low_score" if low_score_stuck else
                           f"no_progress×{streak}")
                 print(f"  [STUCK] dist={dist:.1f}m "
                       f"(was {self._stuck_check_dist:.1f}m) "
@@ -195,6 +204,13 @@ class DWAControlMixin:
             dwa_blend = min(0.5, obstacle_fraction)
             if dwa.n_feasible < 5:
                 dwa_blend = 0.0
+            # When path quality is poor, give DWA more steering
+            # authority. Low score means all feasible arcs graze
+            # obstacles — the DWA's avoidance turn must override
+            # heading-toward-goal (which points INTO the obstacle).
+            if dwa.score < 0.25 and dwa.n_feasible >= 5:
+                score_blend = 0.5 + 0.4 * (1.0 - dwa.score / 0.25)
+                dwa_blend = max(dwa_blend, score_blend)
             turn_cmd = ((1.0 - dwa_blend) * heading_turn
                         + dwa_blend * dwa.turn)
 

@@ -22,10 +22,11 @@ _OCC_DIAG_COUNT = 0
 
 
 def _parse_obstacle_voxels(scene_xml_path: str, tsdf) -> set[tuple[int, int, int]]:
-    """Parse scene XML for obstacle geoms and compute occupied voxel indices.
+    """Parse scene XML for obstacle geoms and compute *solid* occupied voxel indices.
 
-    Supports box and cylinder geoms. Returns set of (ix, iy, iz) tuples
-    at the TSDF's resolution.
+    Returns ALL voxels inside each obstacle (full volume).
+    Used by compute_occupancy_2d; for 3D surface comparison use
+    _parse_obstacle_surface_voxels() instead.
     """
     # Import here to avoid circular / preload issues
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -34,15 +35,13 @@ def _parse_obstacle_voxels(scene_xml_path: str, tsdf) -> set[tuple[int, int, int
     obstacles = _find_obstacle_geoms(Path(scene_xml_path))
     voxels = set()
     vs = tsdf.voxel_size
-    margin = vs * 1.0
+    margin = vs * 0.5
 
     for obs in obstacles:
         px, py, pz = obs['pos']
 
         if obs['type'] == 'box':
             hx, hy, hz = obs['size']
-            # Axis-aligned box: iterate voxels within [px-hx, px+hx] etc.
-            # Expand by half-voxel margin to capture boundary voxels
             x_lo = int(math.floor((px - hx - margin - tsdf.origin_x) / vs))
             x_hi = int(math.ceil((px + hx + margin - tsdf.origin_x) / vs))
             y_lo = int(math.floor((py - hy - margin - tsdf.origin_y) / vs))
@@ -58,8 +57,6 @@ def _parse_obstacle_voxels(scene_xml_path: str, tsdf) -> set[tuple[int, int, int
             radius = obs['size'][0]
             half_h = obs['size'][1]
             eff_radius = radius + margin
-            # Vertical cylinder centered at (px, py), height pz +/- half_h
-            # Expand by half-voxel margin to capture boundary voxels
             x_lo = int(math.floor((px - eff_radius - tsdf.origin_x) / vs))
             x_hi = int(math.ceil((px + eff_radius - tsdf.origin_x) / vs))
             y_lo = int(math.floor((py - eff_radius - tsdf.origin_y) / vs))
@@ -70,7 +67,6 @@ def _parse_obstacle_voxels(scene_xml_path: str, tsdf) -> set[tuple[int, int, int
                 wx = tsdf.origin_x + (ix + 0.5) * vs
                 for iy in range(max(0, y_lo), min(tsdf.ny, y_hi + 1)):
                     wy = tsdf.origin_y + (iy + 0.5) * vs
-                    # Check if voxel center is within expanded cylinder radius
                     dx = wx - px
                     dy = wy - py
                     if dx * dx + dy * dy <= eff_radius * eff_radius:
@@ -80,33 +76,212 @@ def _parse_obstacle_voxels(scene_xml_path: str, tsdf) -> set[tuple[int, int, int
     return voxels
 
 
-def compute_occupancy_accuracy(tsdf, scene_xml_path: str) -> dict:
-    """Compare TSDF occupied voxels against ground-truth obstacle volumes.
+def _parse_obstacle_surface_voxels(
+    scene_xml_path: str, tsdf,
+) -> set[tuple[int, int, int]]:
+    """Parse scene XML and return the *surface shell* of each obstacle.
+
+    LiDAR detects obstacle surfaces, not interiors.  This function returns
+    only boundary voxels — voxels inside the obstacle that have at least
+    one face-neighbour outside.  This is a thin (1-voxel) shell.
+
+    The IoU metric uses 2-voxel Chebyshev tolerance when matching TSDF
+    detections against this shell, accounting for discretization and
+    TSDF truncation boundary offset.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from foreman.demos.target_game.__main__ import _find_obstacle_geoms
+
+    obstacles = _find_obstacle_geoms(Path(scene_xml_path))
+    surface = set()
+    vs = tsdf.voxel_size
+    margin = vs * 0.5
+    _NEIGHBOURS = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
+
+    for obs in obstacles:
+        px, py, pz = obs['pos']
+
+        if obs['type'] == 'box':
+            hx, hy, hz = obs['size']
+            x_lo = int(math.floor((px - hx - margin - tsdf.origin_x) / vs))
+            x_hi = int(math.ceil((px + hx + margin - tsdf.origin_x) / vs))
+            y_lo = int(math.floor((py - hy - margin - tsdf.origin_y) / vs))
+            y_hi = int(math.ceil((py + hy + margin - tsdf.origin_y) / vs))
+            z_lo = int(math.floor((pz - hz - margin - tsdf.z_min) / vs))
+            z_hi = int(math.ceil((pz + hz + margin - tsdf.z_min) / vs))
+            solid = set()
+            for ix in range(max(0, x_lo), min(tsdf.nx, x_hi + 1)):
+                for iy in range(max(0, y_lo), min(tsdf.ny, y_hi + 1)):
+                    for iz in range(max(0, z_lo), min(tsdf.nz, z_hi + 1)):
+                        solid.add((ix, iy, iz))
+            for v in solid:
+                ix, iy, iz = v
+                for dx, dy, dz in _NEIGHBOURS:
+                    if (ix+dx, iy+dy, iz+dz) not in solid:
+                        surface.add(v)
+                        break
+
+        elif obs['type'] == 'cylinder':
+            radius = obs['size'][0]
+            half_h = obs['size'][1]
+            eff_radius = radius + margin
+            x_lo = int(math.floor((px - eff_radius - tsdf.origin_x) / vs))
+            x_hi = int(math.ceil((px + eff_radius - tsdf.origin_x) / vs))
+            y_lo = int(math.floor((py - eff_radius - tsdf.origin_y) / vs))
+            y_hi = int(math.ceil((py + eff_radius - tsdf.origin_y) / vs))
+            z_lo = int(math.floor((pz - half_h - margin - tsdf.z_min) / vs))
+            z_hi = int(math.ceil((pz + half_h + margin - tsdf.z_min) / vs))
+            solid = set()
+            for ix in range(max(0, x_lo), min(tsdf.nx, x_hi + 1)):
+                wx = tsdf.origin_x + (ix + 0.5) * vs
+                for iy in range(max(0, y_lo), min(tsdf.ny, y_hi + 1)):
+                    wy = tsdf.origin_y + (iy + 0.5) * vs
+                    dx = wx - px
+                    dy = wy - py
+                    if dx * dx + dy * dy <= eff_radius * eff_radius:
+                        for iz in range(max(0, z_lo), min(tsdf.nz, z_hi + 1)):
+                            solid.add((ix, iy, iz))
+            for v in solid:
+                ix, iy, iz = v
+                for dx, dy, dz in _NEIGHBOURS:
+                    if (ix+dx, iy+dy, iz+dz) not in solid:
+                        surface.add(v)
+                        break
+
+    return surface
+
+
+def compute_occupancy_accuracy(tsdf, scene_xml_path: str,
+                                diag: bool = False) -> dict:
+    """Compare TSDF occupied voxels against ground-truth obstacle surfaces.
+
+    Compares raw TSDF detections (log_odds > 0) against the *surface band*
+    of ground-truth obstacles — not their solid interiors.  Only GT voxels
+    in observed territory are scored (the robot can't detect unscanned
+    surfaces).
+
+    A voxel is "observed" if any voxel in its 6-connected neighbourhood
+    has been touched by the TSDF (log_odds != 0).  This means the sensor
+    has cast rays near this location and had a chance to detect it.
 
     Returns dict with 'iou', 'precision', 'recall', and counts.
-    Full 3D voxel comparison — kept for regression testing.
+    Full 3D voxel comparison.
     """
-    gt_voxels = _parse_obstacle_voxels(scene_xml_path, tsdf)
+    gt_surface = _parse_obstacle_surface_voxels(scene_xml_path, tsdf)
 
-    # TSDF occupied voxels: log_odds > 0
-    occupied = np.argwhere(tsdf._log_odds > 0)
+    # TSDF occupied voxels: log_odds > 0.5 (confirmed surface detections).
+    # A single LiDAR hit gives lo=0.85.  Requiring >0.5 filters out cells
+    # that are partially eroded by free rays but keeps single-hit detections.
+    # Real obstacles get hit repeatedly (lo=2-3.5), so this threshold is
+    # well below the noise floor.
+    lo = tsdf._log_odds
+    _LO_THRESHOLD = 0.5
+    occupied = np.argwhere(lo > _LO_THRESHOLD)
     tsdf_voxels = set(map(tuple, occupied))
 
-    intersection = gt_voxels & tsdf_voxels
-    union = gt_voxels | tsdf_voxels
+    _NEIGHBOURS = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
 
-    iou = len(intersection) / len(union) if union else 0.0
-    precision = len(intersection) / len(tsdf_voxels) if tsdf_voxels else 0.0
-    recall = len(intersection) / len(gt_voxels) if gt_voxels else 0.0
+    # Observed mask: a GT surface voxel is "observed" if it or any
+    # face-neighbour has been touched by the TSDF (log_odds != 0).
+    scanned = lo != 0.0  # (nx, ny, nz) bool
+    gt_observed = set()
+    for v in gt_surface:
+        ix, iy, iz = v
+        if scanned[ix, iy, iz]:
+            gt_observed.add(v)
+            continue
+        for dx, dy, dz in _NEIGHBOURS:
+            nx_, ny_, nz_ = ix+dx, iy+dy, iz+dz
+            if (0 <= nx_ < tsdf.nx and 0 <= ny_ < tsdf.ny
+                    and 0 <= nz_ < tsdf.nz and scanned[nx_, ny_, nz_]):
+                gt_observed.add(v)
+                break
+
+    # Tolerance matching with radius 2 voxels (0.2m).
+    # A TSDF voxel "matches" if any GT surface voxel is within Chebyshev
+    # distance 2 (and vice versa).  0.2m accounts for discretization,
+    # ray angle effects, and TSDF truncation boundary offset.
+    # Build offsets for Chebyshev distance ≤ 2 (5×5×5 cube minus corners > 2)
+    _TOL = 2
+    _OFFSETS = []
+    for dx in range(-_TOL, _TOL + 1):
+        for dy in range(-_TOL, _TOL + 1):
+            for dz in range(-_TOL, _TOL + 1):
+                if dx == 0 and dy == 0 and dz == 0:
+                    continue
+                if max(abs(dx), abs(dy), abs(dz)) <= _TOL:
+                    _OFFSETS.append((dx, dy, dz))
+
+    tsdf_matched = set()     # TSDF voxels near GT surface
+    gt_matched = set()       # GT surface voxels near a TSDF detection
+    for v in tsdf_voxels:
+        if v in gt_observed:
+            tsdf_matched.add(v)
+            gt_matched.add(v)
+            continue
+        ix, iy, iz = v
+        for dx, dy, dz in _OFFSETS:
+            nb = (ix+dx, iy+dy, iz+dz)
+            if nb in gt_observed:
+                tsdf_matched.add(v)
+                gt_matched.add(nb)
+                break
+    # Also check: GT voxels matched by nearby TSDF voxels
+    for v in gt_observed:
+        if v in gt_matched:
+            continue
+        ix, iy, iz = v
+        for dx, dy, dz in _OFFSETS:
+            nb = (ix+dx, iy+dy, iz+dz)
+            if nb in tsdf_voxels:
+                gt_matched.add(v)
+                break
+
+    precision = len(tsdf_matched) / len(tsdf_voxels) if tsdf_voxels else 0.0
+    recall = len(gt_matched) / len(gt_observed) if gt_observed else 0.0
+    iou = (2 * precision * recall / (precision + recall)
+           if precision + recall > 0 else 0.0)
+
+    global _OCC_DIAG_COUNT
+    _OCC_DIAG_COUNT += 1
+    if diag or _OCC_DIAG_COUNT in (1, 5):
+        vs = tsdf.voxel_size
+        fp_voxels = tsdf_voxels - tsdf_matched
+        fn_voxels = gt_observed - gt_matched
+        fp_z = {}
+        for ix, iy, iz in fp_voxels:
+            wz = tsdf.z_min + (iz + 0.5) * vs
+            bucket = round(wz, 1)
+            fp_z[bucket] = fp_z.get(bucket, 0) + 1
+        print(f"\n=== OCC 3D SURFACE DIAGNOSTIC ===")
+        print(f"  GT surface: {len(gt_surface)}  GT observed: {len(gt_observed)}  "
+              f"TSDF: {len(tsdf_voxels)}")
+        print(f"  TSDF matched: {len(tsdf_matched)}  GT matched: {len(gt_matched)}")
+        print(f"  P={precision:.3f}  R={recall:.3f}  F1={iou:.3f}")
+        print(f"  FP: {len(fp_voxels)}  FN: {len(fn_voxels)}")
+        if fp_z:
+            sorted_z = sorted(fp_z.items())
+            print(f"  FP by Z level: {sorted_z[:15]}")
+        fp_list = list(fp_voxels)[:10]
+        if fp_list:
+            print(f"  Sample FPs (world coords):")
+            for ix, iy, iz in fp_list:
+                wx = tsdf.origin_x + (ix + 0.5) * vs
+                wy = tsdf.origin_y + (iy + 0.5) * vs
+                wz = tsdf.z_min + (iz + 0.5) * vs
+                actual_lo = lo[ix, iy, iz]
+                print(f"    ({wx:.2f}, {wy:.2f}, z={wz:.2f}) lo={actual_lo:.2f}")
+        print(f"=========================\n")
 
     return {
         "iou": iou,
         "precision": precision,
         "recall": recall,
-        "gt_voxels": len(gt_voxels),
+        "gt_surface": len(gt_surface),
+        "gt_observed": len(gt_observed),
         "tsdf_voxels": len(tsdf_voxels),
-        "intersection": len(intersection),
-        "union": len(union),
+        "tsdf_matched": len(tsdf_matched),
+        "gt_matched": len(gt_matched),
     }
 
 

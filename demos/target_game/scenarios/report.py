@@ -22,7 +22,7 @@ def print_report(results: dict) -> None:
 
     # Header
     header = (f"{'Scenario':<15} {'Targets':>8} {'Success':>8} {'Falls':>6} "
-              f"{'ATO':>6} {'SLAM Drift':>11} {'DWA Feas':>9} {'Occ':>12} "
+              f"{'ATO':>6} {'SLAM Drift':>11} {'DWA Feas':>9} {'3DS':>12} "
               f"{'Critics':>10} {'Result':>8}")
     print(header)
     print("-" * len(header))
@@ -63,7 +63,7 @@ def print_report(results: dict) -> None:
                 dwa_str = f"{c.score * 105:.0f}/105"
                 break
 
-        # Occupancy accuracy (IoU between TSDF and ground-truth obstacles)
+        # 3D surface-shell accuracy (TSDF surface vs GT obstacle surfaces)
         occ_str = "n/a"
         occ = gr.occupancy_accuracy
         if occ is not None:
