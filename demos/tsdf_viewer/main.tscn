@@ -1,0 +1,74 @@
+[gd_scene load_steps=10 format=3]
+
+[ext_resource type="Script" path="res://scripts/main.gd" id="1"]
+[ext_resource type="Script" path="res://scripts/tcp_client.gd" id="2"]
+[ext_resource type="Script" path="res://scripts/camera_ctl.gd" id="3"]
+[ext_resource type="Script" path="res://scripts/obs_overlay.gd" id="4"]
+[ext_resource type="Script" path="res://scripts/tsdf_renderer.gd" id="5"]
+[ext_resource type="Script" path="res://scripts/robot.gd" id="6"]
+[ext_resource type="Script" path="res://scripts/path_renderer.gd" id="7"]
+[ext_resource type="Script" path="res://scripts/obstacle_renderer.gd" id="8"]
+
+[sub_resource type="BoxMesh" id="ground_mesh"]
+size = Vector3(40, 0.02, 40)
+
+[sub_resource type="StandardMaterial3D" id="ground_mat"]
+albedo_color = Color(0.25, 0.27, 0.3, 1.0)
+
+[node name="Main" type="Node3D"]
+script = ExtResource("1")
+
+[node name="TCPClient" type="Node" parent="."]
+script = ExtResource("2")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.707, -0.707, 0, 0.707, 0.707, 0, 8.5, 8.5)
+fov = 60.0
+script = ExtResource("3")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866, -0.354, 0.354, 0, 0.707, 0.707, -0.5, -0.612, 0.612, 5, 10, 5)
+light_energy = 0.8
+shadow_enabled = true
+
+[node name="AmbientLight" type="DirectionalLight3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.707, 0.707, 0, -0.707, 0.707, -5, 8, -5)
+light_energy = 0.3
+
+[node name="GroundPlane" type="MeshInstance3D" parent="."]
+mesh = SubResource("ground_mesh")
+material_override = SubResource("ground_mat")
+
+[node name="ObservationOverlay" type="MeshInstance3D" parent="."]
+script = ExtResource("4")
+
+[node name="TSDFVoxels" type="Node3D" parent="."]
+script = ExtResource("5")
+
+[node name="Robot" type="Node3D" parent="."]
+script = ExtResource("6")
+
+[node name="AStarPath" type="Node3D" parent="."]
+script = ExtResource("7")
+
+[node name="ObstacleRenderer" type="Node3D" parent="."]
+script = ExtResource("8")
+
+[node name="Target" type="MeshInstance3D" parent="."]
+visible = false
+
+[node name="HUD" type="CanvasLayer" parent="."]
+
+[node name="StatusLabel" type="Label" parent="HUD"]
+offset_left = 10
+offset_top = 10
+offset_right = 500
+offset_bottom = 120
+text = "TSDF Viewer - waiting for connection..."
+
+[node name="ConnLabel" type="Label" parent="HUD"]
+offset_left = 10
+offset_top = 130
+offset_right = 400
+offset_bottom = 160
+text = ""
