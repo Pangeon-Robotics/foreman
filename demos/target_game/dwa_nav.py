@@ -28,7 +28,7 @@ class DWANavigatorMixin:
         import struct
 
         path = None
-        if self._path_critic is not None and (self._path_critic._tsdf is not None or self._path_critic._cost_grid is not None):
+        if self._path_critic is not None and self._path_critic._cost_grid is not None:
             saved = self._path_critic._robot_radius
             self._path_critic._robot_radius = 0.40
             path = self._path_critic._astar_core(

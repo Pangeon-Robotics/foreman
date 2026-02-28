@@ -169,13 +169,14 @@ def compute_occupancy_accuracy(tsdf, scene_xml_path: str,
     """
     gt_surface = _parse_obstacle_surface_voxels(scene_xml_path, tsdf)
 
-    # TSDF occupied voxels: log_odds > 0.5 (confirmed surface detections).
-    # A single LiDAR hit gives lo=0.85.  Requiring >0.5 filters out cells
-    # that are partially eroded by free rays but keeps single-hit detections.
-    # Real obstacles get hit repeatedly (lo=2-3.5), so this threshold is
-    # well below the noise floor.
+    # TSDF occupied voxels: log_odds > 1.0 (2+ LiDAR hits required).
+    # A single LiDAR hit gives lo=0.85.  Requiring >1.0 filters out
+    # single-hit noise (self-hits, edge artifacts) and matches the
+    # confidence level used by the cost grid for A* path planning.
+    # Real obstacles get hit repeatedly (lo=2-3.5), so 1.0 is well
+    # below the confirmed-obstacle floor.
     lo = tsdf._log_odds
-    _LO_THRESHOLD = 0.5
+    _LO_THRESHOLD = 1.0
     occupied = np.argwhere(lo > _LO_THRESHOLD)
     tsdf_voxels = set(map(tuple, occupied))
 

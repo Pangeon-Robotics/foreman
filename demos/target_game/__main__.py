@@ -527,10 +527,9 @@ def run_game(args) -> GameRunResult:
                     else:
                         print("Warning: no point cloud received after 5s (DWA will use fallback)")
 
-                    # Path critic with A* on TSDF
+                    # Path critic with A* on world cost grid
                     from .path_critic import PathCritic
                     critic = PathCritic(robot=args.robot, robot_radius=0.35)
-                    critic.set_tsdf(perception._tsdf)
                     game.set_path_critic(critic)
 
             except Exception as e:

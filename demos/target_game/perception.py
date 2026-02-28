@@ -360,24 +360,46 @@ class PerceptionPipeline:
         if x_lo < x_hi and y_lo < y_hi:
             ix_idx, iy_idx = np.ogrid[x_lo:x_hi, y_lo:y_hi]
             footprint = (ix_idx - cx)**2 + (iy_idx - cy)**2 <= mask_r**2
-            # Only clear uncertain occupied cells (0 < lo < 1.0) — likely
-            # self-hits from limbs.  Confirmed obstacles (lo >= 1.0) are
-            # preserved so the robot doesn't forget nearby walls.  Free-space
-            # evidence (lo < 0) is also preserved for convergence.
+            # Clear low-confidence occupied cells (0 < lo < 2.0) — likely
+            # self-hits from limbs that got 1-2 hits.  Confirmed obstacles
+            # (lo >= 2.0, i.e. 3+ hits) are preserved so the robot doesn't
+            # forget nearby walls.  Free-space evidence (lo < 0) is also
+            # preserved for convergence.
             lo_slice = tsdf._log_odds[x_lo:x_hi, y_lo:y_hi, :]
-            uncertain = footprint[:, :, None] & (lo_slice > 0.0) & (lo_slice < 1.0)
+            uncertain = footprint[:, :, None] & (lo_slice > 0.0) & (lo_slice < 2.0)
             lo_slice[uncertain] = 0.0
 
         # --- World-frame 2D cost grid (unified authority for A* and DWA) ---
-        dist_2d = tsdf.get_distance_2d(tsdf.costmap_z_lo, tsdf.costmap_z_hi)
+        # Use higher log-odds threshold (>1.0 = 2+ LiDAR hits) for path
+        # planning.  Single hits (lo=0.85) are too noisy for A* routing.
+        # DWA body-frame costmap still uses lo>0.5 for reactive safety.
+        from scipy.ndimage import binary_opening, distance_transform_edt
+
+        lo = tsdf._log_odds
+        iz_lo = max(0, int((tsdf.costmap_z_lo - tsdf.z_min) / vs))
+        iz_hi = min(tsdf.nz, int((tsdf.costmap_z_hi - tsdf.z_min) / vs) + 1)
+        lo_slice = lo[:, :, iz_lo:iz_hi]
+
+        occupied_2d = np.any(lo_slice > 1.0, axis=2)
+
+        # Morphological opening: remove isolated 1-2 cell noise (self-hits,
+        # target residue, edge artifacts).  Real obstacles are 3+ cells wide.
+        occupied_2d = binary_opening(occupied_2d, iterations=1)
+
+        # EDT: distance from every free cell to nearest occupied cell
+        if np.any(occupied_2d):
+            dist_2d = distance_transform_edt(~occupied_2d).astype(
+                np.float32) * vs
+        else:
+            dist_2d = np.full(
+                (tsdf.nx, tsdf.ny), tsdf.nx * vs, dtype=np.float32)
+
         truncation = self._cfg.tsdf_truncation  # 0.5m
         cost_f = 1.0 - np.clip(dist_2d / truncation, 0.0, 1.0)
         cost_u8 = (cost_f * 254).astype(np.uint8)
 
         # Mark unobserved cells as unknown (255)
-        iz_lo = max(0, int((tsdf.costmap_z_lo - tsdf.z_min) / vs))
-        iz_hi = min(tsdf.nz, int((tsdf.costmap_z_hi - tsdf.z_min) / vs) + 1)
-        observed = np.any(tsdf._log_odds[:, :, iz_lo:iz_hi] != 0.0, axis=2)
+        observed = np.any(lo_slice != 0.0, axis=2)
         cost_u8[~observed] = 255
 
         # Zero robot footprint (reuse same circular mask)

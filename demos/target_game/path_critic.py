@@ -49,7 +49,7 @@ class PathCritic:
     Usage::
 
         critic = PathCritic(robot="b2")
-        critic.set_tsdf(tsdf)  # optional, for obstacle-aware A*
+        critic.set_world_cost(grid, ox, oy, vs)  # obstacle-aware A*
 
         # When target spawns:
         critic.set_target(target_x, target_y)
@@ -70,7 +70,6 @@ class PathCritic:
     def __init__(self, robot: str = "b2", robot_radius: float = 0.35):
         self._robot_radius = robot_radius
         self._v_ref = V_REF.get(robot, 2.0)
-        self._tsdf = None
         self._cost_grid: np.ndarray | None = None  # uint8 (nx, ny)
         self._cost_origin_x: float = 0.0
         self._cost_origin_y: float = 0.0
@@ -78,10 +77,6 @@ class PathCritic:
         self._path: list[tuple[float, float, float]] = []  # (x, y, t)
         self._target: tuple[float, float] | None = None
         self._reports: list[dict] = []
-
-    def set_tsdf(self, tsdf) -> None:
-        """Set the PersistentTSDF for obstacle-aware A* computation."""
-        self._tsdf = tsdf
 
     def set_world_cost(
         self,
@@ -189,7 +184,7 @@ class PathCritic:
 
         # A* obstacle-aware shortest path (start to end)
         optimal = None
-        if self._tsdf is not None or self._cost_grid is not None:
+        if self._cost_grid is not None:
             optimal = self._astar((start[0], start[1]), (end[0], end[1]))
 
         # Straight-line distance (fallback when no TSDF)
@@ -364,7 +359,7 @@ class PathCritic:
         return agg_pe ** 2 * (agg_speed / self._v_ref) * agg_reg_gate * 100.0
 
     # ------------------------------------------------------------------
-    # A* on TSDF distance field
+    # A* on world cost grid
     # ------------------------------------------------------------------
 
     def _astar_core(
@@ -373,19 +368,18 @@ class PathCritic:
         goal: tuple[float, float],
         return_path: bool = False,
     ) -> float | list[tuple[float, float]] | None:
-        """Core A* on unified 2D cost grid (or TSDF distance field fallback).
+        """A* on unified 2D world cost grid.
 
         If return_path is False, returns path length in meters (or None).
         If return_path is True, returns list of world-frame (x,y) waypoints
         (or None if no path found).
 
-        When a world cost grid is available (via set_world_cost), uses it
-        as the sole authority for passability and traversal cost. Falls back
-        to the legacy TSDF distance field path when no cost grid is set.
+        Requires a world cost grid (via set_world_cost). Returns None if
+        no cost grid is available.
         """
         if self._cost_grid is not None:
             return self._astar_on_cost_grid(start, goal, return_path)
-        return self._astar_on_tsdf(start, goal, return_path)
+        return None
 
     def _astar_on_cost_grid(
         self,
@@ -504,129 +498,12 @@ class PathCritic:
 
         return None
 
-    def _astar_on_tsdf(
-        self,
-        start: tuple[float, float],
-        goal: tuple[float, float],
-        return_path: bool = False,
-    ) -> float | list[tuple[float, float]] | None:
-        """Legacy A* on TSDF distance field (fallback when no cost grid)."""
-        tsdf = self._tsdf
-        vs = tsdf.voxel_size
-        ox = tsdf.origin_x
-        oy = tsdf.origin_y
-        nx, ny = tsdf.nx, tsdf.ny
-
-        # Get 2D distance field
-        dist_2d = tsdf.get_distance_2d(tsdf.costmap_z_lo, tsdf.costmap_z_hi)
-
-        # Start and goal in grid coordinates
-        sx = int((start[0] - ox) / vs)
-        sy = int((start[1] - oy) / vs)
-        gx = int((goal[0] - ox) / vs)
-        gy = int((goal[1] - oy) / vs)
-
-        # Clamp to grid
-        sx = max(0, min(nx - 1, sx))
-        sy = max(0, min(ny - 1, sy))
-        gx = max(0, min(nx - 1, gx))
-        gy = max(0, min(ny - 1, gy))
-
-        # Passability: distance to nearest obstacle > robot radius
-        passable = dist_2d >= self._robot_radius
-
-        # Unobserved cells are treated as passable so A* can plan
-        # through unexplored space to always reach the target.
-
-        # Relax start and goal cells
-        if not passable[sx, sy]:
-            passable[sx, sy] = True
-        if not passable[gx, gy]:
-            passable[gx, gy] = True
-
-        # Proximity cost
-        _PROX_MARGIN = self._robot_radius * 1.5
-        prox_cost = np.zeros((nx, ny), dtype=np.float64)
-        near_mask = (dist_2d < _PROX_MARGIN) & passable
-        prox_cost[near_mask] = 3.0 * (1.0 - dist_2d[near_mask] / _PROX_MARGIN)
-
-        # A* with 8-connected grid
-        SQRT2 = math.sqrt(2.0)
-        neighbors = [
-            (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
-            (-1, -1, SQRT2), (-1, 1, SQRT2), (1, -1, SQRT2), (1, 1, SQRT2),
-        ]
-
-        def h(x, y):
-            return math.sqrt((x - gx) ** 2 + (y - gy) ** 2)
-
-        open_set = [(h(sx, sy), sx, sy)]
-        g_score = np.full((nx, ny), np.inf, dtype=np.float64)
-        g_score[sx, sy] = 0.0
-        visited = np.zeros((nx, ny), dtype=np.bool_)
-        parent = {}
-
-        best_h = h(sx, sy)
-        best_cell = (sx, sy)
-
-        while open_set:
-            f, cx, cy = heapq.heappop(open_set)
-
-            if cx == gx and cy == gy:
-                if not return_path:
-                    return float(g_score[gx, gy]) * vs
-                path = []
-                px, py = gx, gy
-                while (px, py) != (sx, sy):
-                    path.append((ox + (px + 0.5) * vs, oy + (py + 0.5) * vs))
-                    px, py = parent[(px, py)]
-                path.append((ox + (sx + 0.5) * vs, oy + (sy + 0.5) * vs))
-                path.reverse()
-                return path
-
-            if visited[cx, cy]:
-                continue
-            visited[cx, cy] = True
-
-            ch = h(cx, cy)
-            if ch < best_h:
-                best_h = ch
-                best_cell = (cx, cy)
-
-            for dx, dy, cost in neighbors:
-                nx2 = cx + dx
-                ny2 = cy + dy
-                if 0 <= nx2 < nx and 0 <= ny2 < ny and not visited[nx2, ny2]:
-                    if not passable[nx2, ny2]:
-                        continue
-                    if dx != 0 and dy != 0:
-                        if not passable[cx + dx, cy] or not passable[cx, cy + dy]:
-                            continue
-                    new_g = g_score[cx, cy] + cost + prox_cost[nx2, ny2]
-                    if new_g < g_score[nx2, ny2]:
-                        g_score[nx2, ny2] = new_g
-                        if return_path:
-                            parent[(nx2, ny2)] = (cx, cy)
-                        heapq.heappush(open_set, (new_g + h(nx2, ny2), nx2, ny2))
-
-        if return_path and best_cell != (sx, sy):
-            path = []
-            px, py = best_cell
-            while (px, py) != (sx, sy):
-                path.append((ox + (px + 0.5) * vs, oy + (py + 0.5) * vs))
-                px, py = parent[(px, py)]
-            path.append((ox + (sx + 0.5) * vs, oy + (sy + 0.5) * vs))
-            path.reverse()
-            return path
-
-        return None
-
     def _astar(
         self,
         start: tuple[float, float],
         goal: tuple[float, float],
     ) -> float | None:
-        """Compute shortest collision-free path length via A* on TSDF."""
+        """Compute shortest collision-free path length via A* on cost grid."""
         return self._astar_core(start, goal, return_path=False)
 
     def plan_waypoints(
@@ -639,12 +516,12 @@ class PathCritic:
         """Compute A* path and return the next waypoint at lookahead distance.
 
         Returns (wx, wy) world-frame point ~lookahead meters ahead along
-        the optimal path, or None if no path found or no TSDF.
+        the optimal path, or None if no path found or no cost grid.
 
         planning_radius overrides the robot_radius for passability check,
         giving a wider clearance margin to avoid narrow gaps.
         """
-        if self._tsdf is None and self._cost_grid is None:
+        if self._cost_grid is None:
             return None
 
         saved_radius = self._robot_radius
