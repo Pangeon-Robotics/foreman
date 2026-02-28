@@ -425,7 +425,8 @@ class TargetGame(
             if cost_grid is not None and meta is not None:
                 self._path_critic.set_world_cost(
                     cost_grid, meta['origin_x'], meta['origin_y'],
-                    meta['voxel_size'])
+                    meta['voxel_size'],
+                    truncation=meta.get('truncation', 0.5))
 
         # Dynamic reach threshold
         if self._state == GameState.WALK_TO_TARGET:

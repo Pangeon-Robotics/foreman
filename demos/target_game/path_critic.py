@@ -89,6 +89,7 @@ class PathCritic:
         origin_x: float,
         origin_y: float,
         voxel_size: float,
+        truncation: float = 0.5,
     ) -> None:
         """Set the unified world-frame cost grid for A* planning.
 
@@ -99,11 +100,16 @@ class PathCritic:
         ----------
         cost_grid : uint8 array (nx, ny)
             0=free, 1-253=gradient, 254=lethal, 255=unknown
+        truncation : float
+            TSDF truncation distance (meters) used to compute the cost
+            grid.  Needed to convert robot_radius into a cost threshold
+            for passability (cells within robot_radius are impassable).
         """
         self._cost_grid = cost_grid
         self._cost_origin_x = origin_x
         self._cost_origin_y = origin_y
         self._cost_voxel_size = voxel_size
+        self._cost_truncation = truncation
 
     def set_target(self, target_x: float, target_y: float) -> None:
         """Store current target position for regression computation."""
@@ -183,7 +189,7 @@ class PathCritic:
 
         # A* obstacle-aware shortest path (start to end)
         optimal = None
-        if self._tsdf is not None:
+        if self._tsdf is not None or self._cost_grid is not None:
             optimal = self._astar((start[0], start[1]), (end[0], end[1]))
 
         # Straight-line distance (fallback when no TSDF)
@@ -405,10 +411,16 @@ class PathCritic:
         gx = max(0, min(nx - 1, int((goal[0] - ox) / vs)))
         gy = max(0, min(ny - 1, int((goal[1] - oy) / vs)))
 
-        # Passability from cost grid: lethal (254) blocks.
-        # Unknown (255) is treated as passable with zero cost so A* can
-        # plan through unexplored space to always reach the target.
-        passable = (cost_grid != 254)
+        # Passability: block cells within robot_radius of obstacles.
+        # Cost grid encodes distance: cost = (1 - dist/trunc) * 254.
+        # At dist = robot_radius: cost_threshold = (1 - r/trunc) * 254.
+        # Cells with cost >= threshold are too close for the robot body.
+        # Unknown (255) is treated as passable so A* can plan through
+        # unexplored space to always reach the target.
+        trunc = getattr(self, '_cost_truncation', 0.5)
+        radius_ratio = min(self._robot_radius / trunc, 0.95)
+        cost_threshold = int((1.0 - radius_ratio) * 254)
+        passable = (cost_grid < cost_threshold) | (cost_grid == 255)
 
         # Relax start and goal cells (robot or target may sit on
         # high-cost cell due to TSDF noise or unexplored territory)
@@ -632,7 +644,7 @@ class PathCritic:
         planning_radius overrides the robot_radius for passability check,
         giving a wider clearance margin to avoid narrow gaps.
         """
-        if self._tsdf is None:
+        if self._tsdf is None and self._cost_grid is None:
             return None
 
         saved_radius = self._robot_radius

@@ -28,7 +28,7 @@ class DWANavigatorMixin:
         import struct
 
         path = None
-        if self._path_critic is not None and self._path_critic._tsdf is not None:
+        if self._path_critic is not None and (self._path_critic._tsdf is not None or self._path_critic._cost_grid is not None):
             saved = self._path_critic._robot_radius
             self._path_critic._robot_radius = 0.40
             path = self._path_critic._astar_core(
@@ -304,7 +304,10 @@ class DWANavigatorMixin:
         result = self._dwa_planner.plan(
             costmap_q, goal_x=goal_rx, goal_y=goal_ry)
 
-        self._smooth_dwa_turn += C._DWA_TURN_ALPHA * (
+        alpha = C._DWA_TURN_ALPHA
+        if result.n_feasible < 30 or abs(result.turn) > 0.7:
+            alpha = 0.4  # respond in ~2 replans instead of ~10
+        self._smooth_dwa_turn += alpha * (
             result.turn - self._smooth_dwa_turn)
         result.turn = self._smooth_dwa_turn
 

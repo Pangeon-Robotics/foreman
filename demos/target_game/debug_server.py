@@ -171,8 +171,8 @@ class DebugServer:
         log_odds = tsdf._log_odds  # (nx, ny, nz) float32
         nx, ny, _nz = log_odds.shape
 
-        # Find occupied voxels (log_odds > 0) — vectorized
-        indices = np.argwhere(log_odds > 0)
+        # Find occupied voxels (log_odds > 1.0) — requires 2+ LiDAR hits
+        indices = np.argwhere(log_odds > 1.0)
         n_voxels = len(indices)
 
         header = struct.pack(

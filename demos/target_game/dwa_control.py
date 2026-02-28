@@ -201,7 +201,10 @@ class DWAControlMixin:
 
             n_total = self._dwa_planner._n_curvatures
             obstacle_fraction = 1.0 - (dwa.n_feasible / n_total)
-            dwa_blend = min(0.5, obstacle_fraction)
+            if dwa.n_feasible < 30:
+                dwa_blend = min(0.8, obstacle_fraction * 2.0)
+            else:
+                dwa_blend = min(0.5, obstacle_fraction)
             if dwa.n_feasible < 5:
                 dwa_blend = 0.0
             # When path quality is poor, give DWA more steering
@@ -236,15 +239,16 @@ class DWAControlMixin:
                     self._smooth_dwa_fwd += C.DWA_FWD_ACCEL_ALPHA * (
                         dwa_fwd_target - self._smooth_dwa_fwd)
                 # Floor prevents stalling when DWA forward is low.
-                # feas>=25 (open field): goal is sideways, not blocked.
-                # feas>=10 (moderate obstacles): trot gait needs
-                #   step>=0.13 to execute differential turns.
-                if dwa.n_feasible >= 25:
-                    self._smooth_dwa_fwd = max(
-                        self._smooth_dwa_fwd, 0.4)
-                elif dwa.n_feasible >= 10:
-                    self._smooth_dwa_fwd = max(
-                        self._smooth_dwa_fwd, 0.3)
+                # Only apply when DWA itself wants forward motion
+                # (distinguishes "open field, goal sideways" from
+                # "obstacle ahead, turn to avoid").
+                if dwa.forward >= 0.3:
+                    if dwa.n_feasible >= 25:
+                        self._smooth_dwa_fwd = max(
+                            self._smooth_dwa_fwd, 0.4)
+                    elif dwa.n_feasible >= 10:
+                        self._smooth_dwa_fwd = max(
+                            self._smooth_dwa_fwd, 0.3)
                 heading_mod = min(heading_mod, self._smooth_dwa_fwd)
             elif dwa.n_feasible < 20:
                 heading_mod = min(heading_mod, self._smooth_dwa_fwd)

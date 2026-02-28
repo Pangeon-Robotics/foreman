@@ -253,9 +253,9 @@ class PerceptionPipeline:
     # ground-plane artifacts that slip through lidar.py's filter after
     # 3D rotation shifts their Z. B2 LiDAR at ~0.65m height; downward
     # channels (-15°, -7°) at 2-4m range hit ground at z=0.13-0.25m.
-    # Raising from 0.10 to 0.20 cuts most ground-ring false positives
-    # while preserving obstacle base detection above 0.20m.
-    _MIN_WORLD_Z = 0.20
+    # Raising from 0.10 to 0.25 cuts most ground-ring false positives
+    # while preserving obstacle base detection above 0.25m.
+    _MIN_WORLD_Z = 0.25
 
     def on_point_cloud(self, msg) -> None:
         """DDS callback: new point cloud received.
@@ -360,8 +360,13 @@ class PerceptionPipeline:
         if x_lo < x_hi and y_lo < y_hi:
             ix_idx, iy_idx = np.ogrid[x_lo:x_hi, y_lo:y_hi]
             footprint = (ix_idx - cx)**2 + (iy_idx - cy)**2 <= mask_r**2
-            # Zero all Z slices within footprint (reset to unknown)
-            tsdf._log_odds[x_lo:x_hi, y_lo:y_hi, :] *= ~footprint[:, :, None]
+            # Only clear uncertain occupied cells (0 < lo < 1.0) — likely
+            # self-hits from limbs.  Confirmed obstacles (lo >= 1.0) are
+            # preserved so the robot doesn't forget nearby walls.  Free-space
+            # evidence (lo < 0) is also preserved for convergence.
+            lo_slice = tsdf._log_odds[x_lo:x_hi, y_lo:y_hi, :]
+            uncertain = footprint[:, :, None] & (lo_slice > 0.0) & (lo_slice < 1.0)
+            lo_slice[uncertain] = 0.0
 
         # --- World-frame 2D cost grid (unified authority for A* and DWA) ---
         dist_2d = tsdf.get_distance_2d(tsdf.costmap_z_lo, tsdf.costmap_z_hi)
@@ -384,6 +389,7 @@ class PerceptionPipeline:
             'origin_x': tsdf.origin_x, 'origin_y': tsdf.origin_y,
             'voxel_size': tsdf.voxel_size,
             'nx': tsdf.nx, 'ny': tsdf.ny,
+            'truncation': truncation,
         }
 
         # Extract body-frame costmap for DWA (extent covers full arc range)
