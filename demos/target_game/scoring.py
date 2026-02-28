@@ -187,9 +187,17 @@ class ScoringMixin:
         start_time = time.monotonic()
 
         headed = not getattr(self._sim, '_headless', False)
+        # Headless rate limit: cap game loop at ~200 Hz (2x realtime)
+        # to avoid overwhelming the firmware subprocess with DDS messages.
+        # Without this, cheap ticks (cost grid A*) run at 1800+ Hz and
+        # starve the physics subprocess of CPU, freezing the robot.
+        _min_tick_dt = C.CONTROL_DT / 2.0 if not headed else C.CONTROL_DT
+        _next_tick = time.monotonic()
         while self.tick():
-            if headed:
-                time.sleep(C.CONTROL_DT)
+            _next_tick += _min_tick_dt
+            _now = time.monotonic()
+            if _next_tick > _now:
+                time.sleep(_next_tick - _now)
 
         self._stats.total_time = time.monotonic() - start_time
         if self._telemetry is not None:

@@ -413,12 +413,19 @@ class TargetGame(
                     self._debug_server.send_costmap_2d(
                         cost_grid, meta['origin_x'], meta['origin_y'],
                         meta['voxel_size'])
-                    if self._path_critic is not None:
-                        self._path_critic.set_world_cost(
-                            cost_grid, meta['origin_x'], meta['origin_y'],
-                            meta['voxel_size'])
                 elif tsdf is not None:
                     self._debug_server.send_observation_map(tsdf)
+
+        # Feed cost grid to path critic (unconditional — not gated on viewer)
+        if (self._step_count % 50 == 0
+                and self._perception is not None
+                and self._path_critic is not None):
+            cost_grid = self._perception.world_cost_grid
+            meta = self._perception.world_cost_meta
+            if cost_grid is not None and meta is not None:
+                self._path_critic.set_world_cost(
+                    cost_grid, meta['origin_x'], meta['origin_y'],
+                    meta['voxel_size'])
 
         # Dynamic reach threshold
         if self._state == GameState.WALK_TO_TARGET:

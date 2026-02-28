@@ -405,12 +405,17 @@ class PathCritic:
         gx = max(0, min(nx - 1, int((goal[0] - ox) / vs)))
         gy = max(0, min(ny - 1, int((goal[1] - oy) / vs)))
 
-        # Passability from cost grid: lethal (254) and unknown (255) block
-        passable = (cost_grid < 254)
+        # Passability from cost grid: lethal (254) blocks.
+        # Unknown (255) is treated as passable with zero cost so A* can
+        # plan through unexplored space to always reach the target.
+        passable = (cost_grid != 254)
 
-        # Relax start cell (robot may sit on high-cost cell due to TSDF noise)
+        # Relax start and goal cells (robot or target may sit on
+        # high-cost cell due to TSDF noise or unexplored territory)
         if not passable[sx, sy]:
             passable[sx, sy] = True
+        if not passable[gx, gy]:
+            passable[gx, gy] = True
 
         # Precompute normalized cost for traversal weight (float64 for A*)
         cost_norm = cost_grid.astype(np.float64) / 254.0  # 0.0..1.0
@@ -518,16 +523,14 @@ class PathCritic:
         # Passability: distance to nearest obstacle > robot radius
         passable = dist_2d >= self._robot_radius
 
-        # Unobserved cells (log_odds == 0 everywhere in z-range) are
-        # unknown — don't route through them.
-        iz_lo = max(0, int((tsdf.costmap_z_lo - tsdf.z_min) / vs))
-        iz_hi = min(tsdf.nz, int((tsdf.costmap_z_hi - tsdf.z_min) / vs) + 1)
-        observed = np.any(tsdf._log_odds[:, :, iz_lo:iz_hi] != 0.0, axis=2)
-        passable &= observed
+        # Unobserved cells are treated as passable so A* can plan
+        # through unexplored space to always reach the target.
 
-        # Relax start only
+        # Relax start and goal cells
         if not passable[sx, sy]:
             passable[sx, sy] = True
+        if not passable[gx, gy]:
+            passable[gx, gy] = True
 
         # Proximity cost
         _PROX_MARGIN = self._robot_radius * 1.5
