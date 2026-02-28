@@ -140,11 +140,9 @@ class ScoringMixin:
             self._perception.set_target_position(target.x, target.y)
 
         dist = target.distance_to(nav_x, nav_y)
-        src = "SLAM" if self._odometry else "truth"
         print(
-            f"\n[target {self._target_index}/{self._num_targets}] "
-            f"spawned at ({target.x:.1f}, {target.y:.1f})  "
-            f"dist={dist:.1f}m  (nav={src})")
+            f"\n[{self._target_index}/{self._num_targets}] "
+            f"SPAWN ({target.x:.1f},{target.y:.1f}) d={dist:.1f}")
 
         if self._path_critic is not None:
             self._path_critic.set_target(target.x, target.y)
@@ -155,31 +153,27 @@ class ScoringMixin:
     def _on_reached(self):
         t = self._target_step_count * C.CONTROL_DT
         self._stats.targets_reached += 1
-        print(f"TARGET {self._target_index} REACHED in {t:.1f}s")
+        ato_s = ""
         if self._path_critic is not None:
             target = self._spawner.current_target
             report = self._path_critic.target_reached(target.x, target.y)
             if report:
                 agg = self._path_critic.aggregate_ato()
-                print(
-                    f"  ATO={report['ato_score']:.1f}  "
-                    f"r_gate={report['regression_gate']:.2f}  "
-                    f"agg={agg:.1f}")
+                ato_s = f" ATO={report['ato_score']:.0f} agg={agg:.0f}"
+        print(f"  REACHED {t:.1f}s{ato_s}")
         self._state = C.GameState.SPAWN_TARGET
 
     def _on_timeout(self):
         t = self._target_step_count * C.CONTROL_DT
         self._stats.targets_timeout += 1
-        print(f"TARGET {self._target_index} TIMEOUT after {t:.1f}s")
+        ato_s = ""
         if self._path_critic is not None:
             target = self._spawner.current_target
             report = self._path_critic.target_timeout(target.x, target.y)
             if report:
                 agg = self._path_critic.aggregate_ato()
-                print(
-                    f"  ATO=0.0  "
-                    f"r_gate={report['regression_gate']:.2f}  "
-                    f"agg={agg:.1f}")
+                ato_s = f" agg={agg:.0f}"
+        print(f"  TIMEOUT {t:.1f}s{ato_s}")
         self._state = C.GameState.SPAWN_TARGET
 
     def run(self) -> C.GameStatistics:

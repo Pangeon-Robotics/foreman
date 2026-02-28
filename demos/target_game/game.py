@@ -287,8 +287,28 @@ class TargetGame(
                 pass
         if self._cached_occ is not None:
             o = self._cached_occ
-            return f"  3DS={o['iou']:.2f} P={o['precision']:.2f} R={o['recall']:.2f}"
+            return f" 3DS={o['iou']:.2f}"
         return ""
+
+    def _gt_clearance(self) -> float:
+        """Minimum ground-truth distance from robot surface to nearest obstacle."""
+        if not self._obstacle_bodies:
+            return float('inf')
+        robot = self._sim.get_body("base")
+        if robot is None:
+            return float('inf')
+        rx, ry = float(robot.pos[0]), float(robot.pos[1])
+        min_d = float('inf')
+        for name in self._obstacle_bodies:
+            obs = self._sim.get_body(name)
+            if obs is None:
+                continue
+            d = math.sqrt(
+                (rx - float(obs.pos[0]))**2 + (ry - float(obs.pos[1]))**2)
+            if d < min_d:
+                min_d = d
+        # Subtract robot radius (0.35m) + obstacle half-width (~0.25m)
+        return max(0.0, min_d - 0.60)
 
     def _get_nav_pose(self) -> tuple[float, float, float]:
         """Return (x, y, yaw) for navigation (always ground truth)."""

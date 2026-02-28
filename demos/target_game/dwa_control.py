@@ -57,21 +57,16 @@ class DWAControlMixin:
 
         if self._target_step_count % C.TELEMETRY_INTERVAL == 0:
             t = self._target_step_count * C.CONTROL_DT
-            sent_step = (0.0 if mode_str == "CLOSE-T"
-                         else C.STEP_LENGTH * speed)
-            ato_info = ""
-            if self._path_critic is not None:
-                _a, _pe, _sr, _rg, _reg = (
-                    self._path_critic.running_ato())
-                ato_info = (f"  ATO={_a:.0f} pe={_pe:.0%} sr={_sr:.2f} "
-                            f"rg={_rg:.2f} reg={_reg:.1f}m")
-            occ_str = self._get_occ_str()
-            print(f"[target {self._target_index}/{self._num_targets}] "
-                  f"{mode_str:<7} dist={dist:.1f}m  "
-                  f"h_err={math.degrees(heading_err):+.0f}deg  "
-                  f"step={sent_step:.2f}  wz={self._smooth_wz:+.2f}  "
-                  f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s"
-                  f"{ato_info}{occ_str}")
+            x_gt, y_gt, _, _, _, _ = self._get_robot_pose()
+            clr = self._gt_clearance()
+            clr_s = f" clr={clr:.1f}" if clr < 50 else ""
+            occ = self._get_occ_str()
+            print(
+                f"[{self._target_index}/{self._num_targets}] "
+                f"{mode_str:<5} t={t:.1f} d={dist:.1f} "
+                f"err={math.degrees(heading_err):+.0f}° "
+                f"({x_gt:.1f},{y_gt:.1f})"
+                f"{clr_s}{occ}")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -131,12 +126,9 @@ class DWAControlMixin:
                           "blocked_fwd" if blocked_fwd else
                           "low_score" if low_score_stuck else
                           f"no_progress×{streak}")
-                print(f"  [STUCK] dist={dist:.1f}m "
-                      f"(was {self._stuck_check_dist:.1f}m) "
-                      f"feas={dwa_feas} reason={reason} "
-                      f"-- recovery: turn "
-                      f"{math.degrees(self._stuck_recovery_wz):+.0f}"
-                      f"deg/s")
+                print(
+                    f"  [STUCK {reason} feas={dwa_feas}"
+                    f" → turn {math.degrees(self._stuck_recovery_wz):+.0f}°/s]")
             self._stuck_check_dist = dist
 
         if self._stuck_recovery_countdown > 0:
@@ -167,11 +159,14 @@ class DWAControlMixin:
                 phase = ("STOP"
                          if self._stuck_recovery_countdown >= 70
                          else "TURN")
+                x_gt, y_gt, _, _, _, _ = self._get_robot_pose()
+                clr = self._gt_clearance()
+                clr_s = f" clr={clr:.1f}" if clr < 50 else ""
                 print(
-                    f"[target {self._target_index}/{self._num_targets}]"
-                    f" RECOV-{phase} dist={dist:.1f}m  "
-                    f"h_err={math.degrees(heading_err):+.0f}deg  "
-                    f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s")
+                    f"[{self._target_index}/{self._num_targets}] "
+                    f"R-{phase:<4} t={t:.1f} d={dist:.1f} "
+                    f"err={math.degrees(heading_err):+.0f}° "
+                    f"({x_gt:.1f},{y_gt:.1f}){clr_s}")
             if dist < self._reach_threshold:
                 self._on_reached()
                 return True
@@ -348,38 +343,27 @@ class DWAControlMixin:
         """Print DWA telemetry at TELEMETRY_INTERVAL and check done."""
         if self._target_step_count % C.TELEMETRY_INTERVAL == 0:
             t = self._target_step_count * C.CONTROL_DT
-            tip_active = self._in_tip_mode
-            if dist < self._reach_threshold + 1.5:
-                mode_str = "CLOSE"
-            elif tip_active:
-                mode_str = "TIP"
+            if self._in_tip_mode:
+                mode = "TIP"
+            elif dist < self._reach_threshold + 1.5:
+                mode = "CLOSE"
             else:
-                mode_str = "WALK"
-            sent_wz = self._smooth_wz
-            sent_fwd = self._smooth_heading_mod
-            sent_step = (C.STEP_LENGTH * sent_fwd
-                         if not tip_active else 0.0)
-            dwa_info = ""
+                mode = "WALK"
+            x_gt, y_gt, _, _, _, _ = self._get_robot_pose()
+            clr = self._gt_clearance()
+            clr_s = f" clr={clr:.1f}" if clr < 50 else ""
+            dwa_s = ""
             if self._last_dwa_result is not None:
                 d = self._last_dwa_result
-                dwa_info = (f"  dwa=({d.forward:.2f},{d.turn:.2f}) "
-                            f"score={d.score:.2f} feas={d.n_feasible}")
-            behind_str = "  BEHIND" if goal_behind else ""
-            ato_info = ""
-            if self._path_critic is not None:
-                _a, _pe, _sr, _rg, _reg = (
-                    self._path_critic.running_ato())
-                ato_info = (
-                    f"  ATO={_a:.0f} pe={_pe:.0%} sr={_sr:.2f} "
-                    f"rg={_rg:.2f} reg={_reg:.1f}m")
-            occ_str = self._get_occ_str()
+                dwa_s = f" feas={d.n_feasible} sc={d.score:.2f}"
+            bh = " BH" if goal_behind else ""
+            occ = self._get_occ_str()
             print(
-                f"[target {self._target_index}/{self._num_targets}] "
-                f"{mode_str:<7} dist={dist:.1f}m  "
-                f"h_err={math.degrees(heading_err):+.0f}deg  "
-                f"step={sent_step:.2f}  wz={sent_wz:+.2f}  "
-                f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s"
-                f"{dwa_info}{behind_str}{ato_info}{occ_str}")
+                f"[{self._target_index}/{self._num_targets}] "
+                f"{mode:<5} t={t:.1f} d={dist:.1f} "
+                f"err={math.degrees(heading_err):+.0f}° "
+                f"({x_gt:.1f},{y_gt:.1f})"
+                f"{clr_s}{dwa_s}{bh}{occ}")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -392,8 +376,7 @@ class DWAControlMixin:
                 progress = self._progress_window_dist - dist
                 if progress < 1.0:
                     print(
-                        f"  [EARLY TIMEOUT] progress={progress:.1f}m "
-                        f"in 20s (need 1.0m) -- SLAM drift likely")
+                        f"  [EARLY TIMEOUT progress={progress:.1f}m/20s]")
                     self._on_timeout()
                     return
             self._progress_window_dist = dist

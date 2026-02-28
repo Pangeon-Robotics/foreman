@@ -98,22 +98,15 @@ class NavigatorMixin:
             else:
                 sent_wz = wz
                 sent_step = C.STEP_LENGTH * heading_mod
-            slam_info = ""
-            if self._odometry is not None:
-                drift = math.sqrt((nav_x - x_truth)**2 + (nav_y - y_truth)**2)
-                slam_info = f"  drift={drift:.3f}m"
-            ato_info = ""
-            if self._path_critic is not None:
-                _a, _pe, _sr, _rg, _reg = self._path_critic.running_ato()
-                ato_info = (f"  ATO={_a:.0f} pe={_pe:.0%} sr={_sr:.2f} "
-                            f"rg={_rg:.2f} reg={_reg:.1f}m")
-            occ_str = self._get_occ_str()
-            print(f"[target {self._target_index}/{self._num_targets}] "
-                  f"{mode_str:<7} dist={dist:.1f}m  "
-                  f"h_err={math.degrees(heading_err):+.0f}deg  "
-                  f"step={sent_step:.2f}  wz={sent_wz:+.2f}  "
-                  f"pos=({nav_x:.1f}, {nav_y:.1f})  t={t:.1f}s"
-                  f"{slam_info}{ato_info}{occ_str}")
+            clr = self._gt_clearance()
+            clr_s = f" clr={clr:.1f}" if clr < 50 else ""
+            occ = self._get_occ_str()
+            print(
+                f"[{self._target_index}/{self._num_targets}] "
+                f"{mode_str:<5} t={t:.1f} d={dist:.1f} "
+                f"err={math.degrees(heading_err):+.0f}° "
+                f"({x_truth:.1f},{y_truth:.1f})"
+                f"{clr_s}{occ}")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -169,15 +162,15 @@ class NavigatorMixin:
 
         if self._target_step_count % C.TELEMETRY_INTERVAL == 0:
             t = self._target_step_count * C.CONTROL_DT
-            body = self._sim.get_body("base")
-            vx = float(body.linvel[0]) if body else 0
-            vy = float(body.linvel[1]) if body else 0
-            occ_str = self._get_occ_str()
-            print(f"[target {self._target_index}/{self._num_targets}] "
-                  f"DRIVE  dist={dist:.1f}m  heading_err={heading_err:+.2f}rad  "
-                  f"z={z:.2f}  fwd={fwd:.1f}Nm  turn={turn:.1f}Nm  "
-                  f"pos=({nav_x:.1f}, {nav_y:.1f})  v=({vx:+.2f},{vy:+.2f})  t={t:.1f}s"
-                  f"{occ_str}")
+            clr = self._gt_clearance()
+            clr_s = f" clr={clr:.1f}" if clr < 50 else ""
+            occ = self._get_occ_str()
+            print(
+                f"[{self._target_index}/{self._num_targets}] "
+                f"DRIVE t={t:.1f} d={dist:.1f} "
+                f"err={math.degrees(heading_err):+.0f}° "
+                f"({x_truth:.1f},{y_truth:.1f})"
+                f"{clr_s}{occ}")
 
         if dist < self._reach_threshold:
             self._on_reached()
