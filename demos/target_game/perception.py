@@ -14,6 +14,72 @@ from dataclasses import dataclass
 import numpy as np
 
 
+class LiveCostmapQuery:
+    """CostmapQuery that samples the world-frame grid with live pose.
+
+    Instead of building a body-frame snapshot (which goes stale between
+    LiDAR callbacks), this rotates body-frame query points to world frame
+    using the CURRENT robot pose and looks up the world-frame DWA cost
+    grid.  Eliminates the stale-snapshot bug where obstacles appear at
+    wrong body-frame positions.
+
+    Compatible with CurvatureDWAPlanner (exposes sample / sample_batch).
+    """
+
+    def __init__(self, perception, oob_cost: float = 0.35):
+        self._p = perception
+        self._oob_cost = oob_cost
+        # Expose _grid=None so diagnostic code doesn't crash
+        self._grid = None
+        self._costmap = None
+        self._res = perception._cfg.tsdf_voxel_size
+
+    def sample(self, x: float, y: float) -> float:
+        p = self._p
+        grid = p._dwa_cost_grid
+        meta = p._world_cost_meta
+        if grid is None or meta is None:
+            return self._oob_cost
+        yaw = p._imu_yaw
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        wx = c * x - s * y + p._imu_x
+        wy = s * x + c * y + p._imu_y
+        vs = meta['voxel_size']
+        ix = int((wx - meta['origin_x']) / vs)
+        iy = int((wy - meta['origin_y']) / vs)
+        if 0 <= ix < meta['nx'] and 0 <= iy < meta['ny']:
+            raw = int(grid[ix, iy])
+            if raw == 255:
+                return self._oob_cost
+            return raw / 254.0
+        return self._oob_cost
+
+    def sample_batch(self, points: np.ndarray) -> np.ndarray:
+        p = self._p
+        grid = p._dwa_cost_grid
+        meta = p._world_cost_meta
+        if grid is None or meta is None:
+            return np.full(len(points), self._oob_cost, dtype=np.float32)
+        yaw = p._imu_yaw
+        c = np.cos(yaw)
+        s = np.sin(yaw)
+        wx = c * points[:, 0] - s * points[:, 1] + p._imu_x
+        wy = s * points[:, 0] + c * points[:, 1] + p._imu_y
+        vs = meta['voxel_size']
+        ix = ((wx - meta['origin_x']) / vs).astype(np.intp)
+        iy = ((wy - meta['origin_y']) / vs).astype(np.intp)
+        nx, ny = meta['nx'], meta['ny']
+        valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+        costs = np.full(len(points), self._oob_cost, dtype=np.float32)
+        raw = grid[ix[valid], iy[valid]]
+        known = raw != 255
+        costs_valid = costs[valid]
+        costs_valid[known] = raw[known].astype(np.float32) / 254.0
+        costs[valid] = costs_valid
+        return costs
+
+
 # ---------------------------------------------------------------------------
 # Reactive forward scan: costmap probes beyond DWA horizon
 # ---------------------------------------------------------------------------
@@ -160,6 +226,24 @@ class PerceptionPipeline:
         self._world_cost_meta: dict | None = None
         self._last_cloud_time: float = 0.0
         self._build_times: list[float] = []
+
+        # DWA obstacle memory: retains obstacle cells after TSDF clearing
+        # erases them near the robot.  Decay 0.99/frame at 20Hz ≈ 6s
+        # persistence above threshold 0.3.
+        tsdf = self._tsdf
+        self._obstacle_memory = np.zeros(
+            (tsdf.nx, tsdf.ny), dtype=np.float32)
+
+        # Safety valve: consecutive feas=0 counter.  When DWA reports
+        # n_feasible==0 for too many replans, stale memory cells are the
+        # likely cause — clear them so the robot can move again.
+        self._feas_zero_count = 0
+        # Blanking countdown: suppress memory refill for N frames after
+        # safety valve fires, so clearing isn't immediately undone.
+        self._memory_blank_frames = 0
+        # Force-feasible flag: when True, next DWA replan should
+        # guarantee at least one feasible arc (clears after read).
+        self._force_feasible = False
 
         # Full 6-DOF IMU pose (set by game tick, read by DDS callback)
         self._imu_lock = threading.Lock()
@@ -344,35 +428,30 @@ class PerceptionPipeline:
             pts_world, float(sensor_world[0]), float(sensor_world[1]),
         )
 
-        # Clear TSDF log-odds within robot footprint.
-        # The robot's own body produces LiDAR returns that create persistent
-        # occupied voxels. As the robot moves, these remain as a trail of
-        # grey cubes in the viewer. Clear them at the current body position.
         tsdf = self._tsdf
         vs = tsdf.voxel_size
+
+        # TSDF clearing: zero low-confidence occupied cells within robot
+        # footprint to prevent grey cube trail in viewer.  Uses 0.8m
+        # radius (covers B2 body + limb sweep) to eliminate all self-hit
+        # artifacts.  Near-field obstacle cells erased by clearing are
+        # retained by the obstacle memory grid (below).
         cx = int((imu_x - tsdf.origin_x) / vs)
         cy = int((imu_y - tsdf.origin_y) / vs)
-        mask_r = int(0.8 / vs)  # 0.8m radius (covers B2 body + limbs)
+        mask_r = int(0.8 / vs)  # 0.8m radius (body + limbs)
         x_lo = max(0, cx - mask_r)
         x_hi = min(tsdf.nx, cx + mask_r + 1)
         y_lo = max(0, cy - mask_r)
         y_hi = min(tsdf.ny, cy + mask_r + 1)
+
         if x_lo < x_hi and y_lo < y_hi:
             ix_idx, iy_idx = np.ogrid[x_lo:x_hi, y_lo:y_hi]
             footprint = (ix_idx - cx)**2 + (iy_idx - cy)**2 <= mask_r**2
-            # Clear low-confidence occupied cells (0 < lo < 2.0) — likely
-            # self-hits from limbs that got 1-2 hits.  Confirmed obstacles
-            # (lo >= 2.0, i.e. 3+ hits) are preserved so the robot doesn't
-            # forget nearby walls.  Free-space evidence (lo < 0) is also
-            # preserved for convergence.
-            lo_slice = tsdf._log_odds[x_lo:x_hi, y_lo:y_hi, :]
-            uncertain = footprint[:, :, None] & (lo_slice > 0.0) & (lo_slice < 2.0)
-            lo_slice[uncertain] = 0.0
+            lo_fp = tsdf._log_odds[x_lo:x_hi, y_lo:y_hi, :]
+            uncertain = footprint[:, :, None] & (lo_fp > 0.0) & (lo_fp < 2.0)
+            lo_fp[uncertain] = 0.0
 
-        # --- World-frame 2D cost grid (unified authority for A* and DWA) ---
-        # Use higher log-odds threshold (>1.0 = 2+ LiDAR hits) for path
-        # planning.  Single hits (lo=0.85) are too noisy for A* routing.
-        # DWA body-frame costmap still uses lo>0.5 for reactive safety.
+        # --- World-frame 2D cost grid ---
         from scipy.ndimage import binary_opening, distance_transform_edt
 
         lo = tsdf._log_odds
@@ -380,31 +459,108 @@ class PerceptionPipeline:
         iz_hi = min(tsdf.nz, int((tsdf.costmap_z_hi - tsdf.z_min) / vs) + 1)
         lo_slice = lo[:, :, iz_lo:iz_hi]
 
-        occupied_2d = np.any(lo_slice > 1.0, axis=2)
+        occupied_2d_raw = np.any(lo_slice > 1.0, axis=2)
+        occupied_2d = binary_opening(occupied_2d_raw, iterations=1)
 
-        # Morphological opening: remove isolated 1-2 cell noise (self-hits,
-        # target residue, edge artifacts).  Real obstacles are 3+ cells wide.
-        occupied_2d = binary_opening(occupied_2d, iterations=1)
+        observed = np.any(lo_slice != 0.0, axis=2)
 
-        # EDT: distance from every free cell to nearest occupied cell
-        if np.any(occupied_2d):
-            dist_2d = distance_transform_edt(~occupied_2d).astype(
+        truncation = self._cfg.tsdf_truncation  # 0.5m
+
+        # --- Obstacle memory (shared by A* and DWA) ---
+        # TSDF clearing (0.8m) erases obstacle cells near the robot.
+        # Memory retains where obstacles WERE before clearing.
+        # Updated FIRST so both cost grids use memory-based obstacles.
+        #
+        # Feed memory from RAW occupied (before binary_opening) so thin
+        # features from real obstacles aren't lost.  binary_opening is
+        # designed to remove single-pixel noise, but obstacle surfaces
+        # seen at oblique angles can be just 1-2 cells wide.  The TSDF
+        # clearing already removed self-hit artifacts (lo 0-2 within
+        # 0.8m), so occupied_2d_raw is clean outside the clearing zone.
+        #
+        # Decay: 0.99/frame OUTSIDE the clearing zone (6s persistence).
+        # FROZEN inside the clearing zone — the sensor-distance filter
+        # (0.8m) blocks new LiDAR observations near the robot, so we
+        # can't confirm or deny obstacles.  Preserving memory is safest.
+        mem = self._obstacle_memory
+        if x_lo < x_hi and y_lo < y_hi:
+            # Save memory values in blind zone before decay
+            blind_save = mem[x_lo:x_hi, y_lo:y_hi][footprint].copy()
+        mem *= 0.99
+        if x_lo < x_hi and y_lo < y_hi:
+            # Restore frozen values in blind zone (no decay)
+            mem[x_lo:x_hi, y_lo:y_hi][footprint] = blind_save
+        if self._memory_blank_frames > 0:
+            # Safety valve active: let memory decay without refill.
+            # Real obstacles will be re-learned once blanking ends.
+            self._memory_blank_frames -= 1
+        else:
+            np.maximum(mem, occupied_2d_raw.astype(np.float32), out=mem)
+        mem_occ = mem > 0.3
+
+        # --- A* cost grid: memory (no inflation) ---
+        # Uses obstacle memory (not live TSDF) so A* still sees obstacles
+        # within the 0.8m TSDF clearing zone.  No binary dilation: the
+        # cost gradient from distance_transform_edt + planning_radius
+        # passability threshold already buffer paths from obstacles.
+        # DWA provides real-time fine-grained avoidance at close range.
+        if np.any(mem_occ):
+            dist_2d = distance_transform_edt(~mem_occ).astype(
                 np.float32) * vs
         else:
             dist_2d = np.full(
                 (tsdf.nx, tsdf.ny), tsdf.nx * vs, dtype=np.float32)
-
-        truncation = self._cfg.tsdf_truncation  # 0.5m
         cost_f = 1.0 - np.clip(dist_2d / truncation, 0.0, 1.0)
         cost_u8 = (cost_f * 254).astype(np.uint8)
+        # Memory-aware observed mask: cells with memory data are "observed"
+        # even if the TSDF has been cleared.  Without this, TSDF clearing
+        # (0.8m) makes near-obstacle cells appear "unknown" (255) in the
+        # cost grid, hiding obstacles that the memory still remembers.
+        observed_mem = observed | mem_occ
+        cost_u8[~observed_mem] = 255
 
-        # Mark unobserved cells as unknown (255)
-        observed = np.any(lo_slice != 0.0, axis=2)
-        cost_u8[~observed] = 255
+        # --- DWA cost grid: memory (no inflation) ---
+        # Un-inflated memory avoids feas collapse between adjacent
+        # obstacle rows within DWA's 2m arc horizon.
+        if np.any(mem_occ):
+            dwa_dist = distance_transform_edt(~mem_occ).astype(
+                np.float32) * vs
+        else:
+            dwa_dist = np.full(
+                (tsdf.nx, tsdf.ny), tsdf.nx * vs, dtype=np.float32)
+        dwa_cost_f = 1.0 - np.clip(dwa_dist / truncation, 0.0, 1.0)
+        dwa_cost_u8 = (dwa_cost_f * 254).astype(np.uint8)
+        dwa_cost_u8[~observed_mem] = 255
 
-        # Zero robot footprint (reuse same circular mask)
-        if x_lo < x_hi and y_lo < y_hi:
-            cost_u8[x_lo:x_hi, y_lo:y_hi][footprint] = 0
+        # Zero robot footprint in DWA grid — 0.4m covers robot torso.
+        # Smaller than the 0.8m TSDF clearing radius so obstacles at
+        # 0.4-0.8m remain visible to DWA arc collision checks.
+        # (Self-hits from limbs are already filtered by the 0.8m sensor-
+        # distance filter in the LiDAR callback.)
+        dwa_fp_r = int(0.4 / vs)
+        dwa_fp_x_lo = max(0, cx - dwa_fp_r)
+        dwa_fp_x_hi = min(tsdf.nx, cx + dwa_fp_r + 1)
+        dwa_fp_y_lo = max(0, cy - dwa_fp_r)
+        dwa_fp_y_hi = min(tsdf.ny, cy + dwa_fp_r + 1)
+        if dwa_fp_x_lo < dwa_fp_x_hi and dwa_fp_y_lo < dwa_fp_y_hi:
+            dix, diy = np.ogrid[dwa_fp_x_lo:dwa_fp_x_hi,
+                                dwa_fp_y_lo:dwa_fp_y_hi]
+            dwa_fp = (dix - cx)**2 + (diy - cy)**2 <= dwa_fp_r**2
+            dwa_cost_u8[dwa_fp_x_lo:dwa_fp_x_hi,
+                        dwa_fp_y_lo:dwa_fp_y_hi][dwa_fp] = 0
+        self._dwa_cost_grid = dwa_cost_u8
+
+        astar_r = int(0.35 / vs)
+        astar_x_lo = max(0, cx - astar_r)
+        astar_x_hi = min(tsdf.nx, cx + astar_r + 1)
+        astar_y_lo = max(0, cy - astar_r)
+        astar_y_hi = min(tsdf.ny, cy + astar_r + 1)
+        if astar_x_lo < astar_x_hi and astar_y_lo < astar_y_hi:
+            aix, aiy = np.ogrid[astar_x_lo:astar_x_hi,
+                                astar_y_lo:astar_y_hi]
+            astar_fp = (aix - cx)**2 + (aiy - cy)**2 <= astar_r**2
+            cost_u8[astar_x_lo:astar_x_hi,
+                    astar_y_lo:astar_y_hi][astar_fp] = 0
 
         self._world_cost_grid = cost_u8
         self._world_cost_meta = {
@@ -414,53 +570,70 @@ class PerceptionPipeline:
             'truncation': truncation,
         }
 
-        # Extract body-frame costmap for DWA (extent covers full arc range)
-        costmap_extent = self._cfg.tsdf_xy_extent
-        cost_grid, unknown_mask = self._tsdf.extract_body_costmap(
-            sensor_pose, costmap_extent=costmap_extent,
-        )
-
-        # Mask robot footprint: zero cost within 0.5m of robot origin.
-        # The robot's own body produces LiDAR returns that register as
-        # obstacles in the persistent TSDF, poisoning the DWA's origin
-        # and causing all arcs to fail the lethal check (feas=0).
-        voxel = self._cfg.tsdf_voxel_size
-        n = cost_grid.shape[0]
-        center = n // 2
-        mask_radius_cells = int(0.5 / voxel)
-        y_idx, x_idx = np.ogrid[:n, :n]
-        robot_mask = (x_idx - center)**2 + (y_idx - center)**2 <= mask_radius_cells**2
-        cost_grid[robot_mask] = 0.0
-
-        # Increase cost of unknown cells: the robot shouldn't blast through
-        # unseen territory at full speed. Default Layer 6 cost is 0.15 (nearly
-        # free). At 0.35, arcs through unknown space are significantly penalized,
-        # causing the DWA to prefer scanned routes and naturally decelerate
-        # near the scanning frontier.
-        _UNKNOWN_CELL_COST = 0.35
-        if unknown_mask is not None:
-            cost_grid[unknown_mask] = _UNKNOWN_CELL_COST
-
-        from layer_6.types import Costmap2D
-        costmap = Costmap2D(
-            grid=cost_grid,
-            resolution=self._cfg.tsdf_voxel_size,
-            origin_x=pose.x - costmap_extent,
-            origin_y=pose.y - costmap_extent,
-            robot_yaw=pose.yaw,
-            stamp=msg.timestamp,
-            unknown_mask=unknown_mask,
-        )
-
-        query = self._CostmapQuery(costmap, oob_cost=_UNKNOWN_CELL_COST)
+        # --- Live costmap query for DWA ---
+        # Instead of building a body-frame snapshot (which goes stale
+        # between LiDAR callbacks), DWA samples the world-frame grid
+        # on-the-fly using the current robot pose.  LiveCostmapQuery
+        # reads _dwa_cost_grid and _imu_yaw at query time, so the
+        # costmap is never stale.
+        query = LiveCostmapQuery(self)
 
         with self._lock:
             self._costmap_query = query
-            self._costmap = costmap
             self._last_cloud_time = msg.timestamp
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         self._build_times.append(elapsed_ms)
+
+    def report_dwa_feas(self, n_feasible: int) -> None:
+        """Report DWA feasibility count (called at 20Hz replan rate).
+
+        When n_feasible == 0 for 30+ consecutive replans (1.5s), clear
+        obstacle memory near the robot.  Stale memory cells are the most
+        common cause of prolonged feas=0 — the TSDF was correctly cleared
+        but memory retained phantom obstacles.  Clearing memory lets DWA
+        re-evaluate; if a real obstacle exists, TSDF will repopulate it
+        on the next LiDAR scan.
+        """
+        if n_feasible == 0:
+            self._feas_zero_count += 1
+            if self._feas_zero_count >= 15:
+                self._clear_memory_near_robot()
+                # Suppress memory refill for 10 frames (0.5s at 20Hz)
+                # so clearing isn't immediately undone by TSDF data.
+                self._memory_blank_frames = 10
+                self._feas_zero_count = 0
+        else:
+            self._feas_zero_count = 0
+
+    def _clear_memory_near_robot(self) -> None:
+        """Clear obstacle memory AND the live body-frame costmap.
+
+        Clears memory in a 2.5m radius, and directly zeroes the body-
+        frame costmap that DWA samples from.  Clearing _dwa_cost_grid
+        alone has a race condition with the LiDAR callback (which can
+        overwrite it before the next DWA replan).  Clearing the body-
+        frame costmap takes effect immediately.
+        """
+        tsdf = self._tsdf
+        vs = tsdf.voxel_size
+        with self._imu_lock:
+            rx, ry = self._imu_x, self._imu_y
+        cx = int((rx - tsdf.origin_x) / vs)
+        cy = int((ry - tsdf.origin_y) / vs)
+        r = int(2.5 / vs)  # 2.5m radius (covers DWA arc range)
+        x_lo = max(0, cx - r)
+        x_hi = min(tsdf.nx, cx + r + 1)
+        y_lo = max(0, cy - r)
+        y_hi = min(tsdf.ny, cy + r + 1)
+        if x_lo < x_hi and y_lo < y_hi:
+            ix, iy = np.ogrid[x_lo:x_hi, y_lo:y_hi]
+            mask = (ix - cx)**2 + (iy - cy)**2 <= r**2
+            self._obstacle_memory[x_lo:x_hi, y_lo:y_hi][mask] = 0.0
+        # Set override flag: next DWA replan should force at least
+        # one feasible arc, breaking the consecutive feas=0 count
+        # without blinding the robot to all obstacles.
+        self._force_feasible = True
 
     @property
     def costmap_query(self):

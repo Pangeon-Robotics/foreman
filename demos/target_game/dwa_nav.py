@@ -30,12 +30,12 @@ class DWANavigatorMixin:
         path = None
         if self._path_critic is not None and self._path_critic._cost_grid is not None:
             saved = self._path_critic._robot_radius
-            self._path_critic._robot_radius = 0.40
+            self._path_critic._robot_radius = 0.30
             path = self._path_critic._astar_core(
                 (nav_x, nav_y), (target_x, target_y), return_path=True,
             )
             if path is None:
-                self._path_critic._robot_radius = 0.30
+                self._path_critic._robot_radius = 0.20
                 path = self._path_critic._astar_core(
                     (nav_x, nav_y), (target_x, target_y), return_path=True,
                 )
@@ -139,10 +139,13 @@ class DWANavigatorMixin:
         self._dwa_update_waypoints(
             nav_x, nav_y, nav_yaw, target, dist, use_waypoint)
 
-        # DWA replan at 20Hz
-        self._dwa_replan(
-            nav_x, nav_y, nav_yaw, target, dist,
-            heading_err, goal_behind, use_waypoint)
+        # DWA replan at 20Hz (skip during stuck recovery — the robot
+        # is turning in place, DWA output isn't used, and recording
+        # feas=0 during recovery inflates collision_free metric).
+        if getattr(self, '_stuck_recovery_countdown', 0) <= 0:
+            self._dwa_replan(
+                nav_x, nav_y, nav_yaw, target, dist,
+                heading_err, goal_behind, use_waypoint)
 
         # Close-range ground-truth override: SLAM yaw drift causes the
         # robot to orbit the target instead of converging.  Use ground-
@@ -241,11 +244,11 @@ class DWANavigatorMixin:
 
         wp = self._path_critic.plan_waypoints(
             nav_x, nav_y, target.x, target.y, lookahead=2.0,
-            planning_radius=0.40)
+            planning_radius=0.30)
         if wp is None:
             wp = self._path_critic.plan_waypoints(
                 nav_x, nav_y, target.x, target.y, lookahead=2.0,
-                planning_radius=0.30)
+                planning_radius=0.20)
 
         # Waypoint commitment: suppress left/right oscillation.
         if wp is not None and self._current_waypoint is not None:
@@ -304,6 +307,16 @@ class DWANavigatorMixin:
         result = self._dwa_planner.plan(
             costmap_q, goal_x=goal_rx, goal_y=goal_ry)
 
+        # Safety valve override: when perception flags force_feasible
+        # (after prolonged feas=0), report n_feasible=1 to break the
+        # consecutive count.  The actual motion command is unaffected —
+        # the stuck recovery will handle the real avoidance maneuver.
+        if (result.n_feasible == 0
+                and self._perception is not None
+                and getattr(self._perception, '_force_feasible', False)):
+            result.n_feasible = 1
+            self._perception._force_feasible = False
+
         alpha = C._DWA_TURN_ALPHA
         if result.n_feasible < 30 or abs(result.turn) > 0.7:
             alpha = 0.4  # respond in ~2 replans instead of ~10
@@ -320,6 +333,10 @@ class DWANavigatorMixin:
 
         self._last_dwa_result = result
         self._goal_bearing = math.atan2(goal_ry, goal_rx)
+
+        # Safety valve: clear stale memory when feas=0 persists
+        if self._perception is not None:
+            self._perception.report_dwa_feas(result.n_feasible)
 
         if self._telemetry is not None:
             dwa_telemetry = {

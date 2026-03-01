@@ -395,9 +395,10 @@ class PathCritic:
         nx, ny = cost_grid.shape
 
         # Weight for cost gradient influence on traversal cost.
-        # At COST_WEIGHT=3.0, a cell with cost 254 (lethal boundary) adds
-        # 3.0 to the step distance, strongly discouraging near-obstacle routes.
-        _COST_WEIGHT = 3.0
+        # At COST_WEIGHT=1.5, a cell with cost 254 (lethal boundary) adds
+        # 1.5 to the step distance, preferring wider paths but allowing
+        # corridor routes when detours are significantly longer.
+        _COST_WEIGHT = 1.5
 
         # Start and goal in grid coordinates
         sx = max(0, min(nx - 1, int((start[0] - ox) / vs)))
