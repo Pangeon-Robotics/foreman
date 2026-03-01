@@ -277,17 +277,20 @@ class TargetGame(
         # Recompute every 500 ticks (5s at 100Hz)
         if self._step_count - self._occ_compute_step >= 500:
             try:
-                from .test_occupancy import compute_occupancy_accuracy
+                from .test_occupancy import compute_3ds_v2
                 tsdf = self._perception._tsdf
                 if tsdf is not None:
-                    self._cached_occ = compute_occupancy_accuracy(
+                    self._cached_occ = compute_3ds_v2(
                         tsdf, self._scene_xml_path)
                     self._occ_compute_step = self._step_count
             except Exception:
                 pass
         if self._cached_occ is not None:
             o = self._cached_occ
-            return f" 3DS={o['iou']:.2f}"
+            adh = o['adherence_mm']
+            cpl = o['completeness_pct']
+            phn = o['phantom_pct']
+            return f" 3DS: adh={adh:.1f}mm cpl={cpl:.1f}% phn={phn:.1f}%"
         return ""
 
     def _gt_clearance(self) -> float:
@@ -433,7 +436,7 @@ class TargetGame(
                     self._debug_server.send_costmap_2d(
                         cost_grid, meta['origin_x'], meta['origin_y'],
                         meta['voxel_size'])
-                elif tsdf is not None:
+                elif tsdf is not None and hasattr(tsdf, '_log_odds'):
                     self._debug_server.send_observation_map(tsdf)
 
         # Feed cost grid to path critic (unconditional — not gated on viewer)

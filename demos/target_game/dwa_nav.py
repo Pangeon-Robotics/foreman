@@ -30,12 +30,12 @@ class DWANavigatorMixin:
         path = None
         if self._path_critic is not None and self._path_critic._cost_grid is not None:
             saved = self._path_critic._robot_radius
-            self._path_critic._robot_radius = 0.30
+            self._path_critic._robot_radius = 0.45
             path = self._path_critic._astar_core(
                 (nav_x, nav_y), (target_x, target_y), return_path=True,
             )
             if path is None:
-                self._path_critic._robot_radius = 0.20
+                self._path_critic._robot_radius = 0.30
                 path = self._path_critic._astar_core(
                     (nav_x, nav_y), (target_x, target_y), return_path=True,
                 )
@@ -196,8 +196,18 @@ class DWANavigatorMixin:
         if use_waypoint:
             wp_dx = self._current_waypoint[0] - nav_x
             wp_dy = self._current_waypoint[1] - nav_y
-            heading_err = _normalize_angle(
+            wp_heading_err = _normalize_angle(
                 math.atan2(wp_dy, wp_dx) - nav_yaw)
+            # If the waypoint is behind us, we've passed it — drop it and
+            # head directly to target.  Prevents the robot walking away
+            # from the target while chasing a stale waypoint.
+            if abs(wp_heading_err) > math.pi / 2:
+                self._current_waypoint = None
+                heading_err = target.heading_error(nav_x, nav_y, nav_yaw)
+                use_waypoint = False
+                self._use_waypoint_latch = False
+            else:
+                heading_err = wp_heading_err
         else:
             heading_err = target.heading_error(nav_x, nav_y, nav_yaw)
         goal_behind = abs(heading_err) > math.pi / 2
@@ -217,10 +227,16 @@ class DWANavigatorMixin:
 
         should_replan = False
 
-        # No waypoint yet — need initial plan
+        # Cooldown: at least 1s (100 ticks) between replans to prevent
+        # rapid switching that the robot can't physically follow.
+        last_replan_step = getattr(self, '_last_replan_step', -999)
+        cooldown_elapsed = (
+            self._target_step_count - last_replan_step >= 100)
+
+        # No waypoint yet — need initial plan (bypass cooldown)
         if self._current_waypoint is None:
             should_replan = True
-        else:
+        elif cooldown_elapsed:
             # Reached current waypoint — get next one
             wp_dist = math.hypot(
                 self._current_waypoint[0] - nav_x,
@@ -228,42 +244,41 @@ class DWANavigatorMixin:
             if wp_dist < 0.7:
                 should_replan = True
 
-        # Distance-traveled trigger: replan after moving 1.5m
-        last_pos = getattr(self, '_last_replan_pos', None)
-        if last_pos is not None:
-            moved = math.hypot(nav_x - last_pos[0], nav_y - last_pos[1])
-            if moved > 1.5:
+            # Distance-traveled trigger: replan after moving 1.5m
+            last_pos = getattr(self, '_last_replan_pos', None)
+            if last_pos is not None:
+                moved = math.hypot(
+                    nav_x - last_pos[0], nav_y - last_pos[1])
+                if moved > 1.5:
+                    should_replan = True
+
+            # Obstacles detected — replan (max 1Hz near obstacles).
+            if (self._last_dwa_result is not None
+                    and self._last_dwa_result.n_feasible < 15
+                    and self._target_step_count % 100 == 0):
                 should_replan = True
 
-        # Obstacles detected — replan (max 4Hz).
-        # feas < 30 catches moderate obstacles early (before score
-        # drops to 0.01), so A* can route around before impact.
-        if (self._last_dwa_result is not None
-                and self._last_dwa_result.n_feasible < 30
-                and self._target_step_count % 25 == 0):
-            should_replan = True
-
-        # Safety replan: 3s near obstacles, 10s in open field
-        threat_nearby = (
-            self._last_dwa_result is not None
-            and (self._last_dwa_result.n_feasible < 30
-                 or self._last_dwa_result.score < 0.20
-                 or getattr(self, '_last_threat_level', 0) > 0.2))
-        safety_interval = 300 if threat_nearby else 1000
-        if (self._target_step_count % safety_interval == 0
-                and self._target_step_count > 0):
-            should_replan = True
+            # Safety replan: 3s near obstacles, 10s in open field
+            threat_nearby = (
+                self._last_dwa_result is not None
+                and (self._last_dwa_result.n_feasible < 30
+                     or self._last_dwa_result.score < 0.20
+                     or getattr(self, '_last_threat_level', 0) > 0.2))
+            safety_interval = 300 if threat_nearby else 1000
+            if (self._target_step_count % safety_interval == 0
+                    and self._target_step_count > 0):
+                should_replan = True
 
         if not should_replan:
             return
 
         wp = self._path_critic.plan_waypoints(
             nav_x, nav_y, target.x, target.y, lookahead=2.0,
-            planning_radius=0.30)
+            planning_radius=0.45)
         if wp is None:
             wp = self._path_critic.plan_waypoints(
                 nav_x, nav_y, target.x, target.y, lookahead=2.0,
-                planning_radius=0.20)
+                planning_radius=0.30)
 
         # Waypoint commitment: suppress left/right oscillation.
         if wp is not None and self._current_waypoint is not None:
@@ -275,7 +290,7 @@ class DWANavigatorMixin:
             new_bearing = math.atan2(new_dy, new_dx)
             bearing_change = abs(
                 _normalize_angle(new_bearing - old_bearing))
-            if bearing_change > 0.8:  # >45deg flip
+            if bearing_change > 0.35:  # >20deg direction change
                 if self._target_step_count < self._wp_commit_until:
                     wp = self._current_waypoint  # keep committed wp
                 else:
@@ -294,6 +309,7 @@ class DWANavigatorMixin:
 
         self._current_waypoint = wp
         self._last_replan_pos = (nav_x, nav_y)
+        self._last_replan_step = self._target_step_count
 
         # Update path visualization (green dots) when plan changes
         self._export_path(nav_x, nav_y, target.x, target.y)

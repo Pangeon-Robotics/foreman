@@ -61,12 +61,15 @@ class DWAControlMixin:
             clr = self._gt_clearance()
             clr_s = f" clr={clr:.1f}" if clr < 50 else ""
             occ = self._get_occ_str()
+            nav_s = (f" fwd={self._smooth_dwa_fwd:.2f}"
+                     f" hmod={self._smooth_heading_mod:.2f}"
+                     f" wz={self._smooth_wz:+.1f}")
             print(
                 f"[{self._target_index}/{self._num_targets}] "
                 f"{mode_str:<5} t={t:.1f} d={dist:.1f} "
                 f"err={math.degrees(heading_err):+.0f}° "
                 f"({x_gt:.1f},{y_gt:.1f})"
-                f"{clr_s}{occ}")
+                f"{clr_s}{nav_s}{occ}")
 
         if dist < self._reach_threshold:
             self._on_reached()
@@ -370,12 +373,22 @@ class DWAControlMixin:
                 dwa_s = f" feas={d.n_feasible} sc={d.score:.2f}"
             bh = " BH" if goal_behind else ""
             occ = self._get_occ_str()
+            # Navigation detail: forward speed, heading mod, wz, guidance source
+            nav_s = (f" fwd={self._smooth_dwa_fwd:.2f}"
+                     f" hmod={self._smooth_heading_mod:.2f}"
+                     f" wz={self._smooth_wz:+.1f}")
+            if self._use_waypoint_latch and self._current_waypoint is not None:
+                wp = self._current_waypoint
+                wp_d = math.hypot(wp[0] - nav_x, wp[1] - nav_y)
+                nav_s += f" wp({wp_d:.1f}m)"
+            else:
+                nav_s += " dir"
             print(
                 f"[{self._target_index}/{self._num_targets}] "
                 f"{mode:<5} t={t:.1f} d={dist:.1f} "
                 f"err={math.degrees(heading_err):+.0f}° "
                 f"({x_gt:.1f},{y_gt:.1f})"
-                f"{clr_s}{dwa_s}{bh}{occ}")
+                f"{clr_s}{dwa_s}{bh}{nav_s}{occ}")
 
         if dist < self._reach_threshold:
             self._on_reached()
