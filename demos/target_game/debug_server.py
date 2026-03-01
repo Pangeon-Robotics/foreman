@@ -165,13 +165,25 @@ class DebugServer:
         self._send(MSG_ROBOT_STATE, payload)
 
     def send_tsdf(self, tsdf) -> None:
-        """Pack and send TSDF_OCCUPIED (0x02). Vectorized sparse voxels."""
+        """Pack and send TSDF_OCCUPIED (0x02). Vectorized sparse voxels.
+
+        Works with both PersistentTSDF (dense _log_odds) and SparseTSDF
+        (get_surface_voxels + chunk iteration).
+        """
         if not self.has_client:
             return
+
+        # SparseTSDF: iterate chunks directly (avoid materializing dense array)
+        if hasattr(tsdf, '_chunks'):
+            self._send_tsdf_sparse(tsdf)
+        else:
+            self._send_tsdf_dense(tsdf)
+
+    def _send_tsdf_dense(self, tsdf) -> None:
+        """Send TSDF from dense PersistentTSDF."""
         log_odds = tsdf._log_odds  # (nx, ny, nz) float32
         nx, ny, _nz = log_odds.shape
 
-        # Find occupied voxels (log_odds > 1.0) — requires 2+ LiDAR hits
         indices = np.argwhere(log_odds > 1.0)
         n_voxels = len(indices)
 
@@ -185,14 +197,71 @@ class DebugServer:
             self._send(MSG_TSDF_OCCUPIED, header)
             return
 
-        # Fully vectorized packing (no Python loop)
         ix = indices[:, 0].astype(np.uint16)
         iy = indices[:, 1].astype(np.uint16)
         iz = indices[:, 2].astype(np.uint8)
         lo_vals = log_odds[indices[:, 0], indices[:, 1], indices[:, 2]]
         lo_q = np.clip(lo_vals * 25, -127, 127).astype(np.int8)
 
-        # Pack as structured numpy array → bytes (no per-voxel loop)
+        voxel_dtype = np.dtype([
+            ('ix', '<u2'), ('iy', '<u2'), ('iz', 'u1'), ('lo', 'i1'),
+        ])
+        voxels = np.empty(n_voxels, dtype=voxel_dtype)
+        voxels['ix'] = ix
+        voxels['iy'] = iy
+        voxels['iz'] = iz
+        voxels['lo'] = lo_q
+
+        self._send(MSG_TSDF_OCCUPIED, header + voxels.tobytes())
+
+    def _send_tsdf_sparse(self, tsdf) -> None:
+        """Send TSDF from SparseTSDF (chunk iteration, no dense materialization)."""
+        from layer_6.world_model.tsdf_sparse import CHUNK_SIZE, CHUNK_BITS
+
+        # Collect occupied voxels from all chunks
+        all_ix = []
+        all_iy = []
+        all_iz = []
+        all_lo = []
+
+        for (cx, cy, cz), chunk in list(tsdf._chunks.items()):
+            lo = chunk.log_odds
+            occ = lo > 1.0
+            if not np.any(occ):
+                continue
+            local_indices = np.argwhere(occ)
+            gx = (cx << CHUNK_BITS) + local_indices[:, 0]
+            gy = (cy << CHUNK_BITS) + local_indices[:, 1]
+            gz = (cz << CHUNK_BITS) + local_indices[:, 2]
+            lo_vals = lo[local_indices[:, 0],
+                         local_indices[:, 1],
+                         local_indices[:, 2]]
+            all_ix.append(gx)
+            all_iy.append(gy)
+            all_iz.append(gz)
+            all_lo.append(lo_vals)
+
+        if all_ix:
+            ix = np.concatenate(all_ix).astype(np.uint16)
+            iy = np.concatenate(all_iy).astype(np.uint16)
+            iz = np.concatenate(all_iz).astype(np.uint8)
+            lo_vals = np.concatenate(all_lo)
+            n_voxels = len(ix)
+        else:
+            n_voxels = 0
+
+        header = struct.pack(
+            '<4f 2H I',
+            tsdf.origin_x, tsdf.origin_y, tsdf.z_min, tsdf.voxel_size,
+            tsdf.nx, tsdf.ny, n_voxels,
+        )
+
+        if n_voxels == 0:
+            self._send(MSG_TSDF_OCCUPIED, header)
+            return
+
+        lo_q = np.clip(lo_vals * 25, -127, 127).astype(np.int8)
+
         voxel_dtype = np.dtype([
             ('ix', '<u2'), ('iy', '<u2'), ('iz', 'u1'), ('lo', 'i1'),
         ])
