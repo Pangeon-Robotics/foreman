@@ -183,8 +183,16 @@ class DWANavigatorMixin:
         """
         _dwa_feas_for_wp = (self._last_dwa_result.n_feasible
                             if self._last_dwa_result else 41)
-        use_waypoint = (self._current_waypoint is not None
-                        and (dist > 1.5 or _dwa_feas_for_wp < 30))
+        # Hysteresis: once in waypoint mode, stay until close AND clear
+        _wp_latch = getattr(self, '_use_waypoint_latch', False)
+        if _wp_latch:
+            # Exit waypoint mode only when close to target and path is clear
+            use_waypoint = (self._current_waypoint is not None
+                            and (dist > 1.0 or _dwa_feas_for_wp < 30))
+        else:
+            use_waypoint = (self._current_waypoint is not None
+                            and (dist > 1.5 or _dwa_feas_for_wp < 30))
+        self._use_waypoint_latch = use_waypoint
         if use_waypoint:
             wp_dx = self._current_waypoint[0] - nav_x
             wp_dy = self._current_waypoint[1] - nav_y
@@ -217,15 +225,22 @@ class DWANavigatorMixin:
             wp_dist = math.hypot(
                 self._current_waypoint[0] - nav_x,
                 self._current_waypoint[1] - nav_y)
-            if wp_dist < 1.0:
+            if wp_dist < 0.7:
                 should_replan = True
 
-        # Obstacles detected — replan (max 2Hz).
+        # Distance-traveled trigger: replan after moving 1.5m
+        last_pos = getattr(self, '_last_replan_pos', None)
+        if last_pos is not None:
+            moved = math.hypot(nav_x - last_pos[0], nav_y - last_pos[1])
+            if moved > 1.5:
+                should_replan = True
+
+        # Obstacles detected — replan (max 4Hz).
         # feas < 30 catches moderate obstacles early (before score
         # drops to 0.01), so A* can route around before impact.
         if (self._last_dwa_result is not None
                 and self._last_dwa_result.n_feasible < 30
-                and self._target_step_count % 50 == 0):
+                and self._target_step_count % 25 == 0):
             should_replan = True
 
         # Safety replan: 3s near obstacles, 10s in open field
@@ -278,6 +293,7 @@ class DWANavigatorMixin:
                         wp = self._current_waypoint  # reject flip
 
         self._current_waypoint = wp
+        self._last_replan_pos = (nav_x, nav_y)
 
         # Update path visualization (green dots) when plan changes
         self._export_path(nav_x, nav_y, target.x, target.y)

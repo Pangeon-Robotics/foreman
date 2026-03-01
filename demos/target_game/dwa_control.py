@@ -42,7 +42,7 @@ class DWAControlMixin:
             self._smooth_wz += C.CLOSE_RANGE_WZ_ALPHA * (wz - self._smooth_wz)
             wz = self._smooth_wz
             cos_heading = max(0.0, math.cos(heading_err))
-            speed = min(1.0, dist / 1.5) * cos_heading
+            speed = min(1.0, dist / 1.0) * cos_heading
             self._smooth_heading_mod = speed
             self._decel_tick_count = 0
             params = self._L4GaitParams(
@@ -209,6 +209,12 @@ class DWAControlMixin:
             if dwa.score < 0.25 and dwa.n_feasible >= 5:
                 score_blend = 0.5 + 0.4 * (1.0 - dwa.score / 0.25)
                 dwa_blend = max(dwa_blend, score_blend)
+            # When following an A* waypoint, the strategic path already
+            # routes around obstacles.  Cap DWA steering so the waypoint
+            # heading dominates — DWA still controls speed (feas_scale
+            # braking) and gets full authority at very low feas (<10).
+            if self._use_waypoint_latch and dwa.n_feasible >= 10:
+                dwa_blend = min(dwa_blend, 0.3)
             turn_cmd = ((1.0 - dwa_blend) * heading_turn
                         + dwa_blend * dwa.turn)
 
@@ -224,28 +230,34 @@ class DWAControlMixin:
                 else:
                     heading_mod = min(heading_mod, max(feas_scale, 0.5))
 
-            # DWA forward smoothing
-            dwa_fwd_target = max(0.02, dwa.forward)
-            if not drift_dampened:
-                if dwa_fwd_target < self._smooth_dwa_fwd:
-                    self._smooth_dwa_fwd += C.DWA_FWD_DECEL_ALPHA * (
-                        dwa_fwd_target - self._smooth_dwa_fwd)
-                else:
-                    self._smooth_dwa_fwd += C.DWA_FWD_ACCEL_ALPHA * (
-                        dwa_fwd_target - self._smooth_dwa_fwd)
-                # Floor prevents stalling when DWA forward is low.
-                # Only apply when DWA itself wants forward motion
-                # (distinguishes "open field, goal sideways" from
-                # "obstacle ahead, turn to avoid").
-                if dwa.forward >= 0.3:
-                    if dwa.n_feasible >= 25:
-                        self._smooth_dwa_fwd = max(
-                            self._smooth_dwa_fwd, 0.4)
-                    elif dwa.n_feasible >= 10:
-                        self._smooth_dwa_fwd = max(
-                            self._smooth_dwa_fwd, 0.3)
-                heading_mod = min(heading_mod, self._smooth_dwa_fwd)
+            # DWA forward smoothing — freeze during TIP/behind so
+            # _smooth_dwa_fwd doesn't decay to 0.02 (behind_factor
+            # zeroes dwa.forward).  Robot exits TIP at pre-TIP speed.
+            if not goal_behind and not self._in_tip_mode:
+                dwa_fwd_target = max(0.02, dwa.forward)
+                if not drift_dampened:
+                    if dwa_fwd_target < self._smooth_dwa_fwd:
+                        self._smooth_dwa_fwd += C.DWA_FWD_DECEL_ALPHA * (
+                            dwa_fwd_target - self._smooth_dwa_fwd)
+                    else:
+                        self._smooth_dwa_fwd += C.DWA_FWD_ACCEL_ALPHA * (
+                            dwa_fwd_target - self._smooth_dwa_fwd)
+                    # Floor prevents stalling when DWA forward is low.
+                    # Only apply when DWA itself wants forward motion
+                    # (distinguishes "open field, goal sideways" from
+                    # "obstacle ahead, turn to avoid").
+                    if dwa.forward >= 0.3:
+                        if dwa.n_feasible >= 25:
+                            self._smooth_dwa_fwd = max(
+                                self._smooth_dwa_fwd, 0.4)
+                        elif dwa.n_feasible >= 10:
+                            self._smooth_dwa_fwd = max(
+                                self._smooth_dwa_fwd, 0.3)
+                    heading_mod = min(heading_mod, self._smooth_dwa_fwd)
+                elif dwa.n_feasible < 20:
+                    heading_mod = min(heading_mod, self._smooth_dwa_fwd)
             elif dwa.n_feasible < 20:
+                # During TIP/behind: still respect obstacle braking
                 heading_mod = min(heading_mod, self._smooth_dwa_fwd)
 
             # Reactive scan: reduce speed near obstacles
