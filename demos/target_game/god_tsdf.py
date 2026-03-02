@@ -18,7 +18,9 @@ import numpy as np
 # LiDAR config matching layers_1_2/lidar.py defaults
 _H_FOV = 360.0
 _H_RESOLUTION = 0.18  # degrees
-_V_ANGLES_DEG = [-15.0, -7.0, 0.0, 7.0, 15.0]
+# Hesai XT16: 16 channels at 2° spacing, -15° to +15°
+_V_ANGLES_DEG = [-15.0, -13.0, -11.0, -9.0, -7.0, -5.0, -3.0, -1.0,
+                   1.0,   3.0,   5.0,  7.0,  9.0, 11.0, 13.0, 15.0]
 _MAX_RANGE = 10.0
 _MIN_RANGE = 0.05
 
@@ -137,6 +139,7 @@ class GodViewTSDF:
             costmap_z_hi=0.80,
             tsdf_output_resolution=0.05,
             tsdf_depth_extension=5,
+            tsdf_decay_rate=0.0,  # god-view: no decay, perfect rays
         )
         from layer_6.world_model.tsdf import TSDF
         self._tsdf = TSDF(cfg)
@@ -218,21 +221,38 @@ class GodViewTSDF:
         voxels = self._tsdf.get_surface_voxels(include_history=True)
         return len(voxels)
 
-    def write_temp_file(self, path: str = "/tmp/god_view_tsdf.bin") -> None:
+    def write_temp_file(self, path: str = "/tmp/god_view_tsdf.bin",
+                        display_resolution: float = 0.05) -> None:
         """Write surface voxels to binary file for MuJoCo renderer.
+
+        Downsamples from internal 1cm voxels to display_resolution (default
+        5cm) to keep the voxel count bounded.  Without this, the renderer's
+        stride-based subsampling creates visual churn as the history set
+        grows across frames.
 
         Format: u32 n_voxels + f32 voxel_half_size (8 bytes header)
                 N x 3 float32 xyz (12 bytes per voxel)
         """
         voxels = self._tsdf.get_surface_voxels(include_history=True)
+        if len(voxels) == 0:
+            buf = bytearray(8)
+            struct.pack_into('<If', buf, 0, 0, 0.0)
+            with open(path, 'wb') as f:
+                f.write(buf)
+            return
+
+        # Snap to display grid and deduplicate for stable rendering
+        keys = (voxels / display_resolution).astype(np.int32)
+        _, idx = np.unique(keys, axis=0, return_index=True)
+        voxels = voxels[idx]
+
         n = len(voxels)
-        half = self._tsdf.voxel_size / 2.0
+        half = display_resolution / 2.0
 
         buf = bytearray(8 + n * 12)
         struct.pack_into('<If', buf, 0, n, half)
-        if n > 0:
-            voxels_f32 = voxels.astype(np.float32)
-            buf[8:] = voxels_f32.tobytes()
+        voxels_f32 = voxels.astype(np.float32)
+        buf[8:] = voxels_f32.tobytes()
 
         with open(path, 'wb') as f:
             f.write(buf)
