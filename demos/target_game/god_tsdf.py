@@ -241,10 +241,13 @@ class GodViewTSDF:
                 f.write(buf)
             return
 
-        # Snap to display grid and deduplicate for stable rendering
-        keys = (voxels / display_resolution).astype(np.int32)
+        # Snap to display grid and deduplicate for stable rendering.
+        # np.floor (not astype int32) handles negative coords correctly:
+        # -0.03/0.05 = -0.6 → floor -1, not truncate 0.
+        # Use cell centers so each 5cm cube sits exactly on-grid.
+        keys = np.floor(voxels / display_resolution).astype(np.int32)
         _, idx = np.unique(keys, axis=0, return_index=True)
-        voxels = voxels[idx]
+        voxels = (keys[idx] + 0.5) * display_resolution
 
         n = len(voxels)
         half = display_resolution / 2.0
