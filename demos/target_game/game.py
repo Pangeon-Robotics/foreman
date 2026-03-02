@@ -140,6 +140,9 @@ class TargetGame(
 
         # Debug viewer
         self._debug_server = None
+        self._god_view_costmap: tuple | None = None  # (grid_u8, meta) from scene XML
+        self._god_view_path_file: str | None = None  # temp file for MuJoCo overlay
+        self._god_view_tsdf = None  # GodViewTSDF instance for perfect raycast
 
         # Obstacle proximity
         self._obstacle_bodies: list[str] = []
@@ -249,6 +252,10 @@ class TargetGame(
         """Set scene XML path for occupancy accuracy computation."""
         self._scene_xml_path = path
 
+    def set_god_view_costmap(self, grid: 'np.ndarray', meta: dict) -> None:
+        """Set god-view binary costmap for Godot overlay (red = obstacle footprint)."""
+        self._god_view_costmap = (grid, meta)
+
     def set_obstacle_bodies(self, names: list[str]) -> None:
         self._obstacle_bodies = names
 
@@ -274,13 +281,18 @@ class TargetGame(
         if (self._scene_xml_path is None
                 or self._perception is None):
             return ""
-        # Recompute every 500 ticks (5s at 100Hz)
-        if self._step_count - self._occ_compute_step >= 500:
+        # Recompute every 2000 ticks (20s at 100Hz).  3DS computations
+        # (KD tree build + chunk iteration) block the main thread for
+        # 50-100ms, preventing GaitParams sending.  Less frequent updates
+        # reduce GIL spikes that cause falls.
+        if self._step_count - self._occ_compute_step >= 2000:
             try:
-                from .test_occupancy import compute_3ds_v2
+                from .test_occupancy import compute_3ds_v2, compute_3ds_god
                 tsdf = self._perception._tsdf
                 if tsdf is not None:
                     self._cached_occ = compute_3ds_v2(
+                        tsdf, self._scene_xml_path)
+                    self._cached_occ['god'] = compute_3ds_god(
                         tsdf, self._scene_xml_path)
                     self._occ_compute_step = self._step_count
             except Exception:
@@ -290,7 +302,11 @@ class TargetGame(
             adh = o['adherence_mm']
             cpl = o['completeness_pct']
             phn = o['phantom_pct']
-            return f" 3DS: adh={adh:.1f}mm cpl={cpl:.1f}% phn={phn:.1f}%"
+            parts = f" 3DS: adh={adh:.1f}mm cpl={cpl:.1f}% phn={phn:.1f}%"
+            god = o.get('god')
+            if god is not None:
+                parts += f" god={god['score']:.0f}"
+            return parts
         return ""
 
     def _gt_clearance(self) -> float:
@@ -430,12 +446,57 @@ class TargetGame(
                 tsdf = self._perception._tsdf
                 if tsdf is not None:
                     self._debug_server.send_tsdf(tsdf)
+                # Send robot-view costmap (red in Godot)
                 cost_grid = self._perception.world_cost_grid
                 meta = self._perception.world_cost_meta
                 if cost_grid is not None and meta is not None:
                     self._debug_server.send_costmap_2d(
                         cost_grid, meta['origin_x'], meta['origin_y'],
                         meta['voxel_size'])
+                # Send god-view costmap (blue in Godot)
+                if self._god_view_costmap is not None:
+                    gv_grid, gv_meta = self._god_view_costmap
+                    self._debug_server.send_god_view_costmap(
+                        gv_grid, gv_meta['origin_x'], gv_meta['origin_y'],
+                        gv_meta['voxel_size'])
+                    # God-view A* path (blue dots in Godot)
+                    target = self._spawner.current_target
+                    if target is not None:
+                        gv_x, gv_y, _, _, _, _ = self._get_robot_pose()
+                        god_path = _astar_on_god_view(
+                            gv_grid, gv_meta, (gv_x, gv_y),
+                            (target.x, target.y))
+                        if god_path is not None:
+                            self._debug_server.send_god_view_path(god_path)
+
+        # God-view A* path for MuJoCo overlay (written to temp file)
+        if (self._god_view_path_file is not None
+                and self._god_view_costmap is not None
+                and self._step_count % 50 == 0):
+            import struct as _struct
+            gv_grid, gv_meta = self._god_view_costmap
+            target = self._spawner.current_target
+            if target is not None:
+                gv_x, gv_y, _, _, _, _ = self._get_robot_pose()
+                god_path = _astar_on_god_view(
+                    gv_grid, gv_meta, (gv_x, gv_y),
+                    (target.x, target.y))
+                if god_path is not None:
+                    buf = bytearray(len(god_path) * 8)
+                    for i, (wx, wy) in enumerate(god_path):
+                        _struct.pack_into('ff', buf, i * 8, wx, wy)
+                    try:
+                        with open(self._god_view_path_file, 'wb') as _f:
+                            _f.write(buf)
+                    except OSError:
+                        pass
+
+        # God-view TSDF: perfect raycast → TSDF voxels (written to temp file)
+        if (self._god_view_tsdf is not None
+                and self._step_count % 50 == 0):
+            x, y, yaw, z, _, _ = self._get_robot_pose()
+            self._god_view_tsdf.update(x, y, yaw, z)
+            self._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
 
         # Feed cost grid to path critic (unconditional — not gated on viewer)
         if (self._step_count % 50 == 0
@@ -480,3 +541,19 @@ class TargetGame(
         alpha = progress * progress * (3.0 - 2.0 * progress)
         self._kp = KP_START + alpha * (KP_FULL - KP_START)
         self._kd = KD_START + alpha * (KD_FULL - KD_START)
+
+
+def _astar_on_god_view(
+    grid, meta, start: tuple[float, float], goal: tuple[float, float],
+    robot_radius: float = 0.35,
+) -> list[tuple[float, float]] | None:
+    """Run A* on a god-view cost grid and return world-frame waypoints."""
+    from .path_critic import PathCritic
+    critic = PathCritic.__new__(PathCritic)
+    critic._cost_grid = grid
+    critic._cost_origin_x = meta['origin_x']
+    critic._cost_origin_y = meta['origin_y']
+    critic._cost_voxel_size = meta['voxel_size']
+    critic._cost_truncation = meta.get('truncation', 0.5)
+    critic._robot_radius = robot_radius
+    return critic._astar_on_cost_grid(start, goal, return_path=True)

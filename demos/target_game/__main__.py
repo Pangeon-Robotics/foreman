@@ -58,6 +58,8 @@ class GameRunResult:
     perception_stats: dict | None = None
     ato_score: float | None = None
     occupancy_accuracy: dict | None = None  # IoU/precision/recall from test_occupancy
+    tsdf: object | None = None
+    scene_path: str | None = None
 
 
 def _expand_v9_genome(params: dict) -> dict:
@@ -504,7 +506,20 @@ def run_game(args) -> GameRunResult:
                     for key, val in getattr(args, 'dwa_overrides', {}).items():
                         setattr(pcfg, key, val)
 
+                    # Set scan interval as cooldown gap (measured from build
+                    # end, not start).  250ms gap guarantees 25 control ticks
+                    # between TSDF builds to prevent GIL starvation.
+                    if not hasattr(pcfg, 'scan_min_interval'):
+                        pcfg.scan_min_interval = 0.25
+                    # B2 LiDAR sits at world z≈0.645m (body 0.465 + sensor 0.18).
+                    # 0° rays hit obstacles at z≈0.65 — must be inside costmap band.
+                    # Default costmap_z_hi=0.55 misses all horizontal hits.
+                    pcfg.costmap_z_hi = 0.80
                     perception = PerceptionPipeline(odometry, pcfg)
+                    # B2 LiDAR at z≈0.645m. -7° channel at 3.5m→z=0.22.
+                    # 0.20 gives ~3.5m detection range while rejecting
+                    # -15° ground hits (z<0.13 at 2m+).
+                    perception._MIN_WORLD_Z = 0.20
                     cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
                     cloud_sub.Init(perception.on_point_cloud, 5)
                     game._perception = perception
@@ -545,6 +560,70 @@ def run_game(args) -> GameRunResult:
             game._debug_server = debug_server
             # Send ground-truth obstacle volumes (once, on first client connect)
             game._obstacle_geoms = _find_obstacle_geoms(scene_path)
+            # God-view costmap: binary obstacle footprints for Godot overlay.
+            # Red appears ONLY at actual obstacle cells, no EDT gradient halo.
+            if obstacle_bodies:
+                from .test_costmap_compare import build_god_view_binary
+                from layer_6.config.defaults import load_config as _load_pcfg
+                _pcfg = _load_pcfg(args.robot)
+                gv_grid, gv_meta = build_god_view_binary(
+                    str(scene_path),
+                    z_lo=_pcfg.costmap_z_lo, z_hi=_pcfg.costmap_z_hi,
+                    output_resolution=_pcfg.tsdf_output_resolution,
+                    xy_extent=_pcfg.tsdf_xy_extent)
+                game.set_god_view_costmap(gv_grid, gv_meta)
+                import numpy as _np
+                print(f"God-view costmap: {gv_grid.shape}, "
+                      f"{int(_np.sum(gv_grid == 254))} obstacle cells")
+
+        # God-view costmap overlay in MuJoCo viewer
+        if getattr(args, 'god', False) and obstacle_bodies and not args.headless:
+            from .test_costmap_compare import build_god_view_costmap
+            from layer_6.config.defaults import load_config as _load_pcfg
+            import struct as _struct
+            import numpy as _np
+
+            _pcfg = _load_pcfg(args.robot)
+            gv_grid, gv_meta = build_god_view_costmap(
+                str(scene_path),
+                z_lo=_pcfg.costmap_z_lo, z_hi=_pcfg.costmap_z_hi,
+                output_resolution=_pcfg.tsdf_output_resolution,
+                xy_extent=_pcfg.tsdf_xy_extent,
+                truncation=_pcfg.tsdf_truncation)
+            # Write to temp file for firmware viewer to render.
+            # Rasterizer stores grid[x_idx, y_idx] but renderer reads
+            # grid[row, col] as row→Y, col→X. Transpose so axes match.
+            # Format: rows(u16) cols(u16) origin_x(f) origin_y(f) voxel_size(f) + raw u8
+            _god_file = "/tmp/god_view_costmap.bin"
+            gv_grid_t = gv_grid.T  # (x,y) → (y,x) = (row=Y, col=X)
+            rows, cols = gv_grid_t.shape
+            with open(_god_file, 'wb') as _f:
+                _f.write(_struct.pack('<HHfff', rows, cols,
+                                      gv_meta['origin_x'], gv_meta['origin_y'],
+                                      gv_meta['voxel_size']))
+                _f.write(gv_grid_t.tobytes())
+            n_lethal = int(_np.sum(gv_grid >= 253))
+            n_grad = int(_np.sum((gv_grid > 0) & (gv_grid < 253)))
+            print(f"God-view costmap: {gv_grid.shape}, "
+                  f"{n_lethal} lethal + {n_grad} gradient cells → {_god_file}")
+            # Set god-view on game so it can compute A* paths
+            game.set_god_view_costmap(gv_grid, gv_meta)
+            game._god_view_path_file = "/tmp/god_view_path.bin"
+
+            # God-view TSDF: perfect LiDAR → TSDF from known geometry.
+            # Remove stale temp file from prior runs (renderer caches by mtime).
+            import os as _os
+            _tsdf_tmp = "/tmp/god_view_tsdf.bin"
+            try:
+                _os.unlink(_tsdf_tmp)
+            except OSError:
+                pass
+            from .god_tsdf import GodViewTSDF
+            god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
+            game._god_view_tsdf = god_tsdf
+            print(f"God-view TSDF: {god_tsdf._n_rays} rays, "
+                  f"exclude {len(god_tsdf._robot_geom_ids)} robot geoms, "
+                  f"voxel={god_tsdf._tsdf.voxel_size}m")
 
         # Path critic for non-obstacle runs (straight-line only, no A*)
         if game._path_critic is None:
@@ -559,8 +638,11 @@ def run_game(args) -> GameRunResult:
         occ_accuracy = None
         if perception is not None and getattr(args, 'obstacles', False):
             try:
-                from .test_occupancy import compute_3ds_v2
+                from .test_occupancy import compute_3ds_v2, compute_3ds_god
                 occ_accuracy = compute_3ds_v2(
+                    perception._tsdf, str(scene_path),
+                )
+                occ_accuracy['god'] = compute_3ds_god(
                     perception._tsdf, str(scene_path),
                 )
             except Exception as e:
@@ -574,8 +656,13 @@ def run_game(args) -> GameRunResult:
             perception_stats=perception.stats if perception is not None else None,
             ato_score=ato,
             occupancy_accuracy=occ_accuracy,
+            tsdf=perception._tsdf if perception is not None else None,
+            scene_path=str(scene_path),
         )
     finally:
+        # Shut down perception callback to prevent lingering DDS threads
+        if perception is not None:
+            perception.shutdown()
         if debug_server is not None:
             debug_server.stop()
         sim.stop()
