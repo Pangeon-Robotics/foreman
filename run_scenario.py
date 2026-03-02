@@ -18,7 +18,7 @@ _SEED_GENOMES = {
     "b2": _WORKSPACE / "training" / "models" / "b2" / "ga_v14_seed.json",
 }
 
-SCENARIOS = ["open", "scattered", "corridor", "L_wall", "dead_end", "dense"]
+SCENARIOS = ["open", "scattered", "corridor", "L_wall", "dead_end", "dense", "test"]
 
 
 def main():
@@ -34,6 +34,7 @@ Scenarios (easiest to hardest):
   dead_end   - U-shaped obstacle, must find detour
   dense      - 14 obstacles, narrow gaps (~0.8m)
   all        - Run every scenario sequentially
+  test       - Feedback loop test (5 seeds, headless, all metrics)
 """,
     )
     parser.add_argument("scenario", nargs="?", default=None,
@@ -54,6 +55,10 @@ Scenarios (easiest to hardest):
                         help="Override target seed (default: use scenario's seed)")
     parser.add_argument("--targets", type=int, default=None,
                         help="Override number of targets (default: use scenario's count)")
+    parser.add_argument("--random-obstacles", action="store_true",
+                        help="Randomize obstacle positions (uses target seed)")
+    parser.add_argument("--god", action="store_true",
+                        help="Show god-view costmap overlay in MuJoCo viewer")
     args = parser.parse_args()
 
     if args.scenario is None:
@@ -69,6 +74,22 @@ Scenarios (easiest to hardest):
         print(f"Available: {', '.join(SCENARIOS)}, all")
         sys.exit(1)
 
+    # Feedback loop test shortcut
+    if args.scenario == "test":
+        cmd = [
+            sys.executable, "-m",
+            "foreman.demos.target_game.test_feedback_loop",
+            "--robot", args.robot,
+            "--domain", str(args.domain),
+        ]
+        if args.seed is not None:
+            cmd.extend(["--seed-start", str(args.seed)])
+        if args.targets is not None:
+            cmd.extend(["--seeds", str(args.targets)])
+        if args.random_obstacles:
+            cmd.append("--random-obstacles")
+        sys.exit(subprocess.call(cmd, cwd=str(_WORKSPACE)))
+
     # Build command
     cmd = [
         sys.executable, "-m", "foreman.demos.target_game.scenarios",
@@ -81,6 +102,12 @@ Scenarios (easiest to hardest):
 
     if args.viewer:
         cmd.append("--viewer")
+
+    if args.random_obstacles:
+        cmd.append("--random-obstacles")
+
+    if args.god:
+        cmd.append("--god")
 
     if args.scenario != "all":
         cmd.extend(["--scenario", args.scenario])

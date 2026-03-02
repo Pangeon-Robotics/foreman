@@ -39,6 +39,110 @@ if TYPE_CHECKING:
 # Re-export everything from game_config for backward compatibility.
 from .game_config import *  # noqa: F401,F403
 
+_ROBOT_TSDF_FILE = "/tmp/robot_view_tsdf.bin"
+_ROBOT_COSTMAP_FILE = "/tmp/robot_view_costmap.bin"
+
+
+def _write_robot_tsdf_file(tsdf, display_resolution: float = 0.05) -> None:
+    """Write robot-view TSDF surface voxels to temp file for MuJoCo viewer.
+
+    Same binary format as god-view: u32 n + f32 half, then N x 3 float32 xyz.
+    Downsamples to display_resolution for bounded voxel count.
+    """
+    import struct
+    import numpy as np
+
+    voxels = tsdf.get_surface_voxels(include_history=True)
+    if len(voxels) == 0:
+        buf = bytearray(8)
+        struct.pack_into('<If', buf, 0, 0, 0.0)
+        try:
+            with open(_ROBOT_TSDF_FILE, 'wb') as f:
+                f.write(buf)
+        except OSError:
+            pass
+        return
+
+    keys = np.floor(voxels / display_resolution).astype(np.int32)
+    _, idx = np.unique(keys, axis=0, return_index=True)
+    voxels = (keys[idx] + 0.5) * display_resolution
+
+    n = len(voxels)
+    half = display_resolution / 2.0
+    buf = bytearray(8 + n * 12)
+    struct.pack_into('<If', buf, 0, n, half)
+    buf[8:] = voxels.astype(np.float32).tobytes()
+
+    try:
+        with open(_ROBOT_TSDF_FILE, 'wb') as f:
+            f.write(buf)
+    except OSError:
+        pass
+
+
+def _write_robot_costmap_file(tsdf, display_resolution: float = 0.05,
+                              cost_floor: float = 0.20) -> None:
+    """Write robot-view costmap built from TSDF surface history.
+
+    Uses the same surface voxels as the grey cube visualization
+    (include_history=True), so the costmap always matches visible cubes.
+    Runs a cropped EDT for speed.
+
+    Cost = 1 / (1 + dist^2) — inverse-square falloff, no distance cutoff.
+    Cells below cost_floor (5%) are zeroed so the data is honest.
+
+    Header: u16 rows, u16 cols, f32 origin_x, f32 origin_y, f32 voxel_size
+    Body: rows * cols uint8
+    """
+    import struct
+    import numpy as np
+    from scipy.ndimage import distance_transform_edt
+
+    voxels = tsdf.get_surface_voxels(include_history=True)
+    if len(voxels) == 0:
+        return
+
+    res = display_resolution
+    ox, oy = tsdf.origin_x, tsdf.origin_y
+
+    # Project to 2D grid indices
+    gx = ((voxels[:, 0] - ox) / res).astype(np.int32)
+    gy = ((voxels[:, 1] - oy) / res).astype(np.int32)
+
+    # Crop to bounding box + margin sized from where cost hits floor
+    # 1/(1+d^2) = floor → d = sqrt(1/floor - 1)
+    max_dist = (1.0 / cost_floor - 1.0) ** 0.5
+    margin = int(max_dist / res) + 2
+    x_lo, x_hi = int(gx.min()) - margin, int(gx.max()) + margin + 1
+    y_lo, y_hi = int(gy.min()) - margin, int(gy.max()) + margin + 1
+
+    # Build occupied grid on cropped region
+    cnx, cny = x_hi - x_lo, y_hi - y_lo
+    occupied = np.zeros((cnx, cny), dtype=np.bool_)
+    lgx, lgy = gx - x_lo, gy - y_lo
+    valid = (lgx >= 0) & (lgx < cnx) & (lgy >= 0) & (lgy < cny)
+    occupied[lgx[valid], lgy[valid]] = True
+
+    # EDT → inverse-square cost with scale factor for steep dropoff
+    dist = distance_transform_edt(~occupied).astype(np.float32) * res
+    scale = 0.10  # characteristic distance (m) — cost halves at this distance
+    cost_f = 1.0 / (1.0 + (dist / scale) ** 2)
+    cost_u8 = (cost_f * 254).astype(np.uint8)
+    cost_u8[cost_u8 < int(cost_floor * 254)] = 0
+
+    # Transpose to (row=Y, col=X) for renderer
+    grid_t = cost_u8.T
+    rows, cols = grid_t.shape
+    crop_ox = ox + x_lo * res
+    crop_oy = oy + y_lo * res
+    buf = struct.pack('<HHfff', rows, cols, crop_ox, crop_oy, res)
+    try:
+        with open(_ROBOT_COSTMAP_FILE, 'wb') as f:
+            f.write(buf)
+            f.write(np.ascontiguousarray(grid_t).tobytes())
+    except OSError:
+        pass
+
 
 class TargetGame(
     NavigatorMixin,
@@ -497,6 +601,18 @@ class TargetGame(
             x, y, yaw, z, _, _ = self._get_robot_pose()
             self._god_view_tsdf.update(x, y, yaw, z)
             self._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
+
+        # Robot-view TSDF: write surface voxels to temp file for MuJoCo viewer
+        if (self._step_count % 50 == 0
+                and self._perception is not None
+                and self._perception._tsdf is not None):
+            _write_robot_tsdf_file(self._perception._tsdf)
+
+        # Robot-view costmap: built from TSDF surface history (matches grey cubes)
+        if (self._step_count % 50 == 0
+                and self._perception is not None
+                and self._perception._tsdf is not None):
+            _write_robot_costmap_file(self._perception._tsdf)
 
         # Feed cost grid to path critic (unconditional — not gated on viewer)
         if (self._step_count % 50 == 0

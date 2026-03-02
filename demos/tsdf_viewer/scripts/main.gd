@@ -44,6 +44,8 @@ func _ready() -> void:
 	tcp.path_received.connect(_on_path)
 	tcp.observation_map_received.connect(_on_obs_map)
 	tcp.obstacles_received.connect(_on_obstacles)
+	tcp.god_view_costmap_received.connect(_on_god_view_costmap)
+	tcp.god_view_path_received.connect(_on_god_view_path)
 
 
 func _on_connected() -> void:
@@ -107,6 +109,14 @@ func _on_obs_map(data: PackedByteArray) -> void:
 
 func _on_obstacles(data: PackedByteArray) -> void:
 	obstacle_renderer.update_obstacles(data)
+
+
+func _on_god_view_costmap(data: PackedByteArray) -> void:
+	obs_overlay.update_god_view_costmap(data)
+
+
+func _on_god_view_path(data: PackedByteArray) -> void:
+	astar_path.update_god_view_path(data)
 
 
 func _process(_delta: float) -> void:

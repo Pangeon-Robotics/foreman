@@ -1,30 +1,42 @@
 extends MeshInstance3D
-## Ground-plane cost map overlay.
+## Ground-plane cost map overlay with dual-layer blending.
 ##
-## Renders the unified 2D cost grid as a red gradient:
-##   Cost 0:       transparent (free space)
-##   Cost 1-253:   red gradient (obstacle proximity)
-##   Cost 254:     bright red (lethal)
-##   Cost 255:     dark grey (unknown / unscanned)
+## Renders two cost grids as colored overlays:
+##   Robot-view (MSG_OBSERVATION_MAP / 0x04): RED channel
+##   God-view   (MSG_GOD_VIEW_COSTMAP / 0x06): BLUE channel
+##   Overlap (both nonzero): purple (red + blue)
 ##
-## Uses PackedByteArray bulk writes instead of per-pixel set_pixel()
-## for ~20x speedup on 200x200 grids.
+##   Cost 0 in both:   transparent (free space)
+##   Cost 1-254:       intensity proportional to cost
+##   Cost 255:         dark grey (unknown / unscanned)
 
 var _texture: ImageTexture
 var _initialized := false
 var _last_nx := 0
 var _last_ny := 0
 
+# Stored grid data (raw uint8 arrays, image-oriented: already transposed+flipped)
+var _robot_data: PackedByteArray  # nx*ny uint8, from robot-view
+var _god_data: PackedByteArray    # nx*ny uint8, from god-view
+var _robot_nx := 0
+var _robot_ny := 0
+var _god_nx := 0
+var _god_ny := 0
+
+# Spatial metadata (from whichever grid arrived last — they should match)
+var _origin_x := 0.0
+var _origin_y := 0.0
+var _voxel_size := 0.05
+var _grid_nx := 0
+var _grid_ny := 0
 
 
 func _ready() -> void:
-	# Create quad mesh at ground level
 	var quad := QuadMesh.new()
 	quad.size = Vector2(20.0, 20.0)
 	quad.orientation = PlaneMesh.FACE_Y
 	mesh = quad
 
-	# Position slightly above ground to avoid z-fighting
 	position = Vector3(0, 0.01, 0)
 
 	var mat := StandardMaterial3D.new()
@@ -36,7 +48,7 @@ func _ready() -> void:
 
 
 func update_observation_map(data: PackedByteArray) -> void:
-	# Header: u16x2 (nx, ny), f32x3 (origin_x, origin_y, voxel_size)
+	## Receive robot-view costmap (MSG_OBSERVATION_MAP / 0x04).
 	if data.size() < 16:
 		return
 
@@ -48,45 +60,115 @@ func update_observation_map(data: PackedByteArray) -> void:
 	var voxel_size := data.decode_float(ofs); ofs += 4
 
 	var n_cells: int = nx * ny
-	_update_cost_map(data, ofs, nx, ny, n_cells, origin_x, origin_y, voxel_size)
+	if data.size() < ofs + n_cells:
+		return
+
+	_robot_data = data.slice(ofs, ofs + n_cells)
+	_robot_nx = nx
+	_robot_ny = ny
+	_origin_x = origin_x
+	_origin_y = origin_y
+	_voxel_size = voxel_size
+	_grid_nx = nx
+	_grid_ny = ny
+
+	_rebuild_combined()
 
 
-func _update_cost_map(data: PackedByteArray, ofs: int, nx: int, ny: int,
-		n_cells: int, origin_x: float, origin_y: float, voxel_size: float) -> void:
-	## Render uint8 cost grid as red gradient overlay.
+func update_god_view_costmap(data: PackedByteArray) -> void:
+	## Receive god-view costmap (MSG_GOD_VIEW_COSTMAP / 0x06).
+	if data.size() < 16:
+		return
+
+	var ofs := 0
+	var nx: int = data.decode_u16(ofs); ofs += 2
+	var ny: int = data.decode_u16(ofs); ofs += 2
+	var origin_x := data.decode_float(ofs); ofs += 4
+	var origin_y := data.decode_float(ofs); ofs += 4
+	var voxel_size := data.decode_float(ofs); ofs += 4
+
+	var n_cells: int = nx * ny
+	if data.size() < ofs + n_cells:
+		return
+
+	_god_data = data.slice(ofs, ofs + n_cells)
+	_god_nx = nx
+	_god_ny = ny
+	_origin_x = origin_x
+	_origin_y = origin_y
+	_voxel_size = voxel_size
+	_grid_nx = nx
+	_grid_ny = ny
+
+	_rebuild_combined()
+
+
+func _rebuild_combined() -> void:
+	## Blend robot-view (red) and god-view (blue) into RGBA image.
+	var nx := _grid_nx
+	var ny := _grid_ny
+	if nx == 0 or ny == 0:
+		return
+
+	var n_cells: int = nx * ny
+	var has_robot := (_robot_data.size() == n_cells)
+	var has_god := (_god_data.size() == n_cells)
+
+	if not has_robot and not has_god:
+		return
+
 	var pixel_data := PackedByteArray()
 	pixel_data.resize(n_cells * 4)
 
 	for i in n_cells:
-		var cost: int = data[ofs + i]
+		var rc: int = _robot_data[i] if has_robot else 0
+		var gc: int = _god_data[i] if has_god else 0
 		var p: int = i * 4
-		if cost == 0:
-			# Free space: nearly transparent
-			pixel_data[p] = 0
-			pixel_data[p + 1] = 0
-			pixel_data[p + 2] = 0
-			pixel_data[p + 3] = 13  # alpha ~0.05
-		elif cost == 255:
-			# Unknown: dark grey
+
+		# Both unknown (255) -> grey
+		var robot_unknown := (rc == 255)
+		var god_unknown := (gc == 255)
+
+		if robot_unknown and god_unknown:
 			pixel_data[p] = 60
 			pixel_data[p + 1] = 60
 			pixel_data[p + 2] = 65
-			pixel_data[p + 3] = 102  # alpha 0.40
-		elif cost == 254:
-			# Lethal: bright red
-			pixel_data[p] = 255
+			pixel_data[p + 3] = 102
+		elif rc == 0 and gc == 0:
+			# Both free -> nearly transparent
+			pixel_data[p] = 0
 			pixel_data[p + 1] = 0
 			pixel_data[p + 2] = 0
-			pixel_data[p + 3] = 179  # alpha 0.70
+			pixel_data[p + 3] = 13
 		else:
-			# Gradient: red proportional to cost
-			var t: float = float(cost) / 254.0
-			pixel_data[p] = int(t * 255.0)      # R
-			pixel_data[p + 1] = 0                 # G
-			pixel_data[p + 2] = 0                 # B
-			pixel_data[p + 3] = int(38.0 + t * 140.0)  # alpha 0.15..0.70
+			# Compute red (robot-view) and blue (god-view) intensities
+			var r_val: int = 0
+			var r_alpha: int = 13
+			if not robot_unknown and rc > 0:
+				var t: float = float(rc) / 254.0
+				r_val = int(t * 255.0)
+				r_alpha = int(38.0 + t * 140.0)
+			elif robot_unknown:
+				# Unknown in robot-view only -> grey contribution
+				r_val = 60
+				r_alpha = 102
 
-	_apply_image(nx, ny, pixel_data, origin_x, origin_y, voxel_size)
+			var b_val: int = 0
+			var b_alpha: int = 13
+			if not god_unknown and gc > 0:
+				var t: float = float(gc) / 254.0
+				b_val = int(t * 255.0)
+				b_alpha = int(38.0 + t * 140.0)
+			elif god_unknown:
+				b_val = 65
+				b_alpha = 102
+
+			pixel_data[p] = r_val      # R
+			pixel_data[p + 1] = 0      # G
+			pixel_data[p + 2] = b_val  # B
+			pixel_data[p + 3] = maxi(r_alpha, b_alpha)
+
+	_apply_image(nx, ny, pixel_data, _origin_x, _origin_y, _voxel_size)
 
 
 func _apply_image(nx: int, ny: int, pixel_data: PackedByteArray,

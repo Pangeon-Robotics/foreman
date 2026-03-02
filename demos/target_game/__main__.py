@@ -60,6 +60,7 @@ class GameRunResult:
     occupancy_accuracy: dict | None = None  # IoU/precision/recall from test_occupancy
     tsdf: object | None = None
     scene_path: str | None = None
+    scores: dict | None = None  # Surface/Cost/Router F1 (god vs robot TSDF)
 
 
 def _expand_v9_genome(params: dict) -> dict:
@@ -301,6 +302,46 @@ def _find_obstacle_geoms(scene_path: Path) -> list[dict]:
     return obstacles
 
 
+def _cleanup_stale_data(domain: int | None = None) -> None:
+    """Remove stale temp files and processes from previous runs.
+
+    Clears god-view overlays, DWA arc files, and DDS session files so the
+    firmware viewer starts clean (no leftover blue/red overlays from prior
+    --god runs obscuring the scene).
+    """
+    import glob
+    import subprocess
+
+    # Kill zombie firmware processes and wait for DDS resources to release
+    subprocess.run(["pkill", "-9", "-f", "firmware_sim.py"],
+                   capture_output=True)
+    import time
+    time.sleep(1.0)
+
+    # Remove stale temp files (firmware viewer renders these if they exist)
+    for pattern in [
+        "/tmp/god_view_costmap.bin",
+        "/tmp/god_view_tsdf.bin",
+        "/tmp/god_view_path.bin",
+        "/tmp/robot_view_tsdf.bin",
+        "/tmp/robot_view_costmap.bin",
+        "/tmp/dwa_best_arc.bin",
+        "/tmp/god_view_tsdf_test.bin",
+    ]:
+        for f in glob.glob(pattern):
+            try:
+                _os.remove(f)
+            except OSError:
+                pass
+
+    # Remove stale DDS session files
+    for f in glob.glob("/tmp/robo_sessions/*.json"):
+        try:
+            _os.remove(f)
+        except OSError:
+            pass
+
+
 def run_game(args) -> GameRunResult:
     """Run target game with given configuration. Returns structured result.
 
@@ -315,6 +356,9 @@ def run_game(args) -> GameRunResult:
         max_dist (float): Max target spawn distance (default 6.0)
         angle_range: Override target spawning angle range
     """
+    # Clear stale data from previous runs before anything else
+    _cleanup_stale_data(getattr(args, 'domain', None))
+
     print(f"Starting target game: robot={args.robot}, targets={args.targets}")
 
     # Configure game constants for this robot (before genome, so genome overrides)
@@ -404,6 +448,7 @@ def run_game(args) -> GameRunResult:
     # checking (foreman referee, not robot sensors).
     obstacle_bodies = _find_obstacle_bodies(scene_path)
     track_bodies = ["target"] + obstacle_bodies
+    print(f"Scene: {scene_path} ({len(obstacle_bodies)} obstacles)")
 
     headless = getattr(args, 'headless', False)
     sim = SimulationManager(
@@ -515,6 +560,21 @@ def run_game(args) -> GameRunResult:
                     # 0° rays hit obstacles at z≈0.65 — must be inside costmap band.
                     # Default costmap_z_hi=0.55 misses all horizontal hits.
                     pcfg.costmap_z_hi = 0.80
+
+                    # Align robot-view TSDF with god-view: instant convergence
+                    # (lo_hit=3.0 crosses the 2.0 surface threshold in one hit),
+                    # permanent persistence (no decay), and matched grid geometry.
+                    # This makes the robot TSDF directly comparable to god-view
+                    # for Surface/Cost/Router F1 scoring.
+                    pcfg.tsdf_log_odds_hit = 3.0
+                    pcfg.tsdf_log_odds_max = 5.0
+                    pcfg.tsdf_log_odds_free = 0.25
+                    pcfg.tsdf_truncation = 0.5
+                    pcfg.tsdf_xy_extent = 10.0
+                    pcfg.tsdf_depth_extension = 5
+                    pcfg.tsdf_decay_rate = 0.0
+                    pcfg.tsdf_unknown_cell_cost = 0.5
+
                     perception = PerceptionPipeline(odometry, pcfg)
                     # B2 LiDAR at z≈0.645m. -7° channel at 3.5m→z=0.22.
                     # 0.20 gives ~3.5m detection range while rejecting
@@ -525,7 +585,9 @@ def run_game(args) -> GameRunResult:
                     game._perception = perception
                     print(f"TSDF active: ±{pcfg.tsdf_xy_extent}m, "
                           f"voxel={pcfg.tsdf_voxel_size}m, "
-                          f"output={pcfg.tsdf_output_resolution}m")
+                          f"output={pcfg.tsdf_output_resolution}m, "
+                          f"lo_hit={pcfg.tsdf_log_odds_hit}, "
+                          f"decay={pcfg.tsdf_decay_rate}")
 
                     # Wire up curvature-based DWA planner
                     game.set_dwa_planner(CurvatureDWAPlanner(pcfg))
@@ -576,7 +638,7 @@ def run_game(args) -> GameRunResult:
                 print(f"God-view costmap: {gv_grid.shape}, "
                       f"{int(_np.sum(gv_grid == 254))} obstacle cells")
 
-        # God-view costmap overlay in MuJoCo viewer
+        # God-view costmap overlay in MuJoCo viewer (headed only)
         if getattr(args, 'god', False) and obstacle_bodies and not args.headless:
             from .test_costmap_compare import build_god_view_costmap
             from layer_6.config.defaults import load_config as _load_pcfg
@@ -610,14 +672,9 @@ def run_game(args) -> GameRunResult:
             game.set_god_view_costmap(gv_grid, gv_meta)
             game._god_view_path_file = "/tmp/god_view_path.bin"
 
-            # God-view TSDF: perfect LiDAR → TSDF from known geometry.
-            # Remove stale temp file from prior runs (renderer caches by mtime).
-            import os as _os
-            _tsdf_tmp = "/tmp/god_view_tsdf.bin"
-            try:
-                _os.unlink(_tsdf_tmp)
-            except OSError:
-                pass
+        # God-view TSDF: perfect LiDAR → TSDF from known geometry.
+        # Only created when --god is passed (scoring + blue overlay).
+        if getattr(args, 'god', False) and obstacle_bodies:
             from .god_tsdf import GodViewTSDF
             god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
             game._god_view_tsdf = god_tsdf
@@ -648,6 +705,41 @@ def run_game(args) -> GameRunResult:
             except Exception as e:
                 print(f"Warning: occupancy accuracy failed: {e}")
 
+        # Compute perception F1 scores (god TSDF vs robot TSDF)
+        scores = None
+        god_tsdf_obj = getattr(game, '_god_view_tsdf', None)
+        robot_tsdf_obj = perception._tsdf if perception is not None else None
+        if god_tsdf_obj is not None and robot_tsdf_obj is not None:
+            try:
+                from .scores import compute_surface_f1, compute_cost_f1, compute_router_f1
+                from layer_6.config.defaults import load_config as _load_score_cfg
+                _scfg = _load_score_cfg(args.robot)
+                _z_lo = getattr(_scfg, 'costmap_z_lo', 0.05)
+                _z_hi = 0.80  # match the costmap_z_hi override above
+                _res = getattr(_scfg, 'tsdf_output_resolution', 0.05)
+
+                scores = {
+                    "surface": compute_surface_f1(god_tsdf_obj._tsdf, robot_tsdf_obj, _res),
+                    "cost": compute_cost_f1(god_tsdf_obj._tsdf, robot_tsdf_obj, _z_lo, _z_hi, _res),
+                }
+                # Router F1: use truth trail start → end as A* endpoints
+                trail = list(game.truth_trail)
+                if len(trail) >= 2:
+                    dx = trail[-1][0] - trail[0][0]
+                    dy = trail[-1][1] - trail[0][1]
+                    if (dx * dx + dy * dy) > 1.0:
+                        scores["router"] = compute_router_f1(
+                            god_tsdf_obj._tsdf, robot_tsdf_obj,
+                            trail[0], trail[-1], _z_lo, _z_hi, _res)
+                if "router" not in scores:
+                    scores["router"] = {"f1": 0.0, "precision": 0.0, "recall": 0.0,
+                                        "god_path_m": 0.0, "robot_path_m": 0.0}
+                print(f"\nScores: surface={scores['surface']['f1']:.1f} "
+                      f"cost={scores['cost']['f1']:.1f} "
+                      f"router={scores['router']['f1']:.1f}")
+            except Exception as e:
+                print(f"Warning: score computation failed: {e}")
+
         return GameRunResult(
             stats=stats,
             telemetry_path=telem_path,
@@ -658,6 +750,7 @@ def run_game(args) -> GameRunResult:
             occupancy_accuracy=occ_accuracy,
             tsdf=perception._tsdf if perception is not None else None,
             scene_path=str(scene_path),
+            scores=scores,
         )
     finally:
         # Shut down perception callback to prevent lingering DDS threads

@@ -11,12 +11,16 @@ signal tsdf_received(data: PackedByteArray)
 signal path_received(data: PackedByteArray)
 signal observation_map_received(data: PackedByteArray)
 signal obstacles_received(data: PackedByteArray)
+signal god_view_costmap_received(data: PackedByteArray)
+signal god_view_path_received(data: PackedByteArray)
 
 const MSG_ROBOT_STATE := 0x01
 const MSG_TSDF_OCCUPIED := 0x02
 const MSG_ASTAR_PATH := 0x03
 const MSG_OBSERVATION_MAP := 0x04
 const MSG_OBSTACLES := 0x05
+const MSG_GOD_VIEW_COSTMAP := 0x06
+const MSG_GOD_VIEW_PATH := 0x07
 
 var _tcp := StreamPeerTCP.new()
 var _buf := PackedByteArray()
@@ -96,6 +100,10 @@ func _parse_messages() -> void:
 				observation_map_received.emit(payload)
 			MSG_OBSTACLES:
 				obstacles_received.emit(payload)
+			MSG_GOD_VIEW_COSTMAP:
+				god_view_costmap_received.emit(payload)
+			MSG_GOD_VIEW_PATH:
+				god_view_path_received.emit(payload)
 
 		# Consume this message
 		_buf = _buf.slice(frame_size)

@@ -147,18 +147,18 @@ class DWANavigatorMixin:
                 nav_x, nav_y, nav_yaw, target, dist,
                 heading_err, goal_behind, use_waypoint)
 
-        # Close-range ground-truth override: SLAM yaw drift causes the
-        # robot to orbit the target instead of converging.  Use ground-
-        # truth pose for the final 2m so heading control is accurate.
-        # (Waypoint planning and DWA above still use SLAM — correct for
-        # path planning; only the approach control switches to truth.)
+        # Ground-truth heading override: SLAM yaw drift (3-13m on these
+        # scenarios) makes nav heading useless — robot oscillates ±60°
+        # heading error and never converges.  Use ground-truth for all
+        # heading control (speed modulation, TIP decisions, wz).
+        # DWA costmap queries and A* still use SLAM (correct for local
+        # obstacle avoidance); only the approach heading switches to truth.
         truth_dist = math.hypot(target.x - x_truth, target.y - y_truth)
-        if truth_dist < 2.0:
-            dist = truth_dist
-            heading_err = _normalize_angle(
-                math.atan2(target.y - y_truth, target.x - x_truth)
-                - yaw_truth)
-            goal_behind = abs(heading_err) > math.pi / 2
+        dist = truth_dist
+        heading_err = _normalize_angle(
+            math.atan2(target.y - y_truth, target.x - x_truth)
+            - yaw_truth)
+        goal_behind = abs(heading_err) > math.pi / 2
 
         # Close-range approach: bypass DWA oscillation pipeline
         dwa_feas_now = (self._last_dwa_result.n_feasible
@@ -183,15 +183,29 @@ class DWANavigatorMixin:
         """
         _dwa_feas_for_wp = (self._last_dwa_result.n_feasible
                             if self._last_dwa_result else 41)
-        # Hysteresis: once in waypoint mode, stay until close AND clear
+        # Suppress waypoints when heading to target is roughly correct
+        # (< 40deg error) — A* replanning causes heading oscillation that
+        # halves forward speed.  Only use waypoints when obstacles block
+        # the direct path AND the heading is significantly off.
+        direct_err = abs(target.heading_error(nav_x, nav_y, nav_yaw))
+        _dwa_score = (self._last_dwa_result.score
+                      if self._last_dwa_result else 1.0)
+        # Engage waypoints when any obstacles narrow the path (feas < 40)
+        # OR when DWA best arc barely points toward target (score < 0.20).
+        # At feas=35-39 the robot can still get stuck walking parallel to
+        # obstacle rows — A* routing finds gaps and avoids orbiting.
+        obstacles_present = (_dwa_feas_for_wp < 40
+                             or _dwa_score < 0.20)
         _wp_latch = getattr(self, '_use_waypoint_latch', False)
         if _wp_latch:
-            # Exit waypoint mode only when close to target and path is clear
             use_waypoint = (self._current_waypoint is not None
-                            and (dist > 1.0 or _dwa_feas_for_wp < 30))
+                            and obstacles_present
+                            and direct_err > 0.5)  # >~29deg
         else:
             use_waypoint = (self._current_waypoint is not None
-                            and (dist > 1.5 or _dwa_feas_for_wp < 30))
+                            and dist > 1.5
+                            and obstacles_present
+                            and direct_err > 0.7)  # >~40deg
         self._use_waypoint_latch = use_waypoint
         if use_waypoint:
             wp_dx = self._current_waypoint[0] - nav_x

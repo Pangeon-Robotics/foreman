@@ -20,6 +20,8 @@ MSG_TSDF_OCCUPIED = 0x02
 MSG_ASTAR_PATH = 0x03
 MSG_OBSERVATION_MAP = 0x04
 MSG_OBSTACLES = 0x05
+MSG_GOD_VIEW_COSTMAP = 0x06
+MSG_GOD_VIEW_PATH = 0x07
 
 # DDS→MuJoCo joint permutation (FR,FL,RR,RL → FL,FR,RL,RR)
 _DDS_TO_MUJOCO = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
@@ -260,6 +262,35 @@ class DebugServer:
         for x, y in path_points:
             buf += struct.pack('<ff', x, y)
         self._send(MSG_ASTAR_PATH, buf)
+
+    def send_god_view_costmap(
+        self,
+        cost_grid: np.ndarray,
+        origin_x: float,
+        origin_y: float,
+        voxel_size: float,
+    ) -> None:
+        """Pack and send god-view cost map (0x06). Same format as send_costmap_2d."""
+        if not self.has_client:
+            return
+        nx, ny = cost_grid.shape
+        header = struct.pack(
+            '<2H 3f',
+            nx, ny,
+            origin_x, origin_y, voxel_size,
+        )
+        img = np.ascontiguousarray(np.flipud(cost_grid.T))
+        self._send(MSG_GOD_VIEW_COSTMAP, header + img.tobytes())
+
+    def send_god_view_path(self, path_points: list[tuple[float, float]]) -> None:
+        """Pack and send GOD_VIEW_PATH (0x07). Same format as send_path."""
+        if not self.has_client:
+            return
+        n = len(path_points)
+        buf = struct.pack('<H', n)
+        for x, y in path_points:
+            buf += struct.pack('<ff', x, y)
+        self._send(MSG_GOD_VIEW_PATH, buf)
 
     def send_obstacles(self, obstacles: list[dict]) -> None:
         """Pack and send OBSTACLES (0x05). Ground-truth obstacle volumes.

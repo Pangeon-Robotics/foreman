@@ -180,9 +180,14 @@ def _sample_gt_surfaces(scene_xml_path: str,
 def _extract_tsdf_surface(tsdf) -> np.ndarray:
     """Extract TSDF surface voxels as (N, 3) world-frame coordinates.
 
+    Uses the default log-odds threshold (_OCC_LO_THRESHOLD = 2.0),
+    matching the costmap occupancy threshold. Includes surface history
+    so voxels confirmed during the run but later evicted still count
+    toward 3DS metrics.
+
     Returns (N, 3) float32 array of world-frame voxel centers.
     """
-    return tsdf.get_surface_voxels()
+    return tsdf.get_surface_voxels(include_history=True)
 
 
 def compute_3ds_v2(tsdf, scene_xml_path: str,
@@ -259,6 +264,134 @@ def compute_3ds_v2(tsdf, scene_xml_path: str,
         "n_tsdf_surface": n_tsdf,
         "n_gt_surface": n_gt,
         "n_converged": n_converged,
+    }
+
+
+def compute_3ds_god(tsdf, scene_xml_path: str,
+                    max_dist: float = 0.5,
+                    completeness_tol: float = 0.05,
+                    sample_spacing: float = 0.01,
+                    gt_z_range: tuple[float, float] | None = None) -> dict:
+    """God-mode 3DS: squared-distance penalty with omniscient GT.
+
+    Uses scene XML geometry as perfect ground truth (no sensor noise,
+    no occlusion). For each TSDF surface voxel, measures squared distance
+    to the nearest GT surface point. Phantoms far from any real surface
+    are punished aggressively via dist**2.
+
+    Parameters
+    ----------
+    tsdf : TSDF
+    scene_xml_path : str
+        Path to scene XML with obstacle definitions.
+    max_dist : float
+        Distance cap in meters. Voxels beyond this get maximum penalty.
+        Default 0.5m.
+    completeness_tol : float
+        A GT surface point is "detected" if a TSDF voxel exists within
+        this distance. Default 5cm.
+    sample_spacing : float
+        GT surface sampling density. Default 1cm.
+    gt_z_range : tuple[float, float], optional
+        Filter GT surface points to this Z range (z_lo, z_hi). Points
+        outside this range are excluded from completeness scoring since
+        the LiDAR min_z filter prevents them from ever being detected.
+        Precision and phantom scoring still use the full unfiltered GT
+        (a TSDF voxel near an undetectable GT face is still not phantom).
+
+    Returns
+    -------
+    dict with keys:
+        score : float — 0-100 composite score (100 = perfect)
+        precision_score : float — 0-100, surface accuracy via 1 - mean(dist^2)/max_dist^2
+        completeness_pct : float — % of GT surface points detected
+        phantom_penalty : float — 0-100, mean squared distance of phantom voxels
+        n_tsdf : int — number of TSDF surface voxels
+        n_gt : int — number of GT surface points (after Z filter)
+    """
+    from scipy.spatial import cKDTree
+
+    tsdf_surface = _extract_tsdf_surface(tsdf)
+    gt_surface = _sample_gt_surfaces(scene_xml_path, sample_spacing)
+
+    # Precision/phantom use full GT (unfiltered) — a TSDF voxel near
+    # a low-Z GT face is still a real surface, not a phantom.
+    gt_surface_full = gt_surface
+
+    # Completeness uses Z-filtered GT — surfaces below the LiDAR min_z
+    # can never be detected, so they shouldn't penalize completeness.
+    if gt_z_range is not None and len(gt_surface) > 0:
+        z_lo, z_hi = gt_z_range
+        z_mask = (gt_surface[:, 2] >= z_lo) & (gt_surface[:, 2] <= z_hi)
+        gt_surface_filtered = gt_surface[z_mask]
+    else:
+        gt_surface_filtered = gt_surface
+
+    n_tsdf = len(tsdf_surface)
+    n_gt = len(gt_surface_filtered)
+
+    n_gt_full = len(gt_surface_full)
+
+    if n_tsdf == 0 and n_gt == 0:
+        return {"score": 100.0, "precision_score": 100.0,
+                "completeness_pct": 100.0, "phantom_penalty": 0.0,
+                "n_tsdf": 0, "n_gt": 0}
+    if n_gt_full == 0:
+        return {"score": 0.0, "precision_score": 0.0,
+                "completeness_pct": 100.0, "phantom_penalty": 100.0,
+                "n_tsdf": n_tsdf, "n_gt": 0}
+    if n_tsdf == 0:
+        return {"score": 0.0, "precision_score": 100.0,
+                "completeness_pct": 0.0, "phantom_penalty": 0.0,
+                "n_tsdf": 0, "n_gt": n_gt}
+
+    # Full GT tree for precision and phantom scoring
+    gt_tree_full = cKDTree(gt_surface_full)
+    tsdf_tree = cKDTree(tsdf_surface)
+
+    # (a) Precision: for each TSDF voxel, squared distance to nearest GT
+    #     Uses FULL GT — a voxel near any GT face (even low-Z) is accurate.
+    tsdf_to_gt, _ = gt_tree_full.query(tsdf_surface, k=1)
+    capped = np.minimum(tsdf_to_gt, max_dist)
+    mean_sq = float(np.mean(capped ** 2))
+    precision_score = max(0.0, 100.0 * (1.0 - mean_sq / (max_dist ** 2)))
+
+    # (b) Completeness: fraction of Z-filtered GT points with TSDF nearby.
+    #     Only counts GT points the LiDAR can actually detect.
+    if n_gt > 0:
+        gt_filtered_tree_dists, _ = tsdf_tree.query(gt_surface_filtered, k=1)
+        completeness_pct = float(
+            np.sum(gt_filtered_tree_dists < completeness_tol) / n_gt * 100.0)
+    else:
+        completeness_pct = 0.0
+
+    # (c) Phantom penalty: mean squared distance of phantom voxels
+    #     (TSDF voxels with no FULL GT within completeness_tol)
+    phantom_mask = tsdf_to_gt > completeness_tol
+    n_phantom = int(np.sum(phantom_mask))
+    if n_phantom > 0:
+        phantom_dists = np.minimum(tsdf_to_gt[phantom_mask], max_dist)
+        phantom_penalty = float(
+            np.mean(phantom_dists ** 2) / (max_dist ** 2) * 100.0)
+    else:
+        phantom_penalty = 0.0
+
+    # Composite: weighted combination
+    #   50% precision (how accurate are detections)
+    #   30% completeness (how much GT is covered)
+    #   20% phantom penalty (spurious detections)
+    score = (0.50 * precision_score
+             + 0.30 * completeness_pct
+             - 0.20 * phantom_penalty)
+    score = max(0.0, min(100.0, score))
+
+    return {
+        "score": round(score, 1),
+        "precision_score": round(precision_score, 1),
+        "completeness_pct": round(completeness_pct, 1),
+        "phantom_penalty": round(phantom_penalty, 1),
+        "n_tsdf": n_tsdf,
+        "n_gt": n_gt,
     }
 
 

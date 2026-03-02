@@ -35,9 +35,16 @@ class ScenarioDefinition:
     angle_range: tuple[float, float] | None = None  # override full_circle logic
     pass_criteria: dict = field(default_factory=dict)
     spawn_fn_factory: Callable[[int], Callable] | None = None  # (seed) -> spawn_fn
+    generate_scene: Callable[[str, int], str] | None = None  # (robot, seed) -> path
 
-    def scene_path(self, robot: str) -> Path:
-        """Resolve absolute path to the scene XML for the given robot."""
+    def scene_path(self, robot: str, obstacle_seed: int | None = None) -> Path:
+        """Resolve absolute path to the scene XML for the given robot.
+
+        If generate_scene is set and obstacle_seed is provided, generates a
+        randomized scene XML and returns its path.
+        """
+        if self.generate_scene is not None and obstacle_seed is not None:
+            return Path(self.generate_scene(robot, obstacle_seed))
         return _ASSETS / robot / self.scene_xml
 
 
@@ -102,6 +109,9 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
         spawn_fn_factory=lambda seed: _make_backforth_spawn_fn(
             seed, field_near_x=2.0, field_far_x=9.0, y_range=(-2.0, 2.0),
         ),
+        generate_scene=lambda robot, seed: __import__(
+            'foreman.demos.target_game.scene_gen', fromlist=['generate_scattered_scene']
+        ).generate_scattered_scene(robot, seed),
         pass_criteria={
             "target_success_rate": 0.25,  # at least 1 of 4 (back-and-forth is hard)
             "max_falls": 3,

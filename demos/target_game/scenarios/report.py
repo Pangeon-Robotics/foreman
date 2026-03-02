@@ -23,7 +23,7 @@ def print_report(results: dict) -> None:
     # Header
     header = (f"{'Scenario':<15} {'Targets':>8} {'Success':>8} {'Falls':>6} "
               f"{'ATO':>6} {'SLAM Drift':>11} {'DWA Feas':>9} {'3DS':>12} "
-              f"{'Critics':>10} {'Result':>8}")
+              f"{'3DS-G':>6} {'Critics':>10} {'Result':>8}")
     print(header)
     print("-" * len(header))
 
@@ -65,6 +65,7 @@ def print_report(results: dict) -> None:
 
         # 3DS v2: adherence/completeness/phantom
         occ_str = "n/a"
+        god_str = "n/a"
         occ = gr.occupancy_accuracy
         if occ is not None:
             if 'adherence_mm' in occ:
@@ -74,6 +75,9 @@ def print_report(results: dict) -> None:
                 occ_str = f"{adh:.0f}mm/{cpl:.0f}%/{phn:.0f}%"
             elif 'iou' in occ:
                 occ_str = f"{occ['iou']:.2f}/{occ['precision']:.2f}"
+            god = occ.get('god')
+            if god is not None:
+                god_str = f"{god['score']:.0f}"
 
         # Critics summary
         n_passed = sum(1 for c in result.critic_results if c.passed)
@@ -85,7 +89,7 @@ def print_report(results: dict) -> None:
 
         print(f"{name:<15} {targets_str:>8} {success_str:>8} {falls_str:>6} "
               f"{ato_str:>6} {slam_str:>11} {dwa_str:>9} {occ_str:>12} "
-              f"{critics_str:>10} {result_str:>8}")
+              f"{god_str:>6} {critics_str:>10} {result_str:>8}")
 
     # Detailed failures
     failures = [

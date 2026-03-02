@@ -227,28 +227,10 @@ class PerceptionPipeline:
         self._last_cloud_time: float = 0.0
         self._build_times: list[float] = []
 
-        # DWA obstacle memory: retains obstacle cells after TSDF clearing
-        # erases them near the robot.  Decay 0.99/frame at 20Hz ≈ 6s
-        # persistence above threshold 0.3.
-        # Memory grid at output resolution (not internal 1cm, which would
-        # be enormous).
-        tsdf = self._tsdf
-        out_res = getattr(perception_config, 'tsdf_output_resolution', 0.05)
-        mem_nx = int(round(2 * tsdf.xy_extent / out_res))
-        mem_ny = mem_nx
-        self._mem_voxel_size = out_res
-        self._obstacle_memory = np.zeros(
-            (mem_nx, mem_ny), dtype=np.float32)
-        self._mem_nx = mem_nx
-        self._mem_ny = mem_ny
-
-        # Safety valve: consecutive feas=0 counter.  When DWA reports
-        # n_feasible==0 for too many replans, stale memory cells are the
-        # likely cause — clear them so the robot can move again.
+        # Safety valve: consecutive feas=0 counter.  When DWA can't find
+        # feasible arcs for 15+ replans, clear local TSDF voxels as
+        # contradicting evidence (robot is here, space should be free).
         self._feas_zero_count = 0
-        # Blanking countdown: suppress memory refill for N frames after
-        # safety valve fires, so clearing isn't immediately undone.
-        self._memory_blank_frames = 0
         # Force-feasible flag: when True, next DWA replan should
         # guarantee at least one feasible arc (clears after read).
         self._force_feasible = False
@@ -258,8 +240,12 @@ class PerceptionPipeline:
         # loop.  In headless mode, firmware can flood scans at 50-100Hz
         # wall time.  Time-based throttle limits processing to max 5Hz
         # wall time regardless of incoming rate.
-        self._scan_min_interval = 0.20  # seconds (prevents GIL starvation)
+        self._scan_min_interval = getattr(
+            perception_config, 'scan_min_interval', 0.50)  # cooldown gap AFTER build (not period)
         self._scan_last_time = 0.0
+
+        # Shutdown flag: when True, DDS callback exits immediately.
+        self._shutdown = False
 
         # Full 6-DOF IMU pose (set by game tick, read by DDS callback)
         self._imu_lock = threading.Lock()
@@ -281,6 +267,10 @@ class PerceptionPipeline:
         self._CostmapQuery = CostmapQuery
         self._PointCloud = PointCloud
         self._Pose2D = Pose2D
+
+    def shutdown(self) -> None:
+        """Stop the DDS callback from processing new scans."""
+        self._shutdown = True
 
     def set_imu_pose(self, x: float, y: float, z: float,
                      roll: float, pitch: float, yaw: float) -> None:
@@ -355,7 +345,7 @@ class PerceptionPipeline:
     # channels (-15°, -7°) at 2-4m range hit ground at z=0.13-0.25m.
     # Raising from 0.10 to 0.25 cuts most ground-ring false positives
     # while preserving obstacle base detection above 0.25m.
-    _MIN_WORLD_Z = 0.25
+    _MIN_WORLD_Z = 0.30
 
     def on_point_cloud(self, msg) -> None:
         """DDS callback: new point cloud received.
@@ -368,6 +358,9 @@ class PerceptionPipeline:
         the sensor's body-frame offset (LiDAR is 0.34m forward, 0.18m above
         body center on B2).
         """
+        if self._shutdown:
+            return
+
         # Time-based throttle: skip scans that arrive too fast (wall time).
         # In headless mode, firmware floods scans at 50-100Hz wall time.
         # TSDF integration (~80ms) would starve the control loop.
@@ -375,7 +368,10 @@ class PerceptionPipeline:
         if self._scan_min_interval > 0:
             if now - self._scan_last_time < self._scan_min_interval:
                 return
-            self._scan_last_time = now
+            # Note: last_time is set AFTER build completes (_scan_finish_time)
+            # so the interval is a cooldown gap, not a period.  This guarantees
+            # the control loop gets at least scan_min_interval of GIL time
+            # between builds.
 
         t0 = now
 
@@ -439,11 +435,10 @@ class PerceptionPipeline:
             if len(pts_world) == 0:
                 return
 
-        # Subsample: full scans have 1500-2000 points.
-        # Hit-only integration is O(N) so 250 points is fast (<5ms).
-        if len(pts_world) > 250:
-            idx = np.random.choice(len(pts_world), 250, replace=False)
-            pts_world = pts_world[idx]
+        # No subsampling: hit-only integration is O(N), full scans
+        # (~2000 pts) take <15ms.  TSDF decay (0.25/scan) requires
+        # ~2 hits/voxel/scan for net convergence — subsampling below
+        # 1000 causes net decay and near-zero completeness.
 
         # Sensor world position (for DDA ray origin — rays originate from
         # the sensor, not body center).
@@ -458,6 +453,12 @@ class PerceptionPipeline:
         self._tsdf.integrate_scan_world(
             pts_world, float(sensor_world[0]), float(sensor_world[1]),
         )
+
+        # Yield GIL between TSDF integration and cost grid build.
+        # The main thread needs the GIL at 100Hz to send GaitParams.
+        # Without this yield, 100-165ms continuous GIL hold causes
+        # gait parameter jumps when the main thread resumes.
+        time.sleep(0.005)
 
         tsdf = self._tsdf
 
@@ -477,6 +478,16 @@ class PerceptionPipeline:
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         self._build_times.append(elapsed_ms)
+        # Set last_time AFTER build completes so the interval is a cooldown
+        # gap that guarantees the control loop GIL time between builds.
+        self._scan_last_time = time.monotonic()
+        if elapsed_ms > 150:
+            n = len(self._build_times)
+            cg_ms = getattr(self, '_last_cg_ms', 0)
+            astar_ms = getattr(self, '_last_astar_ms', 0)
+            print(f"  [perc] build#{n} {elapsed_ms:.0f}ms "
+                  f"(cg={cg_ms:.0f} astar={astar_ms:.0f}) "
+                  f"chunks={self._tsdf.n_chunks}")
 
     # ------------------------------------------------------------------
     # Cost grid builder
@@ -492,14 +503,15 @@ class PerceptionPipeline:
 
         The TSDF cost grid (EDT-based) feeds both DWA and A* directly.
         """
-        from scipy.ndimage import binary_dilation, distance_transform_edt
-
         out_res = getattr(self._cfg, 'tsdf_output_resolution', 0.05)
         truncation = self._cfg.tsdf_truncation
 
         # Get cost grid from TSDF (handles projection + EDT)
+        _t_cg0 = time.monotonic()
         cost_u8, meta = tsdf.get_world_cost_grid(
             tsdf.costmap_z_lo, tsdf.costmap_z_hi, out_res)
+        _t_cg1 = time.monotonic()
+
         out_nx = meta['nx']
         out_ny = meta['ny']
         observed = meta.get('observed_mask')
@@ -528,20 +540,36 @@ class PerceptionPipeline:
             dwa_u8[dx_lo:dx_hi, dy_lo:dy_hi][dwa_fp] = 0
         self._dwa_cost_grid = dwa_u8
 
+        # Yield GIL before A* grid build
+        time.sleep(0.005)
+
         # --- A* cost grid: TSDF + inflation ---
-        # Inflate near-surface cells for safety margin, then re-run EDT.
-        occupied_seed = cost_u8 > 200  # cells very close to surfaces
-        if np.any(occupied_seed):
-            inflated = binary_dilation(occupied_seed, iterations=6)
-            dist_2d = distance_transform_edt(~inflated).astype(
-                np.float32) * vs
-        else:
-            dist_2d = np.full(
-                (out_nx, out_ny), out_nx * vs, dtype=np.float32)
-        astar_cost_f = 1.0 - np.clip(dist_2d / truncation, 0.0, 1.0)
-        astar_u8 = (astar_cost_f * 254).astype(np.uint8)
-        if observed is not None:
-            astar_u8[~observed] = 255
+        # A* inflation EDT (~65ms) is rate-limited to every 5th build.
+        # A* paths change slowly (waypoint update rate), so stale-by-4
+        # builds (~1s at 5Hz scan) is acceptable.
+        _t_a0 = time.monotonic()
+        if not hasattr(self, '_astar_build_counter'):
+            self._astar_build_counter = 0
+        self._astar_build_counter += 1
+        astar_changed = (not hasattr(self, '_astar_cache_id')
+                         or self._astar_build_counter % 5 == 0)
+        if astar_changed:
+            from scipy.ndimage import binary_dilation, distance_transform_edt
+            occupied_seed = cost_u8 > 200
+            if np.any(occupied_seed):
+                inflated = binary_dilation(occupied_seed, iterations=6)
+                dist_2d = distance_transform_edt(~inflated).astype(
+                    np.float32) * vs
+            else:
+                dist_2d = np.full(
+                    (out_nx, out_ny), out_nx * vs, dtype=np.float32)
+            astar_cost_f = 1.0 - np.clip(dist_2d / truncation, 0.0, 1.0)
+            astar_u8 = (astar_cost_f * 254).astype(np.uint8)
+            if observed is not None:
+                astar_u8[~observed] = 255
+            self._astar_base = astar_u8
+
+        astar_u8 = self._astar_base.copy()
 
         # A* robot footprint clearing (0.35m)
         astar_r = int(0.35 / vs)
@@ -554,6 +582,8 @@ class PerceptionPipeline:
             astar_fp = (aix - cx)**2 + (aiy - cy)**2 <= astar_r**2
             astar_u8[ax_lo:ax_hi, ay_lo:ay_hi][astar_fp] = 0
         self._world_cost_grid = astar_u8
+        self._last_cg_ms = (_t_cg1 - _t_cg0) * 1000
+        self._last_astar_ms = (time.monotonic() - _t_a0) * 1000
 
         self._world_cost_meta = {
             'origin_x': tsdf.origin_x, 'origin_y': tsdf.origin_y,
@@ -565,51 +595,42 @@ class PerceptionPipeline:
     def report_dwa_feas(self, n_feasible: int) -> None:
         """Report DWA feasibility count (called at 20Hz replan rate).
 
-        When n_feasible == 0 for 30+ consecutive replans (1.5s), clear
-        obstacle memory near the robot.  Stale memory cells are the most
-        common cause of prolonged feas=0 — the TSDF was correctly cleared
-        but memory retained phantom obstacles.  Clearing memory lets DWA
-        re-evaluate; if a real obstacle exists, TSDF will repopulate it
-        on the next LiDAR scan.
+        When n_feasible == 0 for 15+ consecutive replans (0.75s), clear
+        local TSDF voxels as contradicting evidence — the robot is
+        physically present at this location, so nearby obstacle voxels
+        are likely phantom.  If a real obstacle exists, the next LiDAR
+        scan will repopulate it instantly (lo_hit=3.0).
         """
         if n_feasible == 0:
             self._feas_zero_count += 1
             if self._feas_zero_count >= 15:
-                self._clear_memory_near_robot()
-                # Suppress memory refill for 10 frames (0.5s at 20Hz)
-                # so clearing isn't immediately undone by TSDF data.
-                self._memory_blank_frames = 10
+                self._clear_local_tsdf()
                 self._feas_zero_count = 0
         else:
             self._feas_zero_count = 0
 
-    def _clear_memory_near_robot(self) -> None:
-        """Clear obstacle memory AND the live body-frame costmap.
+    def _clear_local_tsdf(self) -> None:
+        """Clear TSDF voxels near robot (contradicting evidence).
 
-        Clears memory in a 2.5m radius, and directly zeroes the body-
-        frame costmap that DWA samples from.  Clearing _dwa_cost_grid
-        alone has a race condition with the LiDAR callback (which can
-        overwrite it before the next DWA replan).  Clearing the body-
-        frame costmap takes effect immediately.
+        The robot's presence at a location is evidence that the space
+        is traversable.  Clears log_odds and obs_count in all TSDF
+        chunks within 2.5m, then forces one feasible DWA arc.
         """
         tsdf = self._tsdf
-        vs = self._mem_voxel_size  # TSDF output resolution
         with self._imu_lock:
             rx, ry = self._imu_x, self._imu_y
-        cx = int((rx - tsdf.origin_x) / vs)
-        cy = int((ry - tsdf.origin_y) / vs)
-        r = int(2.5 / vs)  # 2.5m radius (covers DWA arc range)
-        x_lo = max(0, cx - r)
-        x_hi = min(self._mem_nx, cx + r + 1)
-        y_lo = max(0, cy - r)
-        y_hi = min(self._mem_ny, cy + r + 1)
-        if x_lo < x_hi and y_lo < y_hi:
-            ix, iy = np.ogrid[x_lo:x_hi, y_lo:y_hi]
-            mask = (ix - cx)**2 + (iy - cy)**2 <= r**2
-            self._obstacle_memory[x_lo:x_hi, y_lo:y_hi][mask] = 0.0
-        # Set override flag: next DWA replan should force at least
-        # one feasible arc, breaking the consecutive feas=0 count
-        # without blinding the robot to all obstacles.
+        cs = 16 * tsdf.voxel_size  # chunk side in meters
+        r2 = 2.5 * 2.5
+        for key, chunk in list(tsdf._chunks.items()):
+            cx, cy, cz = key
+            chunk_wx = (cx + 0.5) * cs + tsdf.origin_x
+            chunk_wy = (cy + 0.5) * cs + tsdf.origin_y
+            if (chunk_wx - rx)**2 + (chunk_wy - ry)**2 <= r2:
+                chunk.log_odds[:] = 0.0
+                chunk.obs_count[:] = 0
+                chunk.dirty = True
+                tsdf._occ_chunk_dirty.add(key)
+        tsdf._dirty = True
         self._force_feasible = True
 
     @property

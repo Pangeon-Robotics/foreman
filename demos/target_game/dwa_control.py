@@ -84,16 +84,15 @@ class DWAControlMixin:
         """
         dwa_feas = (self._last_dwa_result.n_feasible
                     if self._last_dwa_result else 999)
-        if (self._target_step_count % 200 == 0
+        if (self._target_step_count % 150 == 0
                 and self._target_step_count > 0):
             no_progress = dist >= self._stuck_check_dist - 0.3
             jammed = dwa_feas < 5 and no_progress
             blocked_fwd = (
                 self._smooth_dwa_fwd < 0.1
                 and no_progress
-                and getattr(self, '_prev_no_progress', False)
                 and not self._in_tip_mode)
-            # Prolonged stuck: 3 consecutive no-progress checks (6s)
+            # Prolonged stuck: 3 consecutive no-progress checks (4.5s)
             # catches DWA local minima where feas is moderate (10-25)
             # and smooth_dwa_fwd floor prevents blocked_fwd from firing.
             streak = getattr(self, '_no_progress_streak', 0)
@@ -102,16 +101,20 @@ class DWAControlMixin:
             else:
                 streak = 0
             self._no_progress_streak = streak
-            prolonged_stuck = (streak >= 3 and not self._in_tip_mode)
-            # Low-score stuck: score < 0.05 with no progress means
-            # the robot is against an obstacle. Trigger after just 1
-            # no-progress check (2s) instead of waiting for 3 (6s).
+            prolonged_stuck = (streak >= 3
+                              and not self._in_tip_mode
+                              and dwa_feas < 30)  # not stuck if open field
+            # Low-score stuck: score < 0.05 AND feas < 15 means
+            # the robot is pressed against an obstacle with few options.
+            # At feas >= 15 the robot has viable arcs — it's navigating,
+            # not stuck.
             low_score_stuck = (
                 no_progress
                 and self._last_dwa_result is not None
                 and self._last_dwa_result.score < 0.05
+                and dwa_feas < 15
                 and not self._in_tip_mode)
-            self._prev_no_progress = no_progress
+            # (prev_no_progress removed — blocked_fwd now triggers on first check)
             if jammed or blocked_fwd or prolonged_stuck or low_score_stuck:
                 self._stuck_recovery_countdown = 100  # 1s at 100Hz
                 self._no_progress_streak = 0
@@ -250,9 +253,12 @@ class DWAControlMixin:
                     # (distinguishes "open field, goal sideways" from
                     # "obstacle ahead, turn to avoid").
                     if dwa.forward >= 0.3:
-                        if dwa.n_feasible >= 25:
+                        if dwa.n_feasible >= 35:
                             self._smooth_dwa_fwd = max(
-                                self._smooth_dwa_fwd, 0.4)
+                                self._smooth_dwa_fwd, 0.65)
+                        elif dwa.n_feasible >= 25:
+                            self._smooth_dwa_fwd = max(
+                                self._smooth_dwa_fwd, 0.50)
                         elif dwa.n_feasible >= 10:
                             self._smooth_dwa_fwd = max(
                                 self._smooth_dwa_fwd, 0.3)
@@ -287,6 +293,22 @@ class DWAControlMixin:
                     and dwa.n_feasible >= 20
                     and not goal_behind):
                 heading_mod = max(heading_mod, C.TURN_STEP_FLOOR)
+            # Open-field speed floor: maintain forward speed when DWA
+            # reports mostly clear (feas >= 35) and heading is reasonable.
+            # Prevents TSDF transients from braking in open space.
+            if (dwa.n_feasible >= 35
+                    and abs(nav_heading_err) < 0.8  # <45deg
+                    and not goal_behind):
+                heading_mod = max(heading_mod, 0.65)
+
+            # Turn brake: cap forward speed when turning hard near
+            # obstacles.  Sideways-walking at high wz near obstacles
+            # causes falls (GIL pause + lateral forces).  Only brakes
+            # when DWA reports constrained arcs (feas < 35) AND the
+            # steering command is strong (|turn_cmd| > 0.5).
+            if dwa.n_feasible < 35 and abs(turn_cmd) > 0.5:
+                brake_cap = 0.4 - 0.2 * min(1.0, abs(turn_cmd))
+                heading_mod = min(heading_mod, max(0.15, brake_cap))
 
             # Smooth to prevent jerky changes
             self._smooth_heading_mod += C.DWA_HEADING_MOD_ALPHA * (
@@ -299,13 +321,30 @@ class DWAControlMixin:
                 self._smooth_wz += C.DWA_WZ_SMOOTH_ALPHA * (wz - self._smooth_wz)
             wz = self._smooth_wz
 
-            # TIP mode: turn in place when target is behind.
-            # With TURN_WZ>=2.0, 180° TIP takes ≤1.6s and produces 0
-            # regression. Walking during turns at 0.3× speed adds arc
-            # distance and regression that kills reg_gate (0.74 vs 0.85).
-            enter_tip = (goal_behind
-                         and abs(heading_err) > C.THETA_THRESHOLD
-                         and not heading_was_good)
+            # Anti-orbit timer: if heading error stays above 35deg for
+            # 2+ seconds while walking, the robot is orbiting the target
+            # instead of converging.  Force TIP to break the orbit.
+            # 35deg threshold catches oscillation in 35-50deg range that
+            # resets a 45deg timer.  Longer window (2s) reduces false positives.
+            _orbit_ticks = getattr(self, '_orbit_heading_ticks', 0)
+            if (abs(heading_err) > 0.61  # >35deg
+                    and not self._in_tip_mode
+                    and not goal_behind):
+                _orbit_ticks += 1
+            else:
+                _orbit_ticks = 0
+            self._orbit_heading_ticks = _orbit_ticks
+            orbit_stuck = _orbit_ticks >= 200  # 2.0s at 100Hz
+
+            # TIP mode: turn in place when target is behind, heading
+            # is very far off, or orbiting detected.
+            # orbit_stuck bypasses heading_was_good: sustained off-heading
+            # walking is a real orbit regardless of SLAM heading quality.
+            enter_tip = (abs(heading_err) > C.THETA_THRESHOLD
+                         and (orbit_stuck
+                              or (not heading_was_good
+                                  and (goal_behind
+                                       or abs(heading_err) > 1.22))))
             stay_tip = (self._in_tip_mode
                         and abs(heading_err) > C.THETA_THRESHOLD)
             if enter_tip or stay_tip:

@@ -45,12 +45,16 @@ class ScenarioRunner:
         domain: int = 2,
         headless: bool = True,
         viewer: bool = False,
+        random_obstacles: bool = False,
+        god_view: bool = False,
     ):
         self._robot = robot
         self._genome = genome
         self._domain = domain
         self._headless = headless
         self._viewer = viewer
+        self._random_obstacles = random_obstacles
+        self._god_view = god_view
 
     def run_all(
         self,
@@ -98,6 +102,14 @@ class ScenarioRunner:
         if scenario.spawn_fn_factory is not None:
             spawn_fn = scenario.spawn_fn_factory(seed)
 
+        # Resolve scene path (may generate randomized XML).
+        # Scenarios with generate_scene always use it; --random-obstacles
+        # forces generation for scenarios that don't define one.
+        obstacle_seed = seed if (
+            self._random_obstacles or scenario.generate_scene is not None
+        ) else None
+        resolved_scene = str(scenario.scene_path(self._robot, obstacle_seed))
+
         # Build args namespace matching what run_game expects
         args = SimpleNamespace(
             robot=self._robot,
@@ -110,13 +122,14 @@ class ScenarioRunner:
             domain=self._domain,
             slam=scenario.use_slam,
             obstacles=scenario.has_obstacles,
-            scene_path=str(scenario.scene_path(self._robot)),
+            scene_path=resolved_scene,
             timeout_per_target=scenario.timeout_per_target,
             min_dist=scenario.min_dist,
             max_dist=scenario.max_dist,
             angle_range=scenario.angle_range,
             spawn_fn=spawn_fn,
             viewer=self._viewer,
+            god=self._god_view,
         )
 
         try:

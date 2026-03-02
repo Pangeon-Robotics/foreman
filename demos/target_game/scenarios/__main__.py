@@ -47,6 +47,10 @@ Scenarios (easiest to hardest):
                         help="Override number of targets (default: use scenario's count)")
     parser.add_argument("--viewer", action="store_true",
                         help="Start TCP debug server for Godot TSDF viewer")
+    parser.add_argument("--random-obstacles", action="store_true",
+                        help="Randomize obstacle positions (uses target seed)")
+    parser.add_argument("--god", action="store_true",
+                        help="Show god-view costmap overlay in MuJoCo viewer")
     parser.add_argument("--list", action="store_true",
                         help="List available scenarios and exit")
     args = parser.parse_args()
@@ -75,6 +79,8 @@ Scenarios (easiest to hardest):
         domain=args.domain,
         headless=not args.headed,
         viewer=args.viewer,
+        random_obstacles=args.random_obstacles,
+        god_view=args.god,
     )
 
     results = runner.run_all(scenarios, seed_override=args.seed,
