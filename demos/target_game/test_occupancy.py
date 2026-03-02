@@ -4,6 +4,9 @@ Runs a headless target game scenario, lets the robot scan nearby obstacles,
 then measures IoU / precision / recall between TSDF occupied voxels and
 ground-truth obstacle volumes parsed from the scene XML.
 
+3DS v2 metrics (adherence, completeness, phantom rate) use TSDF's
+get_surface_voxels method.
+
 Usage:
     python -m foreman.demos.target_game.test_occupancy scattered
     python -m foreman.demos.target_game.test_occupancy corridor --ticks 1000
@@ -19,6 +22,244 @@ from pathlib import Path
 import numpy as np
 
 _OCC_DIAG_COUNT = 0
+
+# Chunk constants from TSDF
+_CHUNK_BITS = 4
+_CHUNK_SIZE = 1 << _CHUNK_BITS  # 16
+
+
+def _materialize_log_odds(tsdf) -> np.ndarray:
+    """Build dense (nx, ny, nz) log_odds array from TSDF chunks.
+
+    Test-only helper — O(chunks) scatter into a preallocated dense array.
+    """
+    lo_dense = np.zeros((tsdf.nx, tsdf.ny, tsdf.nz), dtype=np.float32)
+    for (cx, cy, cz), chunk in tsdf._chunks.items():
+        gx = cx * _CHUNK_SIZE
+        gy = cy * _CHUNK_SIZE
+        gz = cz * _CHUNK_SIZE
+        sx = min(_CHUNK_SIZE, tsdf.nx - gx)
+        sy = min(_CHUNK_SIZE, tsdf.ny - gy)
+        sz = min(_CHUNK_SIZE, tsdf.nz - gz)
+        if sx > 0 and sy > 0 and sz > 0:
+            lo_dense[gx:gx+sx, gy:gy+sy, gz:gz+sz] = chunk.log_odds[:sx, :sy, :sz]
+    return lo_dense
+
+
+# ------------------------------------------------------------------
+# GT Surface Sampling
+# ------------------------------------------------------------------
+
+def _sample_box_surface(pos: tuple, half_extents: tuple,
+                        spacing: float) -> list[np.ndarray]:
+    """Sample all 6 faces of an axis-aligned box at ~spacing resolution.
+
+    Parameters
+    ----------
+    pos : (x, y, z) center of box
+    half_extents : (hx, hy, hz) half-sizes
+    spacing : sample spacing in meters
+
+    Returns list of (3,) arrays — one per sample point.
+    """
+    px, py, pz = pos
+    hx, hy, hz = half_extents
+    points = []
+
+    # Sample counts per face dimension (at least 1 sample)
+    nx = max(1, int(round(2 * hx / spacing)))
+    ny = max(1, int(round(2 * hy / spacing)))
+    nz = max(1, int(round(2 * hz / spacing)))
+
+    xs = np.linspace(px - hx, px + hx, nx + 1)
+    ys = np.linspace(py - hy, py + hy, ny + 1)
+    zs = np.linspace(pz - hz, pz + hz, nz + 1)
+
+    # +/- X faces
+    for y in ys:
+        for z in zs:
+            points.append(np.array([px - hx, y, z], dtype=np.float32))
+            points.append(np.array([px + hx, y, z], dtype=np.float32))
+    # +/- Y faces
+    for x in xs:
+        for z in zs:
+            points.append(np.array([x, py - hy, z], dtype=np.float32))
+            points.append(np.array([x, py + hy, z], dtype=np.float32))
+    # +/- Z faces
+    for x in xs:
+        for y in ys:
+            points.append(np.array([x, y, pz - hz], dtype=np.float32))
+            points.append(np.array([x, y, pz + hz], dtype=np.float32))
+
+    return points
+
+
+def _sample_cylinder_surface(pos: tuple, size: tuple,
+                              spacing: float) -> list[np.ndarray]:
+    """Sample curved surface + top/bottom caps of a vertical cylinder.
+
+    Parameters
+    ----------
+    pos : (x, y, z) center of cylinder
+    size : (radius, half_height)
+    spacing : sample spacing in meters
+
+    Returns list of (3,) arrays.
+    """
+    px, py, pz = pos
+    radius, half_h = size
+    points = []
+
+    # Curved surface: sample along circumference and height
+    circumference = 2 * math.pi * radius
+    n_angle = max(8, int(round(circumference / spacing)))
+    n_z = max(1, int(round(2 * half_h / spacing)))
+
+    angles = np.linspace(0, 2 * math.pi, n_angle, endpoint=False)
+    zs = np.linspace(pz - half_h, pz + half_h, n_z + 1)
+
+    for theta in angles:
+        cx = px + radius * math.cos(theta)
+        cy = py + radius * math.sin(theta)
+        for z in zs:
+            points.append(np.array([cx, cy, z], dtype=np.float32))
+
+    # Top and bottom caps: sample in concentric rings
+    n_rings = max(1, int(round(radius / spacing)))
+    for ring in range(n_rings + 1):
+        r = radius * ring / max(n_rings, 1)
+        if r < 1e-6:
+            # Center point
+            points.append(np.array([px, py, pz - half_h], dtype=np.float32))
+            points.append(np.array([px, py, pz + half_h], dtype=np.float32))
+        else:
+            circ = 2 * math.pi * r
+            n_pts = max(4, int(round(circ / spacing)))
+            for theta in np.linspace(0, 2 * math.pi, n_pts, endpoint=False):
+                cx = px + r * math.cos(theta)
+                cy = py + r * math.sin(theta)
+                points.append(
+                    np.array([cx, cy, pz - half_h], dtype=np.float32))
+                points.append(
+                    np.array([cx, cy, pz + half_h], dtype=np.float32))
+
+    return points
+
+
+def _sample_gt_surfaces(scene_xml_path: str,
+                         sample_spacing: float = 0.01) -> np.ndarray:
+    """Sample GT obstacle surfaces as a dense point cloud.
+
+    Returns (N, 3) world-frame float32 points on obstacle surfaces,
+    sampled at ~sample_spacing (default 1cm). Used as ground truth for
+    adherence / completeness / phantom metrics.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from foreman.demos.target_game.__main__ import _find_obstacle_geoms
+
+    obstacles = _find_obstacle_geoms(Path(scene_xml_path))
+    points: list[np.ndarray] = []
+    for obs in obstacles:
+        if obs['type'] == 'box':
+            points.extend(
+                _sample_box_surface(obs['pos'], obs['size'], sample_spacing))
+        elif obs['type'] == 'cylinder':
+            points.extend(
+                _sample_cylinder_surface(obs['pos'], obs['size'],
+                                          sample_spacing))
+
+    if not points:
+        return np.zeros((0, 3), dtype=np.float32)
+    return np.stack(points).astype(np.float32)
+
+
+# ------------------------------------------------------------------
+# 3DS v2: Adherence / Completeness / Phantom Rate
+# ------------------------------------------------------------------
+
+def _extract_tsdf_surface(tsdf) -> np.ndarray:
+    """Extract TSDF surface voxels as (N, 3) world-frame coordinates.
+
+    Returns (N, 3) float32 array of world-frame voxel centers.
+    """
+    return tsdf.get_surface_voxels()
+
+
+def compute_3ds_v2(tsdf, scene_xml_path: str,
+                    adherence_tol: float = 0.03,
+                    phantom_tol: float = 0.05,
+                    sample_spacing: float = 0.01) -> dict:
+    """Compute 3DS v2 metrics: adherence, completeness, phantom rate.
+
+    Parameters
+    ----------
+    tsdf : TSDF
+    scene_xml_path : str
+        Path to the scene XML file containing obstacle definitions.
+    adherence_tol : float
+        Completeness tolerance — GT point is "covered" if a TSDF surface
+        voxel exists within this distance (meters). Default 3cm.
+    phantom_tol : float
+        Phantom tolerance — TSDF voxel is "phantom" if no GT surface
+        point exists within this distance (meters). Default 5cm.
+    sample_spacing : float
+        GT surface sampling density (meters). Default 1cm.
+
+    Returns
+    -------
+    dict with keys:
+        adherence_mm : float — mean TSDF-to-GT distance in mm
+        completeness_pct : float — % of GT surface covered
+        phantom_pct : float — % of TSDF surface that is phantom
+        n_tsdf_surface : int — number of TSDF surface voxels
+        n_gt_surface : int — number of GT surface sample points
+        n_converged : int — number of converged TSDF voxels
+    """
+    from scipy.spatial import cKDTree
+
+    tsdf_surface = _extract_tsdf_surface(tsdf)
+    gt_surface = _sample_gt_surfaces(scene_xml_path, sample_spacing)
+
+    n_tsdf = len(tsdf_surface)
+    n_gt = len(gt_surface)
+    n_converged = getattr(tsdf, 'n_converged', 0)
+
+    # Degenerate cases
+    if n_tsdf == 0 or n_gt == 0:
+        return {
+            "adherence_mm": float('inf') if n_gt > 0 else 0.0,
+            "completeness_pct": 0.0,
+            "phantom_pct": 100.0 if n_tsdf > 0 and n_gt == 0 else 0.0,
+            "n_tsdf_surface": n_tsdf,
+            "n_gt_surface": n_gt,
+            "n_converged": n_converged,
+        }
+
+    # Build KD-trees
+    gt_tree = cKDTree(gt_surface)
+    tsdf_tree = cKDTree(tsdf_surface)
+
+    # (a) Surface adherence: mean TSDF→GT distance
+    tsdf_to_gt_dists, _ = gt_tree.query(tsdf_surface, k=1)
+    adherence_mm = float(np.mean(tsdf_to_gt_dists) * 1000.0)
+
+    # (b) Completeness: fraction of GT points with a TSDF detection nearby
+    gt_to_tsdf_dists, _ = tsdf_tree.query(gt_surface, k=1)
+    completeness_pct = float(
+        np.sum(gt_to_tsdf_dists < adherence_tol) / n_gt * 100.0)
+
+    # (c) Phantom rate: fraction of TSDF voxels far from any GT surface
+    phantom_pct = float(
+        np.sum(tsdf_to_gt_dists > phantom_tol) / n_tsdf * 100.0)
+
+    return {
+        "adherence_mm": adherence_mm,
+        "completeness_pct": completeness_pct,
+        "phantom_pct": phantom_pct,
+        "n_tsdf_surface": n_tsdf,
+        "n_gt_surface": n_gt,
+        "n_converged": n_converged,
+    }
 
 
 def _parse_obstacle_voxels(scene_xml_path: str, tsdf) -> set[tuple[int, int, int]]:
@@ -175,7 +416,7 @@ def compute_occupancy_accuracy(tsdf, scene_xml_path: str,
     # confidence level used by the cost grid for A* path planning.
     # Real obstacles get hit repeatedly (lo=2-3.5), so 1.0 is well
     # below the confirmed-obstacle floor.
-    lo = tsdf._log_odds
+    lo = _materialize_log_odds(tsdf)
     _LO_THRESHOLD = 1.0
     occupied = np.argwhere(lo > _LO_THRESHOLD)
     tsdf_voxels = set(map(tuple, occupied))
@@ -303,7 +544,7 @@ def compute_occupancy_2d(tsdf, scene_xml_path: str) -> dict:
     iz_lo = max(0, int((z_lo - tsdf.z_min) / vs))
     iz_hi = min(tsdf.nz, int((z_hi - tsdf.z_min) / vs) + 1)
 
-    z_slab = tsdf._log_odds[:, :, iz_lo:iz_hi]
+    z_slab = _materialize_log_odds(tsdf)[:, :, iz_lo:iz_hi]
 
     # TSDF: any occupied voxel in Z band -> cell occupied
     tsdf_2d = np.any(z_slab > 0, axis=2)

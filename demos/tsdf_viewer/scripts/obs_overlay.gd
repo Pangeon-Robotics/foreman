@@ -7,9 +7,6 @@ extends MeshInstance3D
 ##   Cost 254:     bright red (lethal)
 ##   Cost 255:     dark grey (unknown / unscanned)
 ##
-## Backward-compatible: detects uint8 cost map (payload=nx*ny) vs
-## legacy bit-packed observation map (payload=ceil(nx*ny/8)).
-##
 ## Uses PackedByteArray bulk writes instead of per-pixel set_pixel()
 ## for ~20x speedup on 200x200 grids.
 
@@ -18,15 +15,6 @@ var _initialized := false
 var _last_nx := 0
 var _last_ny := 0
 
-# Legacy bit-packed constants (backward compat)
-const OBS_R := 38   # 0.15 * 255
-const OBS_G := 128  # 0.50 * 255
-const OBS_B := 51   # 0.20 * 255
-const OBS_A := 89   # 0.35 * 255
-const UNK_R := 13   # 0.05 * 255
-const UNK_G := 13   # 0.05 * 255
-const UNK_B := 20   # 0.08 * 255
-const UNK_A := 77   # 0.30 * 255
 
 
 func _ready() -> void:
@@ -60,13 +48,7 @@ func update_observation_map(data: PackedByteArray) -> void:
 	var voxel_size := data.decode_float(ofs); ofs += 4
 
 	var n_cells: int = nx * ny
-	var payload_size: int = data.size() - ofs
-
-	# Format detection: uint8 cost map (nx*ny bytes) vs bit-packed (ceil(nx*ny/8))
-	if payload_size >= n_cells:
-		_update_cost_map(data, ofs, nx, ny, n_cells, origin_x, origin_y, voxel_size)
-	else:
-		_update_bit_packed(data, ofs, nx, ny, n_cells, origin_x, origin_y, voxel_size)
+	_update_cost_map(data, ofs, nx, ny, n_cells, origin_x, origin_y, voxel_size)
 
 
 func _update_cost_map(data: PackedByteArray, ofs: int, nx: int, ny: int,
@@ -86,10 +68,10 @@ func _update_cost_map(data: PackedByteArray, ofs: int, nx: int, ny: int,
 			pixel_data[p + 3] = 13  # alpha ~0.05
 		elif cost == 255:
 			# Unknown: dark grey
-			pixel_data[p] = UNK_R
-			pixel_data[p + 1] = UNK_G
-			pixel_data[p + 2] = UNK_B
-			pixel_data[p + 3] = UNK_A
+			pixel_data[p] = 60
+			pixel_data[p + 1] = 60
+			pixel_data[p + 2] = 65
+			pixel_data[p + 3] = 102  # alpha 0.40
 		elif cost == 254:
 			# Lethal: bright red
 			pixel_data[p] = 255
@@ -103,40 +85,6 @@ func _update_cost_map(data: PackedByteArray, ofs: int, nx: int, ny: int,
 			pixel_data[p + 1] = 0                 # G
 			pixel_data[p + 2] = 0                 # B
 			pixel_data[p + 3] = int(38.0 + t * 140.0)  # alpha 0.15..0.70
-
-	_apply_image(nx, ny, pixel_data, origin_x, origin_y, voxel_size)
-
-
-func _update_bit_packed(data: PackedByteArray, ofs: int, nx: int, ny: int,
-		n_cells: int, origin_x: float, origin_y: float, voxel_size: float) -> void:
-	## Legacy bit-packed observation map (green=observed, grey=unknown).
-	var n_bytes: int = ceili(float(n_cells) / 8.0)
-	if data.size() < ofs + n_bytes:
-		return
-
-	var pixel_data := PackedByteArray()
-	pixel_data.resize(n_cells * 4)
-
-	var bit_data := data.slice(ofs, ofs + n_bytes)
-	for byte_idx in n_bytes:
-		var b: int = bit_data[byte_idx]
-		var base_bit: int = byte_idx * 8
-		# Process 8 bits per byte (MSB first — numpy packbits order)
-		for bit in 8:
-			var idx: int = base_bit + (7 - bit)
-			if idx >= n_cells:
-				break
-			var p: int = idx * 4
-			if b & (1 << bit):
-				pixel_data[p] = OBS_R
-				pixel_data[p + 1] = OBS_G
-				pixel_data[p + 2] = OBS_B
-				pixel_data[p + 3] = OBS_A
-			else:
-				pixel_data[p] = UNK_R
-				pixel_data[p + 1] = UNK_G
-				pixel_data[p + 2] = UNK_B
-				pixel_data[p + 3] = UNK_A
 
 	_apply_image(nx, ny, pixel_data, origin_x, origin_y, voxel_size)
 

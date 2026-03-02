@@ -32,12 +32,8 @@ class LiveCostmapQuery:
         # Expose _grid=None so diagnostic code doesn't crash
         self._grid = None
         self._costmap = None
-        # Cost grid resolution: output_resolution for sparse, voxel_size for dense
-        if perception._sparse:
-            self._res = getattr(
-                perception._cfg, 'tsdf_output_resolution', 0.05)
-        else:
-            self._res = perception._cfg.tsdf_voxel_size
+        self._res = getattr(
+            perception._cfg, 'tsdf_output_resolution', 0.05)
 
     def sample(self, x: float, y: float) -> float:
         p = self._p
@@ -219,14 +215,8 @@ class PerceptionPipeline:
         self._odometry = odometry
         self._cfg = perception_config
 
-        # TSDF backend: sparse (chunk-based, 1cm) or dense (PersistentTSDF)
-        self._sparse = getattr(perception_config, 'tsdf_sparse', False)
-        if self._sparse:
-            from layer_6.world_model.tsdf_sparse import SparseTSDF
-            self._tsdf = SparseTSDF(perception_config)
-        else:
-            from layer_6.world_model.tsdf import PersistentTSDF
-            self._tsdf = PersistentTSDF(perception_config)
+        from layer_6.world_model.tsdf import TSDF
+        self._tsdf = TSDF(perception_config)
 
         # Thread-safe costmap storage
         self._lock = threading.Lock()
@@ -240,19 +230,13 @@ class PerceptionPipeline:
         # DWA obstacle memory: retains obstacle cells after TSDF clearing
         # erases them near the robot.  Decay 0.99/frame at 20Hz ≈ 6s
         # persistence above threshold 0.3.
-        # When using sparse TSDF, memory grid is at output resolution
-        # (not internal 1cm resolution, which would be enormous).
+        # Memory grid at output resolution (not internal 1cm, which would
+        # be enormous).
         tsdf = self._tsdf
-        if self._sparse:
-            out_res = getattr(
-                perception_config, 'tsdf_output_resolution', 0.05)
-            mem_nx = int(round(2 * tsdf.xy_extent / out_res))
-            mem_ny = mem_nx
-            self._mem_voxel_size = out_res
-        else:
-            mem_nx = tsdf.nx
-            mem_ny = tsdf.ny
-            self._mem_voxel_size = tsdf.voxel_size
+        out_res = getattr(perception_config, 'tsdf_output_resolution', 0.05)
+        mem_nx = int(round(2 * tsdf.xy_extent / out_res))
+        mem_ny = mem_nx
+        self._mem_voxel_size = out_res
         self._obstacle_memory = np.zeros(
             (mem_nx, mem_ny), dtype=np.float32)
         self._mem_nx = mem_nx
@@ -269,12 +253,12 @@ class PerceptionPipeline:
         # guarantee at least one feasible arc (clears after read).
         self._force_feasible = False
 
-        # Scan throttle: SparseTSDF integration is too heavy (~80ms) to
-        # run at full LiDAR rate — it holds the GIL and starves the
-        # control loop.  In headless mode, firmware can flood scans at
-        # 50-100Hz wall time.  Time-based throttle limits processing
-        # to max 5Hz wall time regardless of incoming rate.
-        self._scan_min_interval = 0.20 if self._sparse else 0.0  # seconds
+        # Scan throttle: TSDF integration is too heavy (~80ms) to run
+        # at full LiDAR rate — it holds the GIL and starves the control
+        # loop.  In headless mode, firmware can flood scans at 50-100Hz
+        # wall time.  Time-based throttle limits processing to max 5Hz
+        # wall time regardless of incoming rate.
+        self._scan_min_interval = 0.20  # seconds (prevents GIL starvation)
         self._scan_last_time = 0.0
 
         # Full 6-DOF IMU pose (set by game tick, read by DDS callback)
@@ -386,7 +370,7 @@ class PerceptionPipeline:
         """
         # Time-based throttle: skip scans that arrive too fast (wall time).
         # In headless mode, firmware floods scans at 50-100Hz wall time.
-        # SparseTSDF integration (~80ms) would starve the control loop.
+        # TSDF integration (~80ms) would starve the control loop.
         now = time.monotonic()
         if self._scan_min_interval > 0:
             if now - self._scan_last_time < self._scan_min_interval:
@@ -455,10 +439,9 @@ class PerceptionPipeline:
             if len(pts_world) == 0:
                 return
 
-        # Subsample for SparseTSDF: full scans have 1500-2000 points.
+        # Subsample: full scans have 1500-2000 points.
         # Hit-only integration is O(N) so 250 points is fast (<5ms).
-        # More points = better obstacle coverage per scan.
-        if self._sparse and len(pts_world) > 250:
+        if len(pts_world) > 250:
             idx = np.random.choice(len(pts_world), 250, replace=False)
             pts_world = pts_world[idx]
 
@@ -478,10 +461,7 @@ class PerceptionPipeline:
 
         tsdf = self._tsdf
 
-        if self._sparse:
-            self._build_cost_grids_sparse(tsdf, imu_x, imu_y)
-        else:
-            self._build_cost_grids_dense(tsdf, imu_x, imu_y)
+        self._build_cost_grids(tsdf, imu_x, imu_y)
 
         # --- Live costmap query for DWA ---
         # Instead of building a body-frame snapshot (which goes stale
@@ -499,14 +479,14 @@ class PerceptionPipeline:
         self._build_times.append(elapsed_ms)
 
     # ------------------------------------------------------------------
-    # Cost grid builders (sparse vs. dense TSDF)
+    # Cost grid builder
     # ------------------------------------------------------------------
 
-    def _build_cost_grids_sparse(self, tsdf, imu_x: float,
-                                 imu_y: float) -> None:
-        """Build cost grids directly from SparseTSDF.
+    def _build_cost_grids(self, tsdf, imu_x: float,
+                          imu_y: float) -> None:
+        """Build cost grids from TSDF.
 
-        SparseTSDF has built-in persistence (log-odds accumulation) so the
+        TSDF has built-in persistence (log-odds accumulation) so the
         obstacle memory layer is NOT used — it amplifies noise into phantom
         obstacles that oscillate DWA between feas=41 and feas=0.
 
@@ -517,7 +497,7 @@ class PerceptionPipeline:
         out_res = getattr(self._cfg, 'tsdf_output_resolution', 0.05)
         truncation = self._cfg.tsdf_truncation
 
-        # Get cost grid from SparseTSDF (handles projection + EDT)
+        # Get cost grid from TSDF (handles projection + EDT)
         cost_u8, meta = tsdf.get_world_cost_grid(
             tsdf.costmap_z_lo, tsdf.costmap_z_hi, out_res)
         out_nx = meta['nx']
@@ -530,7 +510,7 @@ class PerceptionPipeline:
         cy = int((imu_y - tsdf.origin_y) / vs)
 
         # --- DWA cost grid: direct from TSDF ---
-        # SparseTSDF cost_u8 already has EDT-based distance falloff.
+        # cost_u8 already has EDT-based distance falloff.
         # No memory overlay needed — TSDF persistence handles it.
         dwa_u8 = cost_u8.copy()
         if observed is not None:
@@ -582,115 +562,6 @@ class PerceptionPipeline:
             'truncation': truncation,
         }
 
-    def _build_cost_grids_dense(self, tsdf, imu_x: float,
-                                imu_y: float) -> None:
-        """Build cost grids from dense PersistentTSDF (original pipeline)."""
-        from scipy.ndimage import binary_opening, distance_transform_edt
-
-        vs = tsdf.voxel_size
-
-        # TSDF clearing: zero low-confidence occupied cells within robot
-        # footprint to prevent grey cube trail in viewer.
-        cx = int((imu_x - tsdf.origin_x) / vs)
-        cy = int((imu_y - tsdf.origin_y) / vs)
-        mask_r = int(0.8 / vs)
-        x_lo = max(0, cx - mask_r)
-        x_hi = min(tsdf.nx, cx + mask_r + 1)
-        y_lo = max(0, cy - mask_r)
-        y_hi = min(tsdf.ny, cy + mask_r + 1)
-
-        footprint = None
-        if x_lo < x_hi and y_lo < y_hi:
-            ix_idx, iy_idx = np.ogrid[x_lo:x_hi, y_lo:y_hi]
-            footprint = (ix_idx - cx)**2 + (iy_idx - cy)**2 <= mask_r**2
-            lo_fp = tsdf._log_odds[x_lo:x_hi, y_lo:y_hi, :]
-            uncertain = footprint[:, :, None] & (lo_fp > 0.0) & (lo_fp < 2.0)
-            lo_fp[uncertain] = 0.0
-
-        # --- World-frame 2D cost grid ---
-        lo = tsdf._log_odds
-        iz_lo = max(0, int((tsdf.costmap_z_lo - tsdf.z_min) / vs))
-        iz_hi = min(tsdf.nz, int((tsdf.costmap_z_hi - tsdf.z_min) / vs) + 1)
-        lo_slice = lo[:, :, iz_lo:iz_hi]
-
-        occupied_2d_raw = np.any(lo_slice > 1.0, axis=2)
-        occupied_2d = binary_opening(occupied_2d_raw, iterations=1)
-
-        observed = np.any(lo_slice != 0.0, axis=2)
-
-        truncation = self._cfg.tsdf_truncation
-
-        # --- Obstacle memory ---
-        mem = self._obstacle_memory
-        if footprint is not None:
-            blind_save = mem[x_lo:x_hi, y_lo:y_hi][footprint].copy()
-        mem *= 0.99
-        if footprint is not None:
-            mem[x_lo:x_hi, y_lo:y_hi][footprint] = blind_save
-        if self._memory_blank_frames > 0:
-            self._memory_blank_frames -= 1
-        else:
-            np.maximum(mem, occupied_2d_raw.astype(np.float32), out=mem)
-        mem_occ = mem > 0.3
-
-        # --- A* cost grid ---
-        if np.any(mem_occ):
-            dist_2d = distance_transform_edt(~mem_occ).astype(
-                np.float32) * vs
-        else:
-            dist_2d = np.full(
-                (tsdf.nx, tsdf.ny), tsdf.nx * vs, dtype=np.float32)
-        cost_f = 1.0 - np.clip(dist_2d / truncation, 0.0, 1.0)
-        cost_u8 = (cost_f * 254).astype(np.uint8)
-        observed_mem = observed | mem_occ
-        cost_u8[~observed_mem] = 255
-
-        # --- DWA cost grid ---
-        if np.any(mem_occ):
-            dwa_dist = distance_transform_edt(~mem_occ).astype(
-                np.float32) * vs
-        else:
-            dwa_dist = np.full(
-                (tsdf.nx, tsdf.ny), tsdf.nx * vs, dtype=np.float32)
-        dwa_cost_f = 1.0 - np.clip(dwa_dist / truncation, 0.0, 1.0)
-        dwa_cost_u8 = (dwa_cost_f * 254).astype(np.uint8)
-        dwa_cost_u8[~observed_mem] = 255
-
-        # DWA robot footprint clearing (0.4m)
-        dwa_fp_r = int(0.4 / vs)
-        dwa_fp_x_lo = max(0, cx - dwa_fp_r)
-        dwa_fp_x_hi = min(tsdf.nx, cx + dwa_fp_r + 1)
-        dwa_fp_y_lo = max(0, cy - dwa_fp_r)
-        dwa_fp_y_hi = min(tsdf.ny, cy + dwa_fp_r + 1)
-        if dwa_fp_x_lo < dwa_fp_x_hi and dwa_fp_y_lo < dwa_fp_y_hi:
-            dix, diy = np.ogrid[dwa_fp_x_lo:dwa_fp_x_hi,
-                                dwa_fp_y_lo:dwa_fp_y_hi]
-            dwa_fp = (dix - cx)**2 + (diy - cy)**2 <= dwa_fp_r**2
-            dwa_cost_u8[dwa_fp_x_lo:dwa_fp_x_hi,
-                        dwa_fp_y_lo:dwa_fp_y_hi][dwa_fp] = 0
-        self._dwa_cost_grid = dwa_cost_u8
-
-        # A* robot footprint clearing (0.35m)
-        astar_r = int(0.35 / vs)
-        astar_x_lo = max(0, cx - astar_r)
-        astar_x_hi = min(tsdf.nx, cx + astar_r + 1)
-        astar_y_lo = max(0, cy - astar_r)
-        astar_y_hi = min(tsdf.ny, cy + astar_r + 1)
-        if astar_x_lo < astar_x_hi and astar_y_lo < astar_y_hi:
-            aix, aiy = np.ogrid[astar_x_lo:astar_x_hi,
-                                astar_y_lo:astar_y_hi]
-            astar_fp = (aix - cx)**2 + (aiy - cy)**2 <= astar_r**2
-            cost_u8[astar_x_lo:astar_x_hi,
-                    astar_y_lo:astar_y_hi][astar_fp] = 0
-
-        self._world_cost_grid = cost_u8
-        self._world_cost_meta = {
-            'origin_x': tsdf.origin_x, 'origin_y': tsdf.origin_y,
-            'voxel_size': tsdf.voxel_size,
-            'nx': tsdf.nx, 'ny': tsdf.ny,
-            'truncation': truncation,
-        }
-
     def report_dwa_feas(self, n_feasible: int) -> None:
         """Report DWA feasibility count (called at 20Hz replan rate).
 
@@ -722,7 +593,7 @@ class PerceptionPipeline:
         frame costmap takes effect immediately.
         """
         tsdf = self._tsdf
-        vs = self._mem_voxel_size  # output resolution for sparse, voxel_size for dense
+        vs = self._mem_voxel_size  # TSDF output resolution
         with self._imu_lock:
             rx, ry = self._imu_x, self._imu_y
         cx = int((rx - tsdf.origin_x) / vs)
@@ -777,10 +648,8 @@ class PerceptionPipeline:
             "max_ms": max(self._build_times),
             "min_ms": min(self._build_times),
         }
-        if self._sparse:
-            tsdf = self._tsdf
-            s["sparse"] = True
-            s["n_chunks"] = tsdf.n_chunks
-            s["n_converged"] = tsdf.n_converged
-            s["memory_mb"] = tsdf.memory_mb
+        tsdf = self._tsdf
+        s["n_chunks"] = tsdf.n_chunks
+        s["n_converged"] = tsdf.n_converged
+        s["memory_mb"] = tsdf.memory_mb
         return s

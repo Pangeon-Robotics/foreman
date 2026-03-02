@@ -436,8 +436,6 @@ class TargetGame(
                     self._debug_server.send_costmap_2d(
                         cost_grid, meta['origin_x'], meta['origin_y'],
                         meta['voxel_size'])
-                elif tsdf is not None and hasattr(tsdf, '_log_odds'):
-                    self._debug_server.send_observation_map(tsdf)
 
         # Feed cost grid to path critic (unconditional — not gated on viewer)
         if (self._step_count % 50 == 0

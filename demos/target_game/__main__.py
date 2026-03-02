@@ -508,13 +508,9 @@ def run_game(args) -> GameRunResult:
                     cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
                     cloud_sub.Init(perception.on_point_cloud, 5)
                     game._perception = perception
-                    if pcfg.tsdf_sparse:
-                        print(f"SparseTSDF active: ±{pcfg.tsdf_xy_extent}m, "
-                              f"voxel={pcfg.tsdf_voxel_size_sparse}m, "
-                              f"output={pcfg.tsdf_output_resolution}m")
-                    else:
-                        print(f"Persistent TSDF active: ±{pcfg.tsdf_xy_extent}m, "
-                              f"voxel={pcfg.tsdf_voxel_size}m, Bayesian log-odds")
+                    print(f"TSDF active: ±{pcfg.tsdf_xy_extent}m, "
+                          f"voxel={pcfg.tsdf_voxel_size}m, "
+                          f"output={pcfg.tsdf_output_resolution}m")
 
                     # Wire up curvature-based DWA planner
                     game.set_dwa_planner(CurvatureDWAPlanner(pcfg))
@@ -603,8 +599,6 @@ def main():
                         help="Use scene_obstacles.xml with static obstacles")
     parser.add_argument("--viewer", action="store_true",
                         help="Start TCP debug server for Godot TSDF viewer")
-    parser.add_argument("--sparse-tsdf", action="store_true",
-                        help="Use SparseTSDF (chunk-based, 1cm internal)")
     args = parser.parse_args()
 
     result = run_game(args)
@@ -618,10 +612,9 @@ def main():
         if ps.get("builds", 0) > 0:
             print(f"\nPerception: {ps['builds']} costmaps built, "
                   f"mean={ps['mean_ms']:.1f}ms, max={ps['max_ms']:.1f}ms")
-            if ps.get("sparse"):
-                print(f"  SparseTSDF: {ps['n_chunks']} chunks, "
-                      f"{ps['n_converged']} converged, "
-                      f"{ps['memory_mb']:.1f} MB")
+            print(f"  TSDF: {ps['n_chunks']} chunks, "
+                  f"{ps['n_converged']} converged, "
+                  f"{ps['memory_mb']:.1f} MB")
 
 
 if __name__ == "__main__":

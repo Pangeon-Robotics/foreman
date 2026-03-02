@@ -1,8 +1,8 @@
 extends Node3D
 ## Renders TSDF occupied voxels as 3D cubes at their actual positions.
 ##
-## Each occupied voxel is rendered as a 0.1m cube at its (x, y, z) world
-## position, mapped to Godot coordinates. When the LiDAR provides
+## Each occupied voxel is rendered as a cube scaled to the actual voxel_size
+## (1cm voxels). When the LiDAR provides
 ## multi-elevation data, voxels appear at multiple heights showing the
 ## true 3D structure of obstacles.
 
@@ -16,8 +16,9 @@ func _ready() -> void:
 	mat.emission_enabled = true
 	mat.emission_energy_multiplier = 0.5
 
+	# Unit cube — scaled per-instance by actual voxel_size from data
 	var box := BoxMesh.new()
-	box.size = Vector3(0.1, 0.1, 0.1)
+	box.size = Vector3(1.0, 1.0, 1.0)
 
 	_multi_mesh = MultiMesh.new()
 	_multi_mesh.transform_format = MultiMesh.TRANSFORM_3D
@@ -66,8 +67,8 @@ func update_tsdf(data: PackedByteArray) -> void:
 		var wy: float = origin_y + iy * voxel_size + half_vs
 		var wz: float = z_min + iz * voxel_size + half_vs
 
-		# MuJoCo (x,y,z) -> Godot (x,z,-y)
-		var t := Transform3D.IDENTITY
+		# MuJoCo (x,y,z) -> Godot (x,z,-y), scaled by voxel_size
+		var t := Transform3D.IDENTITY.scaled(Vector3(voxel_size, voxel_size, voxel_size))
 		t.origin = Vector3(wx, wz, -wy)
 		_multi_mesh.set_instance_transform(i, t)
 

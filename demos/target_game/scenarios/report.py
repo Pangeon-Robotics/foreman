@@ -63,11 +63,17 @@ def print_report(results: dict) -> None:
                 dwa_str = f"{c.score * 105:.0f}/105"
                 break
 
-        # 3D surface-shell accuracy (TSDF surface vs GT obstacle surfaces)
+        # 3DS v2: adherence/completeness/phantom
         occ_str = "n/a"
         occ = gr.occupancy_accuracy
         if occ is not None:
-            occ_str = f"{occ['iou']:.2f}/{occ['precision']:.2f}"
+            if 'adherence_mm' in occ:
+                adh = occ['adherence_mm']
+                cpl = occ['completeness_pct']
+                phn = occ['phantom_pct']
+                occ_str = f"{adh:.0f}mm/{cpl:.0f}%/{phn:.0f}%"
+            elif 'iou' in occ:
+                occ_str = f"{occ['iou']:.2f}/{occ['precision']:.2f}"
 
         # Critics summary
         n_passed = sum(1 for c in result.critic_results if c.passed)

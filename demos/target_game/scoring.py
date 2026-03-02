@@ -113,6 +113,7 @@ class ScoringMixin:
         self._current_waypoint = None
         self._wp_commit_until = 0
         self._last_replan_pos = None
+        self._last_replan_step = -999
         self._use_waypoint_latch = False
         self._stuck_check_dist = float('inf')
         self._stuck_check_step = 0
