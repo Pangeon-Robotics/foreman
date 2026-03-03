@@ -830,7 +830,7 @@ class PerceptionPipeline:
                          or self._astar_build_counter % 5 == 0)
         if astar_changed:
             from scipy.ndimage import binary_dilation, distance_transform_edt
-            occupied_seed = cost_u8 > 200
+            occupied_seed = (cost_u8 > 200) & (cost_u8 != 255)
             if np.any(occupied_seed):
                 inflated = binary_dilation(occupied_seed, iterations=6)
                 dist_2d = distance_transform_edt(~inflated).astype(
