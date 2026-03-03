@@ -103,11 +103,19 @@ class ScenarioRunner:
             spawn_fn = scenario.spawn_fn_factory(seed)
 
         # Resolve scene path (may generate randomized XML).
-        # Scenarios with generate_scene always use it; --random-obstacles
-        # forces generation for scenarios that don't define one.
-        obstacle_seed = seed if (
-            self._random_obstacles or scenario.generate_scene is not None
-        ) else None
+        # When --seed is explicitly given, use it for reproducible obstacles.
+        # Otherwise, randomize obstacle layout each run (target spawning
+        # still uses the deterministic scenario seed).
+        if scenario.generate_scene is not None:
+            import random as _rng
+            obstacle_seed = (self._seed_override if self._seed_override is not None
+                             else _rng.randint(0, 2**31))
+        elif self._random_obstacles:
+            import random as _rng
+            obstacle_seed = (self._seed_override if self._seed_override is not None
+                             else _rng.randint(0, 2**31))
+        else:
+            obstacle_seed = None
         resolved_scene = str(scenario.scene_path(self._robot, obstacle_seed))
 
         # Build args namespace matching what run_game expects
