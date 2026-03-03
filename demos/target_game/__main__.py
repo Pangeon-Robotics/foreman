@@ -312,11 +312,44 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
     import glob
     import subprocess
 
-    # Kill zombie firmware processes and wait for DDS resources to release
-    subprocess.run(["pkill", "-9", "-f", "firmware_sim.py"],
-                   capture_output=True)
+    # Kill zombie firmware processes on OUR domain only (not other agents').
+    # Using pkill -f firmware_sim.py would kill ALL firmware across all
+    # domains, causing mutual kill-chains when multiple agents run in
+    # parallel on different DDS domains.
     import time
-    time.sleep(1.0)
+    if domain is not None:
+        result = subprocess.run(
+            ["pgrep", "-af", "firmware_sim.py"],
+            capture_output=True, text=True)
+        if result.stdout.strip():
+            killed = []
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    continue
+                pid, cmdline = parts
+                if f"--domain {domain}" in cmdline:
+                    killed.append(pid)
+                    subprocess.run(["kill", "-9", pid],
+                                   capture_output=True)
+            if killed:
+                print(f"  [CLEANUP] killing {len(killed)} firmware PIDs on domain {domain}: {killed}")
+                time.sleep(2.0)
+            else:
+                time.sleep(0.5)
+        else:
+            time.sleep(0.5)
+    else:
+        result = subprocess.run(["pgrep", "-f", "firmware_sim.py"],
+                                capture_output=True, text=True)
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            print(f"  [CLEANUP] killing {len(pids)} firmware PIDs: {pids}")
+            subprocess.run(["pkill", "-9", "-f", "firmware_sim.py"],
+                           capture_output=True)
+            time.sleep(2.0)
+        else:
+            time.sleep(0.5)
 
     # Remove stale temp files (firmware viewer renders these if they exist)
     for pattern in [
@@ -334,12 +367,19 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
             except OSError:
                 pass
 
-    # Remove stale DDS session files
-    for f in glob.glob("/tmp/robo_sessions/*.json"):
+    # Remove stale DDS session files (only our domain if specified)
+    if domain is not None:
+        session_file = f"/tmp/robo_sessions/b2_domain{domain}.json"
         try:
-            _os.remove(f)
+            _os.remove(session_file)
         except OSError:
             pass
+    else:
+        for f in glob.glob("/tmp/robo_sessions/*.json"):
+            try:
+                _os.remove(f)
+            except OSError:
+                pass
 
 
 def run_game(args) -> GameRunResult:

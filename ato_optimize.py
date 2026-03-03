@@ -160,7 +160,7 @@ def analyze_and_propose(current_params: dict, results: dict,
     pe = results.get("mean_path_efficiency") or 1.0
     v_avg = results.get("mean_v_avg") or 0.0
     speed_ratio = results.get("mean_speed_ratio") or 0.0
-    rg = results.get("mean_regression_gate") or 1.0
+    rg = results.get("mean_regression") or 0.0
     bottleneck = results.get("bottleneck", "speed")
 
     fall_rate = falls / max(n_runs, 1)
@@ -419,7 +419,7 @@ def _log_iteration(log_path: Path, iteration: int, params: dict,
         "mean_path_efficiency": results.get("mean_path_efficiency"),
         "mean_v_avg": results.get("mean_v_avg"),
         "mean_speed_ratio": results.get("mean_speed_ratio"),
-        "mean_regression_gate": results.get("mean_regression_gate"),
+        "mean_regression": results.get("mean_regression"),
         "bottleneck": results.get("bottleneck"),
         "decision": reason,
         "ramp_index": ramp_index,

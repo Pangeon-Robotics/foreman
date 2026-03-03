@@ -113,20 +113,23 @@ Runs Layers 1-4 together (legged robots use L4 GaitParams directly, wheeled robo
 With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body velocity) via `perception.py:PerceptionPipeline`. With `--obstacles`: loads `scene_target_obstacles.xml` and enables LiDAR point cloud processing into costmaps + DWA local planning. Costmap visualization is handled by `viz.py:CostmapOverlay`.
 
 **Target game module map** (split to meet 400-line limit):
-| File | Concern |
-|------|---------|
-| `__main__.py` | Entry point, DDS preload, genome loading, arg parsing |
-| `game.py` | TargetGame core (init, tick, pose helpers) |
-| `game_config.py` | Constants, enums, ROBOT_DEFAULTS, `configure_for_robot()` |
-| `scoring.py` | Lifecycle, scoring, run loop, statistics |
-| `navigator.py` | NavigatorMixin (heading/wheeled nav) |
-| `dwa_nav.py` | DWANavigatorMixin (DWA planning, waypoint guidance) |
-| `dwa_control.py` | DWAControlMixin (gait conversion, stuck recovery) |
-| `path_critic.py` | Path quality evaluation for DWA |
-| `perception.py` | PerceptionPipeline (SLAM, LiDAR → costmap) |
-| `viz.py` | CostmapOverlay, visualization helpers |
-| `target.py` | Target and TargetSpawner classes |
-| `utils.py` | Cross-layer shared utilities (canonical location) |
+| File | Concern | Data domain |
+|------|---------|-------------|
+| `__main__.py` | Entry point, DDS preload, genome loading, arg parsing | Both (wires pipelines) |
+| `game.py` | TargetGame core (init, tick, pose helpers) | Both (tick dispatches) |
+| `game_config.py` | Constants, enums, ROBOT_DEFAULTS, `configure_for_robot()` | N/A |
+| `scoring.py` | Lifecycle, scoring, run loop, statistics | N/A |
+| `navigator.py` | NavigatorMixin (heading/wheeled nav) | Robot-view |
+| `dwa_nav.py` | DWANavigatorMixin (DWA planning, waypoint guidance) | **Robot-view only** |
+| `dwa_control.py` | DWAControlMixin (gait conversion, stuck recovery) | Robot-view |
+| `path_critic.py` | Path quality evaluation, A* search | Data-agnostic (operates on given grid) |
+| `perception.py` | PerceptionPipeline (SLAM, LiDAR → costmap) | **Robot-view only** |
+| `god_tsdf.py` | GodViewTSDF (perfect MuJoCo raycasts) | **God-view only** |
+| `viz.py` | CostmapOverlay, visualization helpers | Both (renders both) |
+| `target.py` | Target and TargetSpawner classes | N/A |
+| `utils.py` | Cross-layer shared utilities (canonical location) | N/A |
+
+**Robot-view / god-view compliance**: Robot-view code (green dots, DWA, costmap) must NEVER access god-view data (GodViewTSDF, god_view_costmap, scene XML geometry). Both pipelines share ground-truth robot position for scan integration; the data separation is in what each pipeline *sees* (noisy LiDAR vs perfect raycasts), not where it looks from.
 
 ### Scenario Testing
 Progressive obstacle scenarios for validating DWA navigation:

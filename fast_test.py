@@ -46,12 +46,11 @@ _ATO_AGG_LINE = re.compile(
     r"(\d+%)\s+"             # aggregate path efficiency
     r"([\d.]+)\s+"           # aggregate v_avg
     r"([\d.]+)m\s+"          # total regression
-    r"([\d.]+)\s+"           # aggregate regression gate
     r"([\d.]+)s"             # total stall
 )
 _TARGET_REACHED = re.compile(r"TARGET (\d+) REACHED in ([\d.]+)s")
 _TARGET_TIMEOUT = re.compile(r"TARGET (\d+) TIMEOUT after ([\d.]+)s")
-_PER_TARGET_ATO = re.compile(r"ATO=([\d.]+)\s+r_gate=([\d.]+)\s+agg=([\d.]+)")
+_PER_TARGET_ATO = re.compile(r"ATO=([\d.]+)\s+agg=([\d.]+)")
 _TARGETS_LINE = re.compile(r"Targets:\s*(\d+)/(\d+)\s+reached")
 
 # Module-level config for worker processes (set via _init_worker)
@@ -92,7 +91,6 @@ def parse_output(stdout: str) -> dict:
         "path_efficiency": None,
         "v_avg": None,
         "regression": None,
-        "regression_gate": None,
         "stall": None,
     }
 
@@ -132,8 +130,7 @@ def parse_output(stdout: str) -> dict:
                 result["path_efficiency"] = int(pe_str.rstrip("%")) / 100.0
                 result["v_avg"] = float(m.group(5))
                 result["regression"] = float(m.group(6))
-                result["regression_gate"] = float(m.group(7))
-                result["stall"] = float(m.group(8))
+                result["stall"] = float(m.group(7))
 
     # Parse targets line ("Targets: 3/4 reached (75%)")
     for line in lines:
@@ -336,8 +333,8 @@ def main():
             path_effs.append(r["path_efficiency"])
         if r.get("v_avg") is not None:
             v_avgs.append(r["v_avg"])
-        if r.get("regression_gate") is not None:
-            reg_gates.append(r["regression_gate"])
+        if r.get("regression") is not None:
+            reg_gates.append(r["regression"])
 
         wall_str = f"{r['wall_time']:.1f}s"
 
@@ -445,7 +442,7 @@ def main():
         "mean_path_efficiency": round(sum(path_effs) / len(path_effs), 3) if path_effs else None,
         "mean_v_avg": round(sum(v_avgs) / len(v_avgs), 3) if v_avgs else None,
         "mean_speed_ratio": round(compute_speed_ratio(sum(v_avgs) / len(v_avgs)), 3) if v_avgs else None,
-        "mean_regression_gate": round(sum(reg_gates) / len(reg_gates), 3) if reg_gates else None,
+        "mean_regression": round(sum(reg_gates) / len(reg_gates), 3) if reg_gates else None,
         "bottleneck": bottleneck if (path_effs and v_avgs and reg_gates) else None,
         "runs": all_results,
     }

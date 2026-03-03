@@ -101,8 +101,9 @@ class ScoringMixin:
         self._tip_start_step = 0
         self._tip_start_heading = 0.0
         self._tip_cooldown_until = 0
+        self._tip_cooldown = 0
         self._reset_tip()
-        self._smooth_heading_mod = 0.0
+        self._smooth_heading_mod = 0.65  # start at 65% speed (EMA adjusts in ~5 ticks)
         self._smooth_wz = 0.0
         self._decel_tick_count = 0
         self._smooth_dwa_turn = 0.0
@@ -121,6 +122,14 @@ class ScoringMixin:
         self._stuck_recovery_wz = 0.0
         self._prev_no_progress = False
         self._no_progress_streak = 0
+        self._orbit_heading_ticks = 0
+        self._orbit_dist_ticks = 0
+        self._orbit_dist_active = False
+        self._orbit_slow_ticks = 0
+        self._tip_ticks = 0
+        self._prev_heading_err = 0.0
+        self._committed_path = None
+        self._committed_path_step = 0
         self._last_good_heading_step = -999
         self._progress_window_dist = float('inf')
         self._progress_window_step = 0

@@ -91,7 +91,8 @@ class DWAControlMixin:
             blocked_fwd = (
                 self._smooth_dwa_fwd < 0.1
                 and no_progress
-                and not self._in_tip_mode)
+                and not self._in_tip_mode
+                and dwa_feas < 30)
             # Prolonged stuck: 3 consecutive no-progress checks (4.5s)
             # catches DWA local minima where feas is moderate (10-25)
             # and smooth_dwa_fwd floor prevents blocked_fwd from firing.
@@ -308,12 +309,19 @@ class DWAControlMixin:
                     and not goal_behind):
                 heading_mod = max(heading_mod, 0.65)
 
-            # Combined fwd×wz stability: high speed + yaw rate near
-            # obstacles creates centripetal + gait-sway forces that
-            # exceed leg lateral budget.  Shed forward speed.
+            # Combined fwd×wz stability: high speed + yaw rate
+            # creates centripetal + gait-sway forces that exceed leg
+            # lateral budget.  Shed forward speed.
             if dwa.n_feasible < 25 and abs(self._smooth_wz) > 0.3:
                 wz_penalty = (abs(self._smooth_wz) - 0.3) * 0.5
                 heading_mod = max(0.15, heading_mod - wz_penalty)
+
+            # Lateral stability cap: at hmod=0.64, wz=1.1 (product=0.70)
+            # the robot falls.  Cap the speed×turn product to 0.40.
+            _sw = abs(self._smooth_wz)
+            if _sw > 0.4:
+                _safe_hmod = min(1.0, 0.40 / max(0.1, _sw))
+                heading_mod = min(heading_mod, max(0.20, _safe_hmod))
 
             # Turn brake: cap forward speed when turning near obstacles.
             if dwa.n_feasible < 25 and abs(turn_cmd) > 0.3:

@@ -83,8 +83,10 @@ class DWANavigatorMixin:
         return path[-1] if len(path) > best_i else None
 
     # Minimum ticks before first path export (wait for TSDF data).
-    # At 100Hz control, 300 ticks = 3 seconds.
-    _PATH_WARMUP_TICKS = 300
+    # At 100Hz control, 100 ticks = 1 second.  First cost grid is
+    # available after ~0.25s (4Hz scan), but wait 1s for 2-3 scans
+    # to build a reasonable obstacle picture.
+    _PATH_WARMUP_TICKS = 100
 
     # Diagnostic threshold: cells with cost >= this are counted as "obs".
     # Matches the A* passability threshold (robot_radius=0.15, trunc=0.5):
@@ -116,7 +118,7 @@ class DWANavigatorMixin:
         """
         import struct
 
-        # Don't plan until TSDF has scanned obstacles (first ~3s)
+        # Don't plan until TSDF has scanned obstacles (first ~1s)
         if self._step_count < self._PATH_WARMUP_TICKS:
             return
 

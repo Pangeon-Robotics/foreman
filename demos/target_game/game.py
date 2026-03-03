@@ -290,6 +290,8 @@ class TargetGame(
         # A* waypoint guidance
         self._current_waypoint = None
         self._wp_commit_until = 0
+        self._committed_path = None       # list[(float,float)] or None
+        self._committed_path_step = 0     # step when path was computed
 
         # Stuck detection
         self._stuck_check_dist = float('inf')
@@ -510,7 +512,14 @@ class TargetGame(
                 params, self._sim._t, kp=self._kp, kd=self._kd)
             self._sim._t += CONTROL_DT
         except RuntimeError:
-            print("Simulation stopped unexpectedly")
+            rc = None
+            try:
+                fw = self._sim._firmware
+                if fw is not None and fw._proc is not None:
+                    rc = fw._proc.poll()
+            except Exception:
+                pass
+            print(f"Simulation stopped unexpectedly (firmware exit={rc})")
             self._state = GameState.DONE
 
     def tick(self) -> bool:
