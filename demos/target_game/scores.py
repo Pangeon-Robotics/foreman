@@ -107,12 +107,18 @@ def compute_router_f1(
     god_grid = god_grid[:nx, :ny]
     robot_grid = robot_grid[:nx, :ny]
 
+    # Use 1.5× robot half-width so A* avoids corridors narrower than
+    # 1.05m (1.5 × 0.70m robot diameter).
+    _ROUTER_RADIUS = 0.525
+
     god_path = _astar_path(
         god_grid, start_xy, goal_xy,
-        god_meta['voxel_size'], god_meta['origin_x'], god_meta['origin_y'])
+        god_meta['voxel_size'], god_meta['origin_x'], god_meta['origin_y'],
+        robot_radius=_ROUTER_RADIUS)
     robot_path = _astar_path(
         robot_grid, start_xy, goal_xy,
-        robot_meta['voxel_size'], robot_meta['origin_x'], robot_meta['origin_y'])
+        robot_meta['voxel_size'], robot_meta['origin_x'], robot_meta['origin_y'],
+        robot_radius=_ROUTER_RADIUS)
 
     def _path_length_m(path, vs):
         d = 0.0

@@ -670,9 +670,13 @@ class TargetGame(
 
 def _astar_on_god_view(
     grid, meta, start: tuple[float, float], goal: tuple[float, float],
-    robot_radius: float = 0.35,
+    robot_radius: float = 0.525,
 ) -> list[tuple[float, float]] | None:
-    """Run A* on a god-view cost grid and return world-frame waypoints."""
+    """Run A* on a god-view cost grid and return world-frame waypoints.
+
+    robot_radius defaults to 0.525m = 1.5 × B2 half-width, so A* avoids
+    corridors narrower than 1.05m (1.5 × robot diameter).
+    """
     from .path_critic import PathCritic
     critic = PathCritic.__new__(PathCritic)
     critic._cost_grid = grid
