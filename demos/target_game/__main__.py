@@ -561,11 +561,8 @@ def run_game(args) -> GameRunResult:
                     # Default costmap_z_hi=0.55 misses all horizontal hits.
                     pcfg.costmap_z_hi = 0.80
 
-                    # Align robot-view TSDF with god-view: instant convergence
-                    # (lo_hit=3.0 crosses the 2.0 surface threshold in one hit),
-                    # permanent persistence (no decay), and matched grid geometry.
-                    # This makes the robot TSDF directly comparable to god-view
-                    # for Surface/Cost/Router F1 scoring.
+                    # Instant convergence: lo_hit=3.0 crosses surface threshold
+                    # in one hit, matching god-view integration behavior.
                     pcfg.tsdf_log_odds_hit = 3.0
                     pcfg.tsdf_log_odds_max = 5.0
                     pcfg.tsdf_log_odds_free = 0.25
@@ -579,7 +576,42 @@ def run_game(args) -> GameRunResult:
                     # B2 LiDAR at z≈0.645m. -7° channel at 3.5m→z=0.22.
                     # 0.20 gives ~3.5m detection range while rejecting
                     # -15° ground hits (z<0.13 at 2m+).
-                    perception._MIN_WORLD_Z = 0.20
+                    # With direct scanner, use 0.05 to match god-view
+                    # (no ground noise risk since we use geom exclusion).
+                    # Without direct scanner, keep 0.20 to reject DDS
+                    # ground artifacts from progressive scan rotation.
+                    perception._MIN_WORLD_Z = 0.05
+
+                    # Direct scanner: instant raycasting bypasses DDS
+                    # progressive scan to eliminate motion-blur phantoms.
+                    # MUST be initialized BEFORE DDS subscription to prevent
+                    # early DDS scans from adding motion-blurred phantoms
+                    # to the robot TSDF before _direct_ready blocks them.
+                    # If god-view mode is active, create god_tsdf first and
+                    # share its MuJoCo model so both produce identical rays
+                    # (eliminates cell-boundary disagreements in scoring).
+                    _god_mj_model = None
+                    _god_mj_data = None
+                    if getattr(args, 'god', False) and obstacle_bodies:
+                        from .god_tsdf import GodViewTSDF
+                        god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
+                        game._god_view_tsdf = god_tsdf
+                        _god_mj_model = god_tsdf._model
+                        _god_mj_data = god_tsdf._data
+                        print(f"God-view TSDF: {god_tsdf._n_rays} rays, "
+                              f"exclude {len(god_tsdf._robot_geom_ids)} robot geoms, "
+                              f"voxel={god_tsdf._tsdf.voxel_size}m")
+
+                    perception.init_direct_scanner(
+                        str(scene_path), robot=args.robot,
+                        mj_model=_god_mj_model, mj_data=_god_mj_data)
+                    print(f"Direct scanner: {perception._direct_n_rays} rays, "
+                          f"exclude {len(perception._direct_robot_geoms)} robot + "
+                          f"{len(perception._direct_target_geoms)} target geoms")
+
+                    # Subscribe to DDS AFTER direct scanner is ready.
+                    # _direct_ready=True causes on_point_cloud to return
+                    # immediately, so DDS scans won't pollute the TSDF.
                     cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
                     cloud_sub.Init(perception.on_point_cloud, 5)
                     game._perception = perception
@@ -595,15 +627,17 @@ def run_game(args) -> GameRunResult:
                           f"max_arc={pcfg.dwa_max_arc_length}m, "
                           f"v_max={pcfg.v_max}, w_max={pcfg.w_max}")
 
-                    # Wait for first point cloud (DDS discovery + LiDAR scan)
-                    import time as _time
-                    _pc_deadline = _time.monotonic() + 5.0
-                    while perception.costmap_query is None and _time.monotonic() < _pc_deadline:
-                        _time.sleep(0.1)
-                    if perception.costmap_query is not None:
-                        print(f"First costmap received ({perception.stats['builds']} builds)")
-                    else:
-                        print("Warning: no point cloud received after 5s (DWA will use fallback)")
+                    # With direct scanner, first costmap comes from game
+                    # tick (step 50). Without direct scanner, wait for DDS.
+                    if not perception._direct_ready:
+                        import time as _time
+                        _pc_deadline = _time.monotonic() + 5.0
+                        while perception.costmap_query is None and _time.monotonic() < _pc_deadline:
+                            _time.sleep(0.1)
+                        if perception.costmap_query is not None:
+                            print(f"First costmap received ({perception.stats['builds']} builds)")
+                        else:
+                            print("Warning: no point cloud received after 5s (DWA will use fallback)")
 
                     # Path critic with A* on world cost grid
                     from .path_critic import PathCritic
@@ -674,13 +708,15 @@ def run_game(args) -> GameRunResult:
 
         # God-view TSDF: perfect LiDAR → TSDF from known geometry.
         # Only created when --god is passed (scoring + blue overlay).
+        # May already be created above (shared model with direct scanner).
         if getattr(args, 'god', False) and obstacle_bodies:
-            from .god_tsdf import GodViewTSDF
-            god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
-            game._god_view_tsdf = god_tsdf
-            print(f"God-view TSDF: {god_tsdf._n_rays} rays, "
-                  f"exclude {len(god_tsdf._robot_geom_ids)} robot geoms, "
-                  f"voxel={god_tsdf._tsdf.voxel_size}m")
+            if game._god_view_tsdf is None:
+                from .god_tsdf import GodViewTSDF
+                god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
+                game._god_view_tsdf = god_tsdf
+                print(f"God-view TSDF: {god_tsdf._n_rays} rays, "
+                      f"exclude {len(god_tsdf._robot_geom_ids)} robot geoms, "
+                      f"voxel={god_tsdf._tsdf.voxel_size}m")
 
         # Path critic for non-obstacle runs (straight-line only, no A*)
         if game._path_critic is None:
@@ -734,9 +770,45 @@ def run_game(args) -> GameRunResult:
                 if "router" not in scores:
                     scores["router"] = {"f1": 0.0, "precision": 0.0, "recall": 0.0,
                                         "god_path_m": 0.0, "robot_path_m": 0.0}
-                print(f"\nScores: surface={scores['surface']['f1']:.1f} "
+                sf = scores['surface']
+                print(f"\nScores: surface={sf['f1']:.1f} "
+                      f"(P={sf['precision']:.1f} R={sf['recall']:.1f} "
+                      f"n_god={sf['n_god']} n_robot={sf['n_robot']}) "
                       f"cost={scores['cost']['f1']:.1f} "
                       f"router={scores['router']['f1']:.1f}")
+
+                # Diagnostic: Z distribution of surface voxels
+                import numpy as _np
+                god_vox = god_tsdf_obj._tsdf.get_surface_voxels(include_history=True)
+                robot_vox = robot_tsdf_obj.get_surface_voxels(include_history=True)
+                if len(god_vox) > 0 and len(robot_vox) > 0:
+                    print(f"\n=== SURFACE VOXEL DIAGNOSTICS ===")
+                    print(f"God voxels: {len(god_vox)}, Robot voxels: {len(robot_vox)}")
+                    print(f"God Z: min={god_vox[:,2].min():.3f} max={god_vox[:,2].max():.3f} "
+                          f"mean={god_vox[:,2].mean():.3f}")
+                    print(f"Robot Z: min={robot_vox[:,2].min():.3f} max={robot_vox[:,2].max():.3f} "
+                          f"mean={robot_vox[:,2].mean():.3f}")
+                    # Z histogram at 0.1m bins
+                    for label, vox in [("God", god_vox), ("Robot", robot_vox)]:
+                        zbins = _np.arange(-0.5, 1.6, 0.1)
+                        hist, _ = _np.histogram(vox[:, 2], bins=zbins)
+                        nz = [(f"{zbins[i]:.1f}:{h}" ) for i, h in enumerate(hist) if h > 0]
+                        print(f"{label} Z hist: {' '.join(nz)}")
+                    # XY range
+                    print(f"God XY: x=[{god_vox[:,0].min():.1f},{god_vox[:,0].max():.1f}] "
+                          f"y=[{god_vox[:,1].min():.1f},{god_vox[:,1].max():.1f}]")
+                    print(f"Robot XY: x=[{robot_vox[:,0].min():.1f},{robot_vox[:,0].max():.1f}] "
+                          f"y=[{robot_vox[:,1].min():.1f},{robot_vox[:,1].max():.1f}]")
+                    # Surface history size
+                    print(f"God history: {len(god_tsdf_obj._tsdf._surface_history)}")
+                    print(f"Robot history: {len(robot_tsdf_obj._surface_history)}")
+                    # Active chunks
+                    print(f"God chunks: {len(god_tsdf_obj._tsdf._chunks)}")
+                    print(f"Robot chunks: {len(robot_tsdf_obj._chunks)}")
+                    # Scan counts
+                    if hasattr(game._perception, '_direct_scan_count'):
+                        print(f"Robot direct scans: {game._perception._direct_scan_count}")
+                    print(f"Robot DDS scans: {game._perception.stats.get('builds', 0)}")
             except Exception as e:
                 print(f"Warning: score computation failed: {e}")
 

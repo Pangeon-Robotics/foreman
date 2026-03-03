@@ -595,12 +595,21 @@ class TargetGame(
                     except OSError:
                         pass
 
-        # God-view TSDF: perfect raycast → TSDF voxels (written to temp file)
-        if (self._god_view_tsdf is not None
-                and self._step_count % 50 == 0):
-            x, y, yaw, z, _, _ = self._get_robot_pose()
-            self._god_view_tsdf.update(x, y, yaw, z)
-            self._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
+        # God-view + direct scanner: both scan from the same pose in the
+        # same tick to ensure identical TSDF inputs (surface F1 scoring).
+        if self._step_count % 50 == 0:
+            _scan_x, _scan_y, _scan_yaw, _scan_z, _, _ = self._get_robot_pose()
+
+            # God-view TSDF: perfect raycast → TSDF voxels (written to temp file)
+            if self._god_view_tsdf is not None:
+                self._god_view_tsdf.update(_scan_x, _scan_y, _scan_yaw, _scan_z)
+                self._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
+
+            # Direct scanner: instant raycast into robot TSDF (no motion blur)
+            if (self._perception is not None
+                    and getattr(self._perception, '_direct_ready', False)):
+                self._perception.direct_scan(
+                    _scan_x, _scan_y, _scan_z, _scan_yaw)
 
         # Robot-view TSDF: write surface voxels to temp file for MuJoCo viewer
         if (self._step_count % 50 == 0

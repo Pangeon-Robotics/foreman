@@ -247,6 +247,10 @@ class PerceptionPipeline:
         # Shutdown flag: when True, DDS callback exits immediately.
         self._shutdown = False
 
+        # When True, DDS callback skips TSDF integration (direct scanner
+        # handles it instead). DDS still updates costmaps.
+        self._direct_ready = False
+
         # Full 6-DOF IMU pose (set by game tick, read by DDS callback)
         self._imu_lock = threading.Lock()
         self._imu_x = 0.0
@@ -267,6 +271,192 @@ class PerceptionPipeline:
         self._CostmapQuery = CostmapQuery
         self._PointCloud = PointCloud
         self._Pose2D = Pose2D
+
+    # ------------------------------------------------------------------
+    # Direct scanner: instant raycasting bypassing DDS progressive scan
+    # ------------------------------------------------------------------
+
+    def init_direct_scanner(self, scene_xml_path: str,
+                            robot: str = "b2",
+                            mj_model=None, mj_data=None) -> None:
+        """Set up direct MuJoCo raycasting for motion-blur-free TSDF.
+
+        Loads a static copy of the scene and pre-computes ray directions
+        matching the real LiDAR (Hesai XT16: 2000 H x 16 V = 32000 rays).
+        Call direct_scan() from game tick at desired rate.
+
+        If mj_model/mj_data are provided, reuse them instead of loading
+        a new model. This ensures identical raycasting results when both
+        god-view and robot TSDFs share the same collision geometry.
+        """
+        import mujoco
+
+        if mj_model is not None and mj_data is not None:
+            self._direct_model = mj_model
+            self._direct_data = mj_data
+        else:
+            self._direct_model = mujoco.MjModel.from_xml_path(scene_xml_path)
+            self._direct_data = mujoco.MjData(self._direct_model)
+            mujoco.mj_forward(self._direct_model, self._direct_data)
+
+        # Find robot root body
+        site_id = mujoco.mj_name2id(
+            self._direct_model, mujoco.mjtObj.mjOBJ_SITE, "lidar")
+        exclude_body = -1
+        if site_id >= 0:
+            body_id = self._direct_model.site_bodyid[site_id]
+            while self._direct_model.body_parentid[body_id] != 0:
+                body_id = self._direct_model.body_parentid[body_id]
+            exclude_body = body_id
+        self._direct_exclude_body = exclude_body
+
+        # Collect ALL robot geom IDs (root + child bodies)
+        self._direct_robot_geoms = set()
+        if exclude_body >= 0:
+            bodies = [exclude_body]
+            visited = set()
+            while bodies:
+                bid = bodies.pop()
+                if bid in visited:
+                    continue
+                visited.add(bid)
+                for g in range(self._direct_model.ngeom):
+                    if self._direct_model.geom_bodyid[g] == bid:
+                        self._direct_robot_geoms.add(g)
+                for child in range(self._direct_model.nbody):
+                    if self._direct_model.body_parentid[child] == bid:
+                        bodies.append(child)
+
+        # Target geom IDs
+        self._direct_target_geoms = set()
+        target_body = mujoco.mj_name2id(
+            self._direct_model, mujoco.mjtObj.mjOBJ_BODY, "target")
+        if target_body >= 0:
+            for g in range(self._direct_model.ngeom):
+                if self._direct_model.geom_bodyid[g] == target_body:
+                    self._direct_target_geoms.add(g)
+        self._direct_exclude_geoms = (
+            self._direct_robot_geoms | self._direct_target_geoms)
+
+        # Pre-compute ray directions (matching lidar.py defaults)
+        h_angles = np.deg2rad(np.arange(0.0, 360.0, 0.18))
+        v_angles_deg = [-15, -13, -11, -9, -7, -5, -3, -1,
+                        1, 3, 5, 7, 9, 11, 13, 15]
+        dirs = []
+        for v_deg in v_angles_deg:
+            v_rad = np.deg2rad(v_deg)
+            cos_v, sin_v = np.cos(v_rad), np.sin(v_rad)
+            channel = np.column_stack([
+                np.cos(h_angles) * cos_v,
+                np.sin(h_angles) * cos_v,
+                np.full_like(h_angles, sin_v),
+            ])
+            dirs.append(channel)
+        self._direct_ray_dirs = np.ascontiguousarray(
+            np.vstack(dirs), dtype=np.float64)
+        self._direct_n_rays = len(self._direct_ray_dirs)
+
+        # Working arrays
+        self._direct_geomid = np.zeros(self._direct_n_rays, dtype=np.int32)
+        self._direct_dist = np.zeros(self._direct_n_rays, dtype=np.float64)
+
+        # Sensor offset per robot
+        offsets = {
+            "b2": [0.34, 0.0, 0.18],
+            "go2": [0.20, 0.0, 0.10],
+            "go2w": [0.20, 0.0, 0.10],
+            "b2w": [0.34, 0.0, 0.18],
+        }
+        self._direct_sensor_offset = np.array(
+            offsets.get(robot, [0.34, 0.0, 0.18]), dtype=np.float64)
+
+        self._direct_ready = True
+        self._direct_scan_count = 0
+
+    def direct_scan(self, x: float, y: float, z: float,
+                    yaw: float) -> int:
+        """Cast rays and integrate into TSDF. Call from game tick.
+
+        Returns number of valid hits integrated.
+        """
+        import mujoco
+
+        if not getattr(self, '_direct_ready', False):
+            return 0
+
+        # Sensor world position (yaw-only rotation, matching god-view)
+        c, s = np.cos(yaw), np.sin(yaw)
+        off = self._direct_sensor_offset
+        sx = x + c * off[0] - s * off[1]
+        sy = y + s * off[0] + c * off[1]
+        sz = z + off[2]
+        sensor_pos = np.array([sx, sy, sz], dtype=np.float64)
+
+        # Rotate ray directions from sensor-local to world frame
+        R_yaw = np.array([
+            [c, -s, 0], [s, c, 0], [0, 0, 1],
+        ], dtype=np.float64)
+        rays_world = (R_yaw @ self._direct_ray_dirs.T).T
+        rays_flat = np.ascontiguousarray(rays_world.flatten())
+
+        # Cast all rays at once (no progressive scan, no motion blur)
+        mujoco.mj_multiRay(
+            m=self._direct_model, d=self._direct_data,
+            pnt=sensor_pos, vec=rays_flat,
+            geomgroup=None, flg_static=1,
+            bodyexclude=self._direct_exclude_body,
+            geomid=self._direct_geomid,
+            dist=self._direct_dist,
+            nray=self._direct_n_rays, cutoff=10.0,
+        )
+
+        # Filter valid hits
+        valid = ((self._direct_dist >= 0.05)
+                 & (self._direct_dist <= 10.0))
+        if not np.any(valid):
+            return 0
+
+        dists = self._direct_dist[valid]
+        dirs_v = rays_world[valid]
+        geomids = self._direct_geomid[valid]
+
+        # Exclude robot + target geoms
+        if self._direct_exclude_geoms:
+            keep = np.ones(len(geomids), dtype=bool)
+            for gid in self._direct_exclude_geoms:
+                keep &= geomids != gid
+            dists = dists[keep]
+            dirs_v = dirs_v[keep]
+
+        if len(dists) == 0:
+            return 0
+
+        # Compute world hit points
+        hits = sensor_pos + dirs_v * dists[:, np.newaxis]
+        hits = hits.astype(np.float32)
+
+        # Ground filter
+        hits = hits[hits[:, 2] >= self._MIN_WORLD_Z]
+        if len(hits) == 0:
+            return 0
+
+        # Target geoms already excluded by geom ID (no XY distance
+        # filter needed — that's only for the DDS path where geom IDs
+        # are unavailable).
+
+        # Integrate into TSDF
+        self._tsdf.integrate_scan_world(hits, float(sx), float(sy))
+        self._direct_scan_count += 1
+
+        # Build cost grids after every integration (main thread, safe).
+        with self._imu_lock:
+            ix, iy = self._imu_x, self._imu_y
+        self._build_cost_grids(self._tsdf, ix, iy)
+        query = LiveCostmapQuery(self)
+        with self._lock:
+            self._costmap_query = query
+
+        return len(hits)
 
     def shutdown(self) -> None:
         """Stop the DDS callback from processing new scans."""
@@ -359,6 +549,12 @@ class PerceptionPipeline:
         body center on B2).
         """
         if self._shutdown:
+            return
+
+        # When direct scanner is active, skip DDS callback entirely.
+        # Cost grids are built in direct_scan() (main thread) to avoid
+        # thread-safety issues with concurrent TSDF access.
+        if self._direct_ready:
             return
 
         # Time-based throttle: skip scans that arrive too fast (wall time).
