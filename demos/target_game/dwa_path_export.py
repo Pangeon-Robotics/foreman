@@ -19,18 +19,18 @@ PATH_WARMUP_TICKS = 100
 # Diagnostic threshold: cells with cost >= this are counted as "obs".
 VIZ_OBS_THRESHOLD = 177
 
+# Force replan when robot strays this far from the committed path.
+# Prevents green dots from appearing disconnected from the robot.
+MAX_PATH_DEVIATION = 1.0  # meters
+
 
 def validate_committed_path(committed_path, committed_path_step, step_count,
-                            nav_x, nav_y, target_x, target_y):
+                            robot_x, robot_y, target_x, target_y):
     """Reuse committed path if it's recent and aimed at the right target.
 
-    Time-based hold: the path is kept for 5 seconds unconditionally.
-    No cost-grid sampling -- the TSDF updates every 0.5s and would
-    constantly invalidate smoothed paths that graze obstacle zones,
-    causing the green dots to flicker between routes.
-
     Returns trimmed path (with robot position prepended) if valid,
-    None to trigger replan.
+    None to trigger replan.  Forces replan when the robot has deviated
+    > MAX_PATH_DEVIATION from the nearest path point.
     """
     path = committed_path
     if path is None or len(path) < 2:
@@ -48,16 +48,22 @@ def validate_committed_path(committed_path, committed_path_step, step_count,
     # Trim: drop points the robot has already passed
     best_i, best_d2 = 0, float('inf')
     for i, (px, py) in enumerate(path):
-        d2 = (px - nav_x)**2 + (py - nav_y)**2
+        d2 = (px - robot_x)**2 + (py - robot_y)**2
         if d2 < best_d2:
             best_d2 = d2
             best_i = i
+
+    # Robot has deviated too far from the committed path -- replan
+    # so the green dots don't appear disconnected from the robot.
+    if best_d2 > MAX_PATH_DEVIATION * MAX_PATH_DEVIATION:
+        return None
+
     trimmed = path[best_i:]
     if len(trimmed) < 2:
         return None
 
     # Prepend robot position so dots always start at the robot
-    return [(nav_x, nav_y)] + list(trimmed)
+    return [(robot_x, robot_y)] + list(trimmed)
 
 
 def waypoint_from_path(path, nav_x, nav_y, lookahead=2.0):
@@ -78,35 +84,18 @@ def waypoint_from_path(path, nav_x, nav_y, lookahead=2.0):
     return path[-1] if len(path) > best_i else None
 
 
-def export_path(game, nav_x, nav_y, target_x, target_y):
+def export_path(game, target_x, target_y):
     """Write robot-view A* path to temp file for headed viewer rendering.
 
-    Uses constrained A* (force_passable=False, robot_radius=0.15)
-    which blocks cells >= 177 -- obstacle-free by construction.
-    The inflated A* grid creates boundary barriers at the
-    observed/unobserved edge, so the A* path is typically partial
-    (stops at the boundary).  A straight-line extension through
-    unobserved space connects the partial path to the target.
-
-    Committed path is held for 5 seconds (time-based, no cost-grid
-    re-validation) to prevent green dot flickering from TSDF updates.
-
-    Skips planning for the first 3 seconds (300 ticks) to wait for
-    TSDF to accumulate obstacle data.
-
-    ROBOT-VIEW ONLY: cost grid comes from the robot's perception
-    pipeline (LiDAR -> TSDF -> costmap).  A* start uses ground-truth
-    position because the cost grid obstacles are in GT world frame
-    (from mj_multiRay).  SLAM drifts from GT, so using SLAM as the
-    A* start would place the path origin meters from the rendered robot.
+    Uses ground-truth position (not SLAM) because the cost grid obstacles
+    are in GT world frame (from mj_multiRay).  Committed path is held for
+    5 seconds to prevent green dot flickering from TSDF updates, but
+    forced to replan if the robot deviates > MAX_PATH_DEVIATION.
     """
     # Don't plan until TSDF has scanned obstacles (first ~1s)
     if game._step_count < PATH_WARMUP_TICKS:
         return
 
-    # Ground-truth position for A* start and path rendering.
-    # Cost grid obstacles are in GT world frame, so A* must start
-    # from GT too. SLAM (nav_x, nav_y) drifts from GT over time.
     x_gt, y_gt, _, _, _, _ = game._get_robot_pose()
     if game._committed_path is None:
         print(f"  [EXPORT] REPLAN gt=({x_gt:.2f},{y_gt:.2f})", flush=True)

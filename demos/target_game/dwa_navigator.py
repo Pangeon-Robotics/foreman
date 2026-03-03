@@ -231,7 +231,7 @@ class DWANavigator:
         # Refresh the viz file at 10Hz
         if (g._committed_path is not None
                 and g._target_step_count % 10 == 0):
-            export_path(g, nav_x, nav_y, target.x, target.y)
+            export_path(g, target.x, target.y)
 
         if not should_replan:
             return
@@ -283,7 +283,7 @@ class DWANavigator:
         g._last_replan_step = g._target_step_count
 
         # Update path visualization (green dots) when plan changes
-        export_path(g, nav_x, nav_y, target.x, target.y)
+        export_path(g, target.x, target.y)
 
     def _dwa_replan(self, nav_x, nav_y, nav_yaw, target, dist,
                     heading_err, goal_behind, use_waypoint):

@@ -145,6 +145,7 @@ class TargetGame:
         self._cached_pose: (
             tuple[float, float, float, float, float, float] | None
         ) = None
+        self._glitch_ticks = 0
 
         # --- Composed helpers ---
         self.nav = Navigator(self)
@@ -158,7 +159,9 @@ class TargetGame:
     def _get_robot_pose(self):
         """Return (x, y, yaw, z, roll, pitch) from ground truth.
 
-        Includes glitch rejection: jumps > 2m return cached pose.
+        Includes glitch rejection: jumps > 2m are rejected for up to
+        0.5s (50 ticks at 100Hz).  If the new position persists beyond
+        the grace period, it's accepted as real (fall recovery, collision).
         """
         body = self._sim.get_body("base")
         x = float(body.pos[0])
@@ -171,7 +174,11 @@ class TargetGame:
             dx = x - self._cached_pose[0]
             dy = y - self._cached_pose[1]
             if math.sqrt(dx * dx + dy * dy) > 2.0:
-                return self._cached_pose
+                if self._glitch_ticks < 50:
+                    self._glitch_ticks += 1
+                    return self._cached_pose
+                # Grace period expired — accept new position
+        self._glitch_ticks = 0
         self._cached_pose = pose
         return pose
 
