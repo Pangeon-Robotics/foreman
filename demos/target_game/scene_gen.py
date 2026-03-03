@@ -68,15 +68,17 @@ _FIELD_Y_MIN = -3.5
 _FIELD_Y_MAX = 3.5
 
 # Obstacle geometry ranges
-_CYL_R_MIN, _CYL_R_MAX = 0.15, 0.35
+# Max radius 0.30m: keeps min gap passable for B2 (0.5m body + 0.3m sway margin)
+_CYL_R_MIN, _CYL_R_MAX = 0.15, 0.30
 _CYL_HH_MIN, _CYL_HH_MAX = 0.30, 0.50
-_BOX_H_MIN, _BOX_H_MAX = 0.15, 0.35
+_BOX_H_MIN, _BOX_H_MAX = 0.15, 0.30
 
 # Minimum center-to-center distance between obstacles
-_MIN_SPACING = 1.5
+# 2.0m gives ~1.4m edge-to-edge gap at max size — comfortable for B2
+_MIN_SPACING = 2.0
 
-# Number of obstacles
-_N_MIN, _N_MAX = 15, 20
+# Number of obstacles (matches hand-crafted scene difficulty)
+_N_MIN, _N_MAX = 8, 12
 
 
 def _generate_obstacles(rng: random.Random, n: int) -> list[Obstacle]:

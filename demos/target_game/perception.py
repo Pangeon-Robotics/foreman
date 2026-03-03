@@ -458,6 +458,85 @@ class PerceptionPipeline:
 
         return len(hits)
 
+    def direct_scan_only(self, x: float, y: float, z: float,
+                         yaw: float) -> int:
+        """Raycast + TSDF integration only, NO cost grid build.
+
+        Cost grid build is deferred to build_cost_grids_from_main()
+        on a later tick to avoid blocking the control loop for 200+ms.
+        """
+        import mujoco
+
+        if not getattr(self, '_direct_ready', False):
+            return 0
+
+        c, s = np.cos(yaw), np.sin(yaw)
+        off = self._direct_sensor_offset
+        sx = x + c * off[0] - s * off[1]
+        sy = y + s * off[0] + c * off[1]
+        sz = z + off[2]
+        sensor_pos = np.array([sx, sy, sz], dtype=np.float64)
+
+        R_yaw = np.array([
+            [c, -s, 0], [s, c, 0], [0, 0, 1],
+        ], dtype=np.float64)
+        rays_world = (R_yaw @ self._direct_ray_dirs.T).T
+        rays_flat = np.ascontiguousarray(rays_world.flatten())
+
+        mujoco.mj_multiRay(
+            m=self._direct_model, d=self._direct_data,
+            pnt=sensor_pos, vec=rays_flat,
+            geomgroup=None, flg_static=1,
+            bodyexclude=self._direct_exclude_body,
+            geomid=self._direct_geomid,
+            dist=self._direct_dist,
+            nray=self._direct_n_rays, cutoff=10.0,
+        )
+
+        valid = ((self._direct_dist >= 0.05)
+                 & (self._direct_dist <= 10.0))
+        if not np.any(valid):
+            return 0
+
+        dists = self._direct_dist[valid]
+        dirs_v = rays_world[valid]
+        geomids = self._direct_geomid[valid]
+
+        if self._direct_exclude_geoms:
+            keep = np.ones(len(geomids), dtype=bool)
+            for gid in self._direct_exclude_geoms:
+                keep &= geomids != gid
+            dists = dists[keep]
+            dirs_v = dirs_v[keep]
+
+        if len(dists) == 0:
+            return 0
+
+        hits = sensor_pos + dirs_v * dists[:, np.newaxis]
+        hits = hits.astype(np.float32)
+        hits = hits[hits[:, 2] >= self._MIN_WORLD_Z]
+        if len(hits) == 0:
+            return 0
+
+        self._tsdf.integrate_scan_world(hits, float(sx), float(sy))
+        self._direct_scan_count += 1
+        return len(hits)
+
+    def build_cost_grids_from_main(self) -> None:
+        """Build cost grids from TSDF. Call from game tick on a staggered phase.
+
+        This is the expensive operation (~65-100ms for EDT) that was
+        previously bundled into direct_scan(), blocking the control loop.
+        """
+        if self._tsdf is None:
+            return
+        with self._imu_lock:
+            ix, iy = self._imu_x, self._imu_y
+        self._build_cost_grids(self._tsdf, ix, iy)
+        query = LiveCostmapQuery(self)
+        with self._lock:
+            self._costmap_query = query
+
     def shutdown(self) -> None:
         """Stop the DDS callback from processing new scans."""
         self._shutdown = True

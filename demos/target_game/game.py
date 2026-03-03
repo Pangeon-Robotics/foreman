@@ -595,45 +595,53 @@ class TargetGame(
                     except OSError:
                         pass
 
-        # God-view + direct scanner: both scan from the same pose in the
-        # same tick to ensure identical TSDF inputs (surface F1 scoring).
-        if self._step_count % 50 == 0:
+        # --- Staggered perception work ---
+        # Spread expensive operations across different ticks to avoid
+        # blocking the control loop for 200-300ms on a single tick.
+        # Each operation runs at 4Hz (every 25 ticks) but offset.
+        # Previous 50-tick cycle (2Hz) let robot move 1.14m between
+        # scans at v_theory=1.14 m/s — outrunning perception.
+        _phase = self._step_count % 25
+
+        # Phase 0: God-view + DirectScanner raycasts (same pose for F1 scoring)
+        # Raycast is fast (~5ms each via mj_multiRay C call).
+        # Cost grid build is DEFERRED to phase 10.
+        if _phase == 0:
             _scan_x, _scan_y, _scan_yaw, _scan_z, _, _ = self._get_robot_pose()
 
-            # God-view TSDF: perfect raycast → TSDF voxels (written to temp file)
             if self._god_view_tsdf is not None:
                 self._god_view_tsdf.update(_scan_x, _scan_y, _scan_yaw, _scan_z)
                 self._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
 
-            # Direct scanner: instant raycast into robot TSDF (no motion blur)
             if (self._perception is not None
                     and getattr(self._perception, '_direct_ready', False)):
-                self._perception.direct_scan(
+                self._perception.direct_scan_only(
                     _scan_x, _scan_y, _scan_z, _scan_yaw)
 
-        # Robot-view TSDF: write surface voxels to temp file for MuJoCo viewer
-        if (self._step_count % 50 == 0
-                and self._perception is not None
-                and self._perception._tsdf is not None):
-            _write_robot_tsdf_file(self._perception._tsdf)
+        # Phase 10: Cost grid build (~65-100ms — the expensive part).
+        # Runs every OTHER cycle (2Hz) to limit GIL blocking.
+        # Scans run at 4Hz above so TSDF has fresh data.
+        _cycle = self._step_count // 25
+        if _phase == 10 and _cycle % 2 == 0 and self._perception is not None:
+            self._perception.build_cost_grids_from_main()
 
-        # Robot-view costmap: built from TSDF surface history (matches grey cubes)
-        if (self._step_count % 50 == 0
-                and self._perception is not None
-                and self._perception._tsdf is not None):
-            _write_robot_costmap_file(self._perception._tsdf)
-
-        # Feed cost grid to path critic (unconditional — not gated on viewer)
-        if (self._step_count % 50 == 0
-                and self._perception is not None
-                and self._path_critic is not None):
-            cost_grid = self._perception.world_cost_grid
-            meta = self._perception.world_cost_meta
-            if cost_grid is not None and meta is not None:
-                self._path_critic.set_world_cost(
-                    cost_grid, meta['origin_x'], meta['origin_y'],
-                    meta['voxel_size'],
-                    truncation=meta.get('truncation', 0.5))
+        # Phase 15: Path critic update + viewer file writes
+        if _phase == 15:
+            if (self._perception is not None
+                    and self._path_critic is not None):
+                cost_grid = self._perception.world_cost_grid
+                meta = self._perception.world_cost_meta
+                if cost_grid is not None and meta is not None:
+                    self._path_critic.set_world_cost(
+                        cost_grid, meta['origin_x'], meta['origin_y'],
+                        meta['voxel_size'],
+                        truncation=meta.get('truncation', 0.5))
+            # Viewer file writes (headed mode only)
+            if (not self._headless
+                    and self._perception is not None
+                    and self._perception._tsdf is not None):
+                _write_robot_tsdf_file(self._perception._tsdf)
+                _write_robot_costmap_file(self._perception._tsdf)
 
         # Dynamic reach threshold
         if self._state == GameState.WALK_TO_TARGET:

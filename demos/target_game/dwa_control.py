@@ -243,7 +243,14 @@ class DWAControlMixin:
                 dwa_fwd_target = max(0.02, dwa.forward)
                 if not drift_dampened:
                     if dwa_fwd_target < self._smooth_dwa_fwd:
-                        self._smooth_dwa_fwd += C.DWA_FWD_DECEL_ALPHA * (
+                        # Brake harder near obstacles: with default alpha
+                        # (0.15), decel from 1.0→0.65 takes 2.5s = 1.75m
+                        # of travel into obstacle zone.  At 0.40, same
+                        # drop takes ~0.5s = 0.35m.
+                        decel_alpha = C.DWA_FWD_DECEL_ALPHA
+                        if dwa.n_feasible < 30:
+                            decel_alpha = 0.40
+                        self._smooth_dwa_fwd += decel_alpha * (
                             dwa_fwd_target - self._smooth_dwa_fwd)
                     else:
                         self._smooth_dwa_fwd += C.DWA_FWD_ACCEL_ALPHA * (
@@ -294,31 +301,53 @@ class DWAControlMixin:
                     and not goal_behind):
                 heading_mod = max(heading_mod, C.TURN_STEP_FLOOR)
             # Open-field speed floor: maintain forward speed when DWA
-            # reports mostly clear (feas >= 35) and heading is reasonable.
+            # reports mostly clear and heading is reasonable.
             # Prevents TSDF transients from braking in open space.
-            if (dwa.n_feasible >= 35
+            if (dwa.n_feasible >= 30
                     and abs(nav_heading_err) < 0.8  # <45deg
                     and not goal_behind):
                 heading_mod = max(heading_mod, 0.65)
 
-            # Turn brake: cap forward speed when turning hard near
-            # obstacles.  Sideways-walking at high wz near obstacles
-            # causes falls (GIL pause + lateral forces).  Only brakes
-            # when DWA reports constrained arcs (feas < 35) AND the
-            # steering command is strong (|turn_cmd| > 0.5).
-            if dwa.n_feasible < 35 and abs(turn_cmd) > 0.5:
-                brake_cap = 0.4 - 0.2 * min(1.0, abs(turn_cmd))
+            # Combined fwd×wz stability: high speed + yaw rate near
+            # obstacles creates centripetal + gait-sway forces that
+            # exceed leg lateral budget.  Shed forward speed.
+            if dwa.n_feasible < 25 and abs(self._smooth_wz) > 0.3:
+                wz_penalty = (abs(self._smooth_wz) - 0.3) * 0.5
+                heading_mod = max(0.15, heading_mod - wz_penalty)
+
+            # Turn brake: cap forward speed when turning near obstacles.
+            if dwa.n_feasible < 25 and abs(turn_cmd) > 0.3:
+                brake_cap = 0.5 - 0.3 * min(1.0, abs(turn_cmd))
                 heading_mod = min(heading_mod, max(0.15, brake_cap))
+
+            # Global speed cap: B2 at step=0.45/freq=3.0 is at the
+            # gait stability cliff (v_theory=1.35m/s).  Cap at 0.85
+            # gives step=0.38m (v_theory=1.14m/s), 15% margin for
+            # random perturbations that cause falls in open field.
+            heading_mod = min(heading_mod, 0.85)
 
             # Smooth to prevent jerky changes
             self._smooth_heading_mod += C.DWA_HEADING_MOD_ALPHA * (
                 heading_mod - self._smooth_heading_mod)
             heading_mod = self._smooth_heading_mod
 
+            # Instant decel at low feas: when heavily constrained
+            # (<20 arcs), bypass EMA and hard-set heading_mod.
+            # Default alpha=0.15 takes 0.2s to brake from full
+            # speed; at v=1.1m/s that's 0.22m — the entire
+            # remaining clearance at clr=0.2.
+            if dwa.n_feasible < 20 and heading_mod < self._smooth_heading_mod:
+                self._smooth_heading_mod = heading_mod
+
             wz = _clamp(
                 turn_cmd * C.WZ_LIMIT, -C.WZ_LIMIT, C.WZ_LIMIT)
             if not drift_dampened:
-                self._smooth_wz += C.DWA_WZ_SMOOTH_ALPHA * (wz - self._smooth_wz)
+                # Lower alpha near obstacles: prevents abrupt wz reversal
+                # (e.g. +0.3→-0.7 in 30ms) that destabilizes gait.
+                wz_alpha = C.DWA_WZ_SMOOTH_ALPHA
+                if dwa.n_feasible < 30:
+                    wz_alpha = 0.10
+                self._smooth_wz += wz_alpha * (wz - self._smooth_wz)
             wz = self._smooth_wz
 
             # Anti-orbit timer: if heading error stays above 35deg for
@@ -337,14 +366,20 @@ class DWAControlMixin:
             orbit_stuck = _orbit_ticks >= 200  # 2.0s at 100Hz
 
             # TIP mode: turn in place when target is behind, heading
-            # is very far off, or orbiting detected.
+            # is very far off, orbiting detected, or effectively stopped.
             # orbit_stuck bypasses heading_was_good: sustained off-heading
             # walking is a real orbit regardless of SLAM heading quality.
+            # low_speed_turn: when forward speed is near zero but heading
+            # error is large, walking at wz=1.5 with 0.02m steps is
+            # unstable — use TIP gait (wider stance, lower step height).
+            low_speed_turn = (self._smooth_dwa_fwd < 0.15
+                              and abs(heading_err) > C.THETA_THRESHOLD)
             enter_tip = (abs(heading_err) > C.THETA_THRESHOLD
                          and (orbit_stuck
+                              or low_speed_turn
                               or (not heading_was_good
                                   and (goal_behind
-                                       or abs(heading_err) > 1.22))))
+                                       or abs(heading_err) > 1.05))))
             stay_tip = (self._in_tip_mode
                         and abs(heading_err) > C.THETA_THRESHOLD)
             if enter_tip or stay_tip:

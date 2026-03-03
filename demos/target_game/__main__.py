@@ -498,6 +498,9 @@ def run_game(args) -> GameRunResult:
             timeout_steps=timeout_steps,
         )
 
+        # Headless flag — controls whether viewer file writes run in tick
+        game._headless = args.headless
+
         # Register obstacle bodies for ground-truth proximity checking
         if obstacle_bodies:
             game.set_obstacle_bodies(obstacle_bodies)
