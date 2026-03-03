@@ -19,74 +19,12 @@ import sys
 import time
 from pathlib import Path
 
+from ato_params import (
+    V_REF, PARAM_BOUNDS, SPEED_RAMP,
+    clamp, theoretical_speed, make_genome_json, get_initial_params,
+)
+
 _FOREMAN = Path(__file__).resolve().parent
-
-# V_REF for B2 — must match path_critic.py
-V_REF = 2.0
-
-# Parameter definitions: (initial, min, max, step)
-PARAM_BOUNDS = {
-    "STEP_LENGTH":     (0.30, 0.10, 0.70, 0.05),
-    "GAIT_FREQ":       (1.5,  1.0,  6.0,  0.5),
-    "STEP_HEIGHT":     (0.07, 0.03, 0.15, 0.01),
-    "DUTY_CYCLE":      (0.65, 0.50, 0.80, 0.05),
-    "TURN_WZ":         (1.0,  0.5,  2.0,  0.1),
-    "THETA_THRESHOLD": (0.6,  0.3,  0.8,  0.05),
-    "KP_YAW":          (2.0,  1.0,  5.0,  0.5),
-    # Turn params (keep stable during speed ramp)
-    "TURN_FREQ":       (3.0,  1.5,  5.0,  0.5),
-    "TURN_STEP_HEIGHT": (0.08, 0.04, 0.12, 0.01),
-    "TURN_DUTY_CYCLE": (0.55, 0.45, 0.65, 0.05),
-    "TURN_STANCE_WIDTH": (0.12, 0.08, 0.20, 0.02),
-}
-
-# Speed ramp progression: (STEP_LENGTH, GAIT_FREQ, STEP_HEIGHT)
-# Ratio STEP_LENGTH/GAIT_FREQ ~0.13-0.16, STEP_HEIGHT ~23% of STEP_LENGTH
-SPEED_RAMP = [
-    (0.40, 2.5, 0.09),
-    (0.45, 3.0, 0.10),
-    (0.50, 3.5, 0.11),
-    (0.55, 4.0, 0.12),
-    (0.60, 4.5, 0.13),
-    (0.65, 5.0, 0.14),
-]
-
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
-
-
-def theoretical_speed(step_length: float, gait_freq: float) -> float:
-    """Estimate theoretical max forward speed from gait params."""
-    return step_length * gait_freq
-
-
-def make_genome_json(params: dict) -> dict:
-    """Create a v12-format genome JSON from parameter dict."""
-    return {
-        "genome": {
-            "GAIT_FREQ": params["GAIT_FREQ"],
-            "STEP_LENGTH": params["STEP_LENGTH"],
-            "STEP_HEIGHT": params["STEP_HEIGHT"],
-            "DUTY_CYCLE": params["DUTY_CYCLE"],
-            "STANCE_WIDTH": params.get("STANCE_WIDTH", 0.0),
-            "KP_YAW": params["KP_YAW"],
-            "WZ_LIMIT": params.get("WZ_LIMIT", 1.5),
-            "TURN_FREQ": params["TURN_FREQ"],
-            "TURN_STEP_HEIGHT": params["TURN_STEP_HEIGHT"],
-            "TURN_DUTY_CYCLE": params["TURN_DUTY_CYCLE"],
-            "TURN_STANCE_WIDTH": params["TURN_STANCE_WIDTH"],
-            "TURN_WZ": params["TURN_WZ"],
-            "THETA_THRESHOLD": params["THETA_THRESHOLD"],
-        },
-        "generation": "ato_opt",
-        "fitness": 0.0,
-    }
-
-
-def get_initial_params() -> dict:
-    """Return the initial parameter set (current B2 defaults)."""
-    return {name: bounds[0] for name, bounds in PARAM_BOUNDS.items()}
 
 
 def run_evaluation(params: dict, iteration: int, n_runs: int, targets: int,
@@ -170,7 +108,6 @@ def analyze_and_propose(current_params: dict, results: dict,
         if prev_params is not None:
             reason = f"REVERT: {falls} falls ({fall_rate:.0%}), reverting to previous params"
             reverted = copy.deepcopy(prev_params)
-            # Try to stabilize: increase duty cycle or step height
             reverted["DUTY_CYCLE"] = clamp(
                 reverted["DUTY_CYCLE"] + 0.05 * step_scale,
                 *PARAM_BOUNDS["DUTY_CYCLE"][1:3])
@@ -185,7 +122,7 @@ def analyze_and_propose(current_params: dict, results: dict,
                 *PARAM_BOUNDS["DUTY_CYCLE"][1:3])
             return params, ramp_index, reason
 
-    # Some falls but not catastrophic — try stability tweaks without reverting speed
+    # Some falls but not catastrophic — try stability tweaks
     if falls > 0:
         reason = f"STABILITY: {falls} falls, increasing step_height and duty_cycle"
         params["STEP_HEIGHT"] = clamp(
@@ -198,10 +135,8 @@ def analyze_and_propose(current_params: dict, results: dict,
 
     # No falls — decide based on bottleneck
     if bottleneck == "speed" or speed_ratio < 0.8:
-        # Speed is the bottleneck — advance the speed ramp
         if ramp_index < len(SPEED_RAMP):
             sl, gf, sh = SPEED_RAMP[ramp_index]
-            # Safety: never increase >30% in one step
             max_sl = current_params["STEP_LENGTH"] * 1.3
             max_gf = current_params["GAIT_FREQ"] * 1.3
             sl = min(sl, max_sl)
@@ -213,7 +148,6 @@ def analyze_and_propose(current_params: dict, results: dict,
             reason = f"SPEED RAMP [{ramp_index}]: step={params['STEP_LENGTH']:.2f}, freq={params['GAIT_FREQ']:.1f}, v_theory={v_new:.2f}"
             return params, ramp_index + 1, reason
         else:
-            # Ramp exhausted — try finer increments
             params["STEP_LENGTH"] = clamp(
                 params["STEP_LENGTH"] + 0.03 * step_scale,
                 *PARAM_BOUNDS["STEP_LENGTH"][1:3])
@@ -318,19 +252,16 @@ def main():
     print(f"{'#'*72}\n")
 
     for iteration in range(start_iter, start_iter + args.max_iter):
-        # Run evaluation
         results = run_evaluation(
             params, iteration, args.n, args.targets, args.seed_offset)
 
         mean_ato = results.get("mean_ato") or 0.0
         falls = results.get("total_falls", 0)
 
-        # Track best
         if mean_ato > best_ato and falls == 0:
             best_ato = mean_ato
             best_params = copy.deepcopy(params)
 
-        # Check convergence
         if mean_ato >= args.target_ato and falls == 0:
             print(f"\n{'*'*72}")
             print(f"* CONVERGED at iteration {iteration}!")
@@ -342,7 +273,6 @@ def main():
                            ramp_index, step_scale, best_ato, best_params, None)
             break
 
-        # Track consecutive fall iterations for step_scale reduction
         if falls > 0:
             consecutive_fall_iters += 1
             if consecutive_fall_iters >= 2:
@@ -353,7 +283,6 @@ def main():
         else:
             consecutive_fall_iters = 0
 
-        # Check plateau
         if prev_results and prev_results.get("mean_ato"):
             improvement = mean_ato - prev_results["mean_ato"]
             if abs(improvement) < 2.0 and falls == 0:
@@ -365,24 +294,20 @@ def main():
             print(f"  [plateau] 3 iterations with <2 ATO improvement, trying orthogonal axis")
             plateau_count = 0
 
-        # Propose next parameters
         next_params, ramp_index, reason = analyze_and_propose(
             params, results, prev_params, prev_results,
             ramp_index, step_scale)
 
         print(f"\n  DECISION: {reason}")
 
-        # Log
         _log_iteration(log_path, iteration, params, results, reason,
                        ramp_index, step_scale, best_ato, best_params, next_params)
 
-        # Advance
         prev_params = copy.deepcopy(params)
         prev_results = results
         params = next_params
 
     else:
-        # Loop ended without converging
         print(f"\n{'='*72}")
         print(f"OPTIMIZATION COMPLETE (did not reach target ATO {args.target_ato})")
         print(f"Best ATO: {best_ato:.1f}")
@@ -390,7 +315,6 @@ def main():
             print(f"Best params: {json.dumps({k: round(v, 3) for k, v in best_params.items()})}")
         print(f"{'='*72}\n")
 
-    # Write final best params
     if best_params:
         final_path = _FOREMAN / "tmp" / "ato_best_params.json"
         final_path.write_text(json.dumps({

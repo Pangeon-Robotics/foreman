@@ -13,11 +13,12 @@ Usage:
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+from test_result_parser import parse_output
 
 _FOREMAN = Path(__file__).resolve().parent
 _WORKSPACE = _FOREMAN.parent
@@ -25,33 +26,6 @@ _WORKSPACE = _FOREMAN.parent
 # Environment: LD_PRELOAD for CycloneDDS 0.10.4
 _ENV = os.environ.copy()
 _ENV["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libddsc.so.0.10.4"
-
-# Regex patterns for parsing output
-_ATO_TABLE_LINE = re.compile(
-    r"^\s*(\d+)\s+"          # target number
-    r"([\d.]+)m\s+"          # A* distance
-    r"([\d.]+)s\s+"          # time
-    r"([\d.]+)\s+"           # ATO score
-    r"(\d+%)\s+"             # path efficiency
-    r"([\d.]+)\s+"           # v_avg
-    r"([\d.]+)m\s+"          # regression
-    r"([\d.]+)\s+"           # regression gate
-    r"([\d.]+)s"             # stall
-    r"(.*)"                  # optional TIMEOUT suffix
-)
-_ATO_AGG_LINE = re.compile(
-    r"^\s+([\d.]+)m\s+"      # total A* distance
-    r"([\d.]+)s\s+"          # total time
-    r"([\d.]+)\s+"           # aggregate ATO
-    r"(\d+%)\s+"             # aggregate path efficiency
-    r"([\d.]+)\s+"           # aggregate v_avg
-    r"([\d.]+)m\s+"          # total regression
-    r"([\d.]+)s"             # total stall
-)
-_TARGET_REACHED = re.compile(r"TARGET (\d+) REACHED in ([\d.]+)s")
-_TARGET_TIMEOUT = re.compile(r"TARGET (\d+) TIMEOUT after ([\d.]+)s")
-_PER_TARGET_ATO = re.compile(r"ATO=([\d.]+)\s+agg=([\d.]+)")
-_TARGETS_LINE = re.compile(r"Targets:\s*(\d+)/(\d+)\s+reached")
 
 # Module-level config for worker processes (set via _init_worker)
 _worker_targets = 4
@@ -76,75 +50,6 @@ def kill_firmware_on_domain(domain_id: int) -> None:
         session_file = Path(f"/tmp/robo_sessions/{pattern}")
         if session_file.exists():
             session_file.unlink(missing_ok=True)
-
-
-def parse_output(stdout: str) -> dict:
-    """Parse scenario runner stdout for ATO scores and target results."""
-    result = {
-        "targets": [],       # per-target info
-        "aggregate_ato": None,
-        "reached": 0,
-        "total": 0,
-        "falls": 0,
-        "error": None,
-        # ATO component breakdown (from aggregate line)
-        "path_efficiency": None,
-        "v_avg": None,
-        "regression": None,
-        "stall": None,
-    }
-
-    lines = stdout.split("\n")
-
-    # Parse per-target reached/timeout events with their ATO
-    for i, line in enumerate(lines):
-        m = _TARGET_REACHED.search(line)
-        if m:
-            idx, t = int(m.group(1)), float(m.group(2))
-            ato = 0.0
-            # Next line should have ATO details
-            if i + 1 < len(lines):
-                am = _PER_TARGET_ATO.search(lines[i + 1])
-                if am:
-                    ato = float(am.group(1))
-            result["targets"].append({"idx": idx, "time": t, "ato": ato, "timeout": False})
-            continue
-        m = _TARGET_TIMEOUT.search(line)
-        if m:
-            idx, t = int(m.group(1)), float(m.group(2))
-            result["targets"].append({"idx": idx, "time": t, "ato": 0.0, "timeout": True})
-
-    # Parse the ATO FITNESS aggregate line (last numbers line in the table)
-    in_ato_table = False
-    for line in lines:
-        if "=== ATO FITNESS" in line:
-            in_ato_table = True
-            continue
-        if in_ato_table:
-            # Try aggregate line (no target number, just starts with distance)
-            m = _ATO_AGG_LINE.match(line)
-            if m:
-                result["aggregate_ato"] = float(m.group(3))
-                # Extract components
-                pe_str = m.group(4)  # e.g., "95%"
-                result["path_efficiency"] = int(pe_str.rstrip("%")) / 100.0
-                result["v_avg"] = float(m.group(5))
-                result["regression"] = float(m.group(6))
-                result["stall"] = float(m.group(7))
-
-    # Parse targets line ("Targets: 3/4 reached (75%)")
-    for line in lines:
-        m = _TARGETS_LINE.search(line)
-        if m:
-            result["reached"] = int(m.group(1))
-            result["total"] = int(m.group(2))
-
-    # Check for falls
-    for line in lines:
-        if "FALL DETECTED" in line:
-            result["falls"] += 1
-
-    return result
 
 
 def run_worker(args: tuple) -> dict:

@@ -85,6 +85,19 @@ cd layer_3 && pytest tests/test_controller.py -v  # Single test file
 # Integration test: FEP observation chain (from workspace root)
 python foreman/test_observation_chain.py
 python foreman/test_observation_chain.py --demo  # With simulation demo
+
+# Parallel ATO scoring (4 headless scattered runs on separate DDS domains)
+python foreman/fast_test.py              # 4 parallel runs, prints stats
+python foreman/fast_test.py -n 8         # 8 parallel runs
+python foreman/fast_test.py --targets 3 --config path/to/params.json
+
+# ATO optimization loop (iteratively tunes gait params via fast_test.py)
+python foreman/ato_optimize.py           # Run optimization loop
+python foreman/ato_optimize.py --resume  # Resume from last iteration
+
+# Feedback loop validation (Surface F1, Cost F1, Router F1, ATO, falls)
+python foreman/run_scenario.py test      # 5-seed headless sweep, all metrics
+python -m foreman.demos.target_game.test_feedback_loop --seeds 5 --domain 20
 ```
 
 ### Target Game Demo
@@ -112,22 +125,50 @@ Runs Layers 1-4 together (legged robots use L4 GaitParams directly, wheeled robo
 
 With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body velocity) via `perception.py:PerceptionPipeline`. With `--obstacles`: loads `scene_target_obstacles.xml` and enables LiDAR point cloud processing into costmaps + DWA local planning. Costmap visualization is handled by `viz.py:CostmapOverlay`.
 
-**Target game module map** (split to meet 400-line limit):
+**Target game module map** (composition pattern, all files <400 lines):
 | File | Concern | Data domain |
 |------|---------|-------------|
-| `__main__.py` | Entry point, DDS preload, genome loading, arg parsing | Both (wires pipelines) |
+| `__main__.py` | Entry point, DDS preload, run_game(), main() | Both (wires pipelines) |
+| `genome_loader.py` | Genome expansion (v9/v10/v12) and application | N/A |
+| `scene_parser.py` | Scene XML obstacle body/geom parsing | N/A |
 | `game.py` | TargetGame core (init, tick, pose helpers) | Both (tick dispatches) |
 | `game_config.py` | Constants, enums, ROBOT_DEFAULTS, `configure_for_robot()` | N/A |
-| `scoring.py` | Lifecycle, scoring, run loop, statistics | N/A |
-| `navigator.py` | NavigatorMixin (heading/wheeled nav) | Robot-view |
-| `dwa_nav.py` | DWANavigatorMixin (DWA planning, waypoint guidance) | **Robot-view only** |
-| `dwa_control.py` | DWAControlMixin (gait conversion, stuck recovery) | Robot-view |
-| `path_critic.py` | Path quality evaluation, A* search | Data-agnostic (operates on given grid) |
-| `perception.py` | PerceptionPipeline (SLAM, LiDAR → costmap) | **Robot-view only** |
+| `game_scoring.py` | GameScoring helper (lifecycle, scoring, statistics) | N/A |
+| `game_setup.py` | Game initialization helpers (scenes, perception) | Both |
+| `game_viz.py` | Game visualization file writers | Both |
+| `game_astar.py` | God-view A* wrapper for game | **God-view only** |
+| `navigator_helper.py` | Navigator helper (heading/wheeled nav) | Robot-view |
+| `dwa_navigator.py` | DWANavigator helper (DWA planning, waypoints) | **Robot-view only** |
+| `dwa_path_export.py` | Green dot path export + constrained A* | Robot-view |
+| `dwa_controller.py` | DWAController helper (gait conversion, telemetry) | Robot-view |
+| `stuck_recovery.py` | StuckRecovery helper (stuck detection + TIP) | Robot-view |
+| `path_critic.py` | PathCritic (ATO metrics, recording, summary) | Data-agnostic |
+| `astar.py` | A* search on cost grids | Data-agnostic |
+| `path_smoother.py` | Catmull-Rom path smoothing | Data-agnostic |
+| `perception.py` | PerceptionPipeline core, LiveCostmapQuery | **Robot-view only** |
+| `reactive_scan.py` | ReactiveScanResult + reactive_scan() | **Robot-view only** |
+| `direct_scanner.py` | DirectScanner (bypass DDS LiDAR) | **Robot-view only** |
+| `costmap_builder.py` | Cost grid building + local TSDF clearing | **Robot-view only** |
 | `god_tsdf.py` | GodViewTSDF (perfect MuJoCo raycasts) | **God-view only** |
 | `viz.py` | CostmapOverlay, visualization helpers | Both (renders both) |
 | `target.py` | Target and TargetSpawner classes | N/A |
 | `utils.py` | Cross-layer shared utilities (canonical location) | N/A |
+| `scores.py` | Perception F1 metrics (Surface, Cost, Router) | Both (god vs robot) |
+| `scene_gen.py` | Procedural obstacle layout generation | N/A |
+| `debug_server.py` | UDP sender for Godot TSDF/costmap viewer | N/A |
+| `test_occupancy.py` | Occupancy accuracy test (3D surface + 2D projected) | Both |
+| `test_occupancy_gt.py` | GT surface sampling, TSDF materialization | Both |
+| `test_occupancy_3ds.py` | 3DS v2 metrics (adherence, completeness, phantom) | Both |
+| `test_costmap_compare.py` | Costmap comparison test orchestration | Both |
+| `test_costmap_helpers.py` | God-view costmap builders, A* route scoring | **God-view only** |
+
+TargetGame uses **composition** — helper objects receive `game` reference:
+```python
+self.nav = Navigator(self)           # navigator_helper.py
+self.dwa_nav = DWANavigator(self)    # dwa_navigator.py
+self.dwa_ctrl = DWAController(self)  # dwa_controller.py
+self.scoring = GameScoring(self)     # game_scoring.py
+```
 
 **Robot-view / god-view compliance**: Robot-view code (green dots, DWA, costmap) must NEVER access god-view data (GodViewTSDF, god_view_costmap, scene XML geometry). Both pipelines share ground-truth robot position for scan integration; the data separation is in what each pipeline *sees* (noisy LiDAR vs perfect raycasts), not where it looks from.
 
@@ -268,6 +309,20 @@ The target game `__main__.py` handles multiple genome formats via auto-detection
 | v12 | `GAIT_FREQ` | 13 | Sovereign walk + turn (separate turn genes) |
 
 Genomes are JSON files (either `{"genome": {...}}` or `{"locomotion": {...}, "steering": {...}}`). The `_apply_genome()` function flattens, detects version, expands to L5 constants, and patches module-level globals at runtime.
+
+## Validation Metrics
+
+`test_feedback_loop.py` is the primary validation harness. It runs multi-seed headless scenarios and checks:
+
+| Metric | Source | Threshold | Measures |
+|--------|--------|-----------|----------|
+| Surface F1 | `scores.py:compute_surface_f1()` | ≥50 | Robot TSDF voxels vs god-view TSDF |
+| Cost F1 | `scores.py:compute_cost_f1()` | ≥50 | Robot costmap cells vs god-view costmap |
+| Router F1 | `scores.py:compute_router_f1()` | ≥50 | A* path similarity (god vs robot grids) |
+| Targets | game result | ≥3 of 4 | Mean targets reached across seeds |
+| Falls | game result | ≤1 | Mean falls across seeds |
+
+The `run_scenario.py test` command is a convenience wrapper that invokes this harness. Use 5+ seeds for reliable A/B comparison (DDS non-determinism causes ±1 target, ±2 falls between runs).
 
 ## Cross-Repo Shared Utilities
 

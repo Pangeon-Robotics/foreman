@@ -17,18 +17,6 @@ from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Path setup for cross-layer imports.
-#
-# Layers 3, 4, and 5 each have a `config/` package with different contents.
-# Layer 5's simulation.py swaps config modules at import time, but the
-# SimulationManager constructor calls config functions at runtime from
-# both Layer 3 and Layer 4. Since both layers use
-# importlib.import_module("config.b2") which resolves via sys.modules,
-# the wrong config.b2 gets loaded.
-#
-# Fix: pre-populate each layer's _active_config cache by loading their
-# config.b2 modules directly by file path, bypassing sys.modules entirely.
-# Also replace Layer 4's load_config call in the constructor to use the
-# pre-loaded config.
 # ---------------------------------------------------------------------------
 _root = Path(__file__).resolve().parents[3]  # workspace root
 _layer5 = str(_root / "layer_5")
@@ -36,16 +24,16 @@ _layer5 = str(_root / "layer_5")
 if _layer5 not in sys.path:
     sys.path.insert(0, _layer5)
 
-# Import Layer 5 API (triggers import-time config swap for Layer 4/3)
 from simulation import SimulationManager
-from config.defaults import MotionCommand  # noqa: F401 — captured for game.py
+from config.defaults import MotionCommand  # noqa: F401
 
-# Get L4 GaitParams (Layer 5 registers _l4_simulation at import time)
 _l4_sim = sys.modules["_l4_simulation"]
 L4GaitParams = _l4_sim.GaitParams
 
 from .game import TargetGame, configure_for_robot, GameStatistics, CONTROL_DT, TARGET_TIMEOUT_STEPS
 from .utils import load_module_by_path, patch_layer_configs
+from .genome_loader import _apply_genome
+from .scene_parser import _find_obstacle_bodies, _find_obstacle_geoms
 
 
 @dataclass
@@ -57,266 +45,18 @@ class GameRunResult:
     truth_trail: list[tuple[float, float]] = field(default_factory=list)
     perception_stats: dict | None = None
     ato_score: float | None = None
-    occupancy_accuracy: dict | None = None  # IoU/precision/recall from test_occupancy
+    occupancy_accuracy: dict | None = None
     tsdf: object | None = None
     scene_path: str | None = None
-    scores: dict | None = None  # Surface/Cost/Router F1 (god vs robot TSDF)
-
-
-def _expand_v9_genome(params: dict) -> dict:
-    """Expand v9 genome (8 params) to all Layer 5 constants.
-
-    Maps unified gait/steering params to both walk and turn-in-place
-    constants, matching training/ga/episode.py:inject_genome_v9().
-    """
-    freq = params.get("FREQ", 1.5)
-    step_length = params.get("STEP_LENGTH", 0.20)
-    step_height = params.get("STEP_HEIGHT", 0.06)
-    duty_cycle = params.get("DUTY_CYCLE", 0.55)
-    walk_speed = params.get("WALK_SPEED", 1.0)
-    kp_yaw = params.get("KP_YAW", 2.0)
-    wz_limit = params.get("WZ_LIMIT", 1.5)
-    stance_width = params.get("STANCE_WIDTH", 0.0)
-
-    return {
-        # Walk gait
-        "BASE_FREQ": freq, "MIN_FREQ": freq, "MAX_FREQ": freq,
-        "FREQ_SCALE": 0.0,
-        "STEP_LENGTH_SCALE": step_length,
-        "MAX_STEP_LENGTH": step_length,
-        "TROT_STEP_HEIGHT": step_height,
-        "WALK_STEP_HEIGHT": step_height,
-        # Turn gait (unified with walk)
-        "TURN_IN_PLACE_FREQ": freq,
-        "TURN_IN_PLACE_STEP_HEIGHT": step_height,
-        "TURN_IN_PLACE_STEP_LENGTH": step_length,
-        "TURN_IN_PLACE_DUTY_CYCLE": duty_cycle,
-        "TURN_IN_PLACE_WZ_SCALE": 1.0,
-        "TURN_IN_PLACE_STANCE_WIDTH": stance_width,
-        # Steering
-        "KP_YAW": kp_yaw, "WALK_SPEED": walk_speed,
-        "WALK_SPEED_MIN": 0.0, "TURN_WZ_LIMIT": wz_limit,
-    }
-
-
-def _is_v12_genome(params: dict) -> bool:
-    """Detect v12 sovereign genome by presence of GAIT_FREQ key."""
-    return "GAIT_FREQ" in params
-
-
-def _expand_v12_genome(params: dict) -> dict:
-    """Expand v12 genome (13 params) to all Layer 5 constants.
-
-    Maps sovereign walk + turn genes to L5's TURN_IN_PLACE_* and
-    walk constants. WALK_SPEED is derived from STEP_LENGTH * GAIT_FREQ.
-    """
-    gait_freq = params.get("GAIT_FREQ", 1.5)
-    step_length = params.get("STEP_LENGTH", 0.20)
-    step_height = params.get("STEP_HEIGHT", 0.06)
-    duty_cycle = params.get("DUTY_CYCLE", 0.55)
-    stance_width = params.get("STANCE_WIDTH", 0.0)
-    kp_yaw = params.get("KP_YAW", 2.0)
-    wz_limit = params.get("WZ_LIMIT", 1.5)
-
-    return {
-        # Walk gait
-        "BASE_FREQ": gait_freq, "MIN_FREQ": gait_freq, "MAX_FREQ": gait_freq,
-        "FREQ_SCALE": 0.0,
-        "STEP_LENGTH_SCALE": step_length,
-        "MAX_STEP_LENGTH": step_length,
-        "TROT_STEP_HEIGHT": step_height,
-        "WALK_STEP_HEIGHT": step_height,
-        # Turn gait (v12 has separate turn params)
-        "TURN_IN_PLACE_FREQ": params.get("TURN_FREQ", 1.0),
-        "TURN_IN_PLACE_STEP_HEIGHT": params.get("TURN_STEP_HEIGHT", 0.06),
-        "TURN_IN_PLACE_STEP_LENGTH": step_length,
-        "TURN_IN_PLACE_DUTY_CYCLE": params.get("TURN_DUTY_CYCLE", 0.55),
-        "TURN_IN_PLACE_WZ_SCALE": 1.0,
-        "TURN_IN_PLACE_STANCE_WIDTH": params.get("TURN_STANCE_WIDTH", 0.04),
-        # Steering (WALK_SPEED derived from step_length * gait_freq)
-        "KP_YAW": kp_yaw,
-        "WALK_SPEED": step_length * gait_freq,
-        "WALK_SPEED_MIN": 0.0,
-        "TURN_WZ_LIMIT": wz_limit,
-    }
-
-
-def _is_v10_genome(params: dict) -> bool:
-    """Detect v10 genome by presence of turn joint delta keys."""
-    return "P1_FL_HIP" in params
-
-
-def _apply_genome(genome_path: str) -> None:
-    """Load a GA-evolved genome JSON and patch game + Layer 5 parameters.
-
-    v12+ genomes: dual patch — game module constants for L4-direct walk
-    control, plus L5 expansion for the startup/stand phase.
-    v9/v10 genomes: expand to L5 constants and patch L5 modules.
-    """
-    genome = json.loads(Path(genome_path).read_text())
-
-    # Flatten: handle both export format {"locomotion": {...}, "steering": {...}}
-    # and GA checkpoint format {"genome": {...}, "fitness": ...}
-    params = {}
-    if "genome" in genome and isinstance(genome["genome"], dict):
-        params.update(genome["genome"])
-    for group in ("locomotion", "steering"):
-        if group in genome:
-            params.update(genome[group])
-
-    from . import game as game_mod
-    from . import game_config as game_cfg
-
-    if _is_v12_genome(params):
-        # v12+ sovereign genome: dual patch
-
-        # 1. Patch game module constants for L4-direct walk/turn control.
-        # Must patch both game_config (authoritative, read by navigator
-        # mixins via `C.XXX`) and game (re-exported copy, read by
-        # __main__.py safety caps via `game_mod.XXX`).
-        v12_game_params = [
-            "GAIT_FREQ", "STEP_LENGTH", "STEP_HEIGHT", "DUTY_CYCLE", "STANCE_WIDTH",
-            "KP_YAW", "WZ_LIMIT", "TURN_FREQ", "TURN_STEP_HEIGHT", "TURN_DUTY_CYCLE",
-            "TURN_STANCE_WIDTH", "TURN_WZ", "THETA_THRESHOLD",
-        ]
-        for name in v12_game_params:
-            if name in params:
-                setattr(game_cfg, name, params[name])
-                setattr(game_mod, name, params[name])
-                print(f"  game.{name} = {params[name]:.4f}")
-
-        # 2. Patch extended control parameters (any genome key matching a
-        #    game_config module-level variable not in the v12 core list).
-        for key, val in params.items():
-            if key not in v12_game_params and hasattr(game_cfg, key):
-                setattr(game_cfg, key, val)
-                setattr(game_mod, key, val)
-                print(f"  game.{key} = {val}")
-
-        # 3. Expand to L5 constants for startup/stand phase (send_motion_command)
-        expanded = _expand_v12_genome(params)
-        theta = params.get("THETA_THRESHOLD", "?")
-        turn_wz = params.get("TURN_WZ", "?")
-        n_extra = sum(1 for k in params if k not in v12_game_params and hasattr(game_cfg, k))
-        extra_str = f" + {n_extra} control params" if n_extra else ""
-        print(f"  v12 sovereign genome: 13 genes{extra_str}, theta_threshold={theta}, turn_wz={turn_wz}")
-
-    elif _is_v10_genome(params):
-        # Extract walk subset (the 8 v9 params) for L5 expansion
-        walk_keys = ["FREQ", "STEP_LENGTH", "STEP_HEIGHT", "DUTY_CYCLE",
-                     "WALK_SPEED", "KP_YAW", "WZ_LIMIT", "STANCE_WIDTH"]
-        walk_params = {k: params[k] for k in walk_keys if k in params}
-        expanded = _expand_v9_genome(walk_params)
-        # Merge: expanded walk + original turn/timing genes
-        for k, v in params.items():
-            if k not in expanded:
-                expanded[k] = v
-        # Print turn gene summary
-        turn_count = sum(1 for k in params if k.startswith(("P1_", "P2_")))
-        timing = {k: params[k] for k in ["T_PHASE1", "T_PHASE2", "T_PHASE3"] if k in params}
-        print(f"  v10 turn genes: {turn_count} joint deltas, timing={timing}")
-
-    elif "FREQ" in params:
-        expanded = _expand_v9_genome(params)
-
-    else:
-        expanded = params
-
-    # Patch Layer 5 config.defaults and downstream modules
-    locomotion_params = [
-        "BASE_FREQ", "FREQ_SCALE", "MAX_FREQ", "MIN_FREQ",
-        "STEP_LENGTH_SCALE", "MAX_STEP_LENGTH", "TROT_STEP_HEIGHT",
-        "WALK_STEP_HEIGHT",
-        "TURN_IN_PLACE_FREQ", "TURN_IN_PLACE_STEP_HEIGHT",
-        "TURN_IN_PLACE_STEP_LENGTH", "TURN_IN_PLACE_DUTY_CYCLE",
-        "TURN_IN_PLACE_WZ_SCALE", "TURN_IN_PLACE_STANCE_WIDTH",
-    ]
-    defaults_mod = sys.modules.get("config.defaults")
-    downstream_mods = ["velocity_mapper", "gait_selector", "locomotion",
-                       "transition", "terrain_gait"]
-
-    for name in locomotion_params:
-        if name not in expanded:
-            continue
-        if defaults_mod and hasattr(defaults_mod, name):
-            setattr(defaults_mod, name, expanded[name])
-        for mod_name in downstream_mods:
-            mod = sys.modules.get(mod_name)
-            if mod and hasattr(mod, name):
-                setattr(mod, name, expanded[name])
-
-    gen = genome.get("generation", "?")
-    fitness = genome.get("fitness", "?")
-    print(f"Applied genome gen={gen}, fitness={fitness}")
-
-
-def _find_obstacle_bodies(scene_path: Path) -> list[str]:
-    """Parse scene XML to discover obstacle body names (obs_*).
-
-    Foreman-level utility — reads the scene to learn what obstacles exist
-    so it can track their physics state for ground-truth proximity checking.
-    """
-    import xml.etree.ElementTree as ET
-    names = []
-    try:
-        tree = ET.parse(scene_path)
-        for body in tree.iter("body"):
-            name = body.get("name", "")
-            if name.startswith("obs_"):
-                names.append(name)
-    except (ET.ParseError, FileNotFoundError):
-        pass
-    return names
-
-
-def _find_obstacle_geoms(scene_path: Path) -> list[dict]:
-    """Parse scene XML to extract obstacle geom volumes.
-
-    Finds bodies whose names start with 'obs_' or 'wall_'.
-    Returns list of dicts with 'type' ('box'|'cylinder'), 'pos' (x,y,z),
-    and 'size' (half-extents for box, radius+half-height for cylinder).
-    Used by debug_server (viewer wireframes) and test_occupancy (ground truth).
-    """
-    import xml.etree.ElementTree as ET
-    _PREFIXES = ("obs_", "wall_")
-    obstacles = []
-    try:
-        tree = ET.parse(scene_path)
-        for body in tree.iter("body"):
-            name = body.get("name", "")
-            if not any(name.startswith(p) for p in _PREFIXES):
-                continue
-            pos_str = body.get("pos", "0 0 0")
-            pos = tuple(float(v) for v in pos_str.split())
-            for geom in body.findall("geom"):
-                gtype = geom.get("type", "sphere")
-                size_str = geom.get("size", "0.25")
-                size = tuple(float(v) for v in size_str.split())
-                obstacles.append({
-                    "type": gtype,
-                    "pos": pos,
-                    "size": size,
-                })
-    except (ET.ParseError, FileNotFoundError):
-        pass
-    return obstacles
+    scores: dict | None = None
 
 
 def _cleanup_stale_data(domain: int | None = None) -> None:
-    """Remove stale temp files and processes from previous runs.
-
-    Clears god-view overlays, DWA arc files, and DDS session files so the
-    firmware viewer starts clean (no leftover blue/red overlays from prior
-    --god runs obscuring the scene).
-    """
+    """Remove stale temp files and processes from previous runs."""
     import glob
     import subprocess
-
-    # Kill zombie firmware processes on OUR domain only (not other agents').
-    # Using pkill -f firmware_sim.py would kill ALL firmware across all
-    # domains, causing mutual kill-chains when multiple agents run in
-    # parallel on different DDS domains.
     import time
+
     if domain is not None:
         result = subprocess.run(
             ["pgrep", "-af", "firmware_sim.py"],
@@ -351,7 +91,6 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
         else:
             time.sleep(0.5)
 
-    # Remove stale temp files (firmware viewer renders these if they exist)
     for pattern in [
         "/tmp/god_view_costmap.bin",
         "/tmp/god_view_tsdf.bin",
@@ -367,7 +106,6 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
             except OSError:
                 pass
 
-    # Remove stale DDS session files (only our domain if specified)
     if domain is not None:
         session_file = f"/tmp/robo_sessions/b2_domain{domain}.json"
         try:
@@ -383,25 +121,10 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
 
 
 def run_game(args) -> GameRunResult:
-    """Run target game with given configuration. Returns structured result.
-
-    Called by both the CLI main() and the scenario runner. The args namespace
-    should have at minimum: robot, targets, headless, seed, genome,
-    full_circle, domain, slam, obstacles.
-
-    Optional attributes (used by scenario runner):
-        scene_path (str): Override scene XML path (bypasses obstacles logic)
-        timeout_per_target (float): Seconds per target before timeout
-        min_dist (float): Min target spawn distance (default 3.0)
-        max_dist (float): Max target spawn distance (default 6.0)
-        angle_range: Override target spawning angle range
-    """
-    # Clear stale data from previous runs before anything else
+    """Run target game with given configuration. Returns structured result."""
     _cleanup_stale_data(getattr(args, 'domain', None))
 
     print(f"Starting target game: robot={args.robot}, targets={args.targets}")
-
-    # Configure game constants for this robot (before genome, so genome overrides)
     configure_for_robot(args.robot)
 
     genome = getattr(args, 'genome', None)
@@ -409,10 +132,6 @@ def run_game(args) -> GameRunResult:
         print(f"\nApplying evolved genome: {genome}")
         _apply_genome(genome)
 
-    # Safety cap: untrained genomes may have unstable turn params for heavy robots.
-    # B2 is stable up to TURN_WZ=3.0 with TURN_FREQ>=2.5 and stance_width>=0.12.
-    # Higher turn rates are critical for ATO: 180° turns at wz=1.0 take 3.14s of
-    # zero forward speed, killing aggregate v_avg. At wz=3.0, turns take ~1s.
     from . import game as game_mod
     from . import game_config as game_cfg
     if args.robot == "b2":
@@ -424,18 +143,13 @@ def run_game(args) -> GameRunResult:
             game_mod.TURN_STANCE_WIDTH = 0.12
             game_cfg.TURN_STANCE_WIDTH = 0.12
             print(f"  Safety cap: TURN_STANCE_WIDTH raised to {game_mod.TURN_STANCE_WIDTH} for B2")
-        # TURN_FREQ cap removed: differential stride TIP has zero lateral
-        # slippage by construction, no need for fast cycling.
         if game_mod.TURN_DUTY_CYCLE > 0.55:
             game_mod.TURN_DUTY_CYCLE = 0.55
             game_cfg.TURN_DUTY_CYCLE = 0.55
             print(f"  Safety cap: TURN_DUTY_CYCLE lowered to {game_mod.TURN_DUTY_CYCLE} for B2")
 
-    # Pre-populate config caches to avoid runtime namespace collision
     patch_layer_configs(args.robot, Path(_root))
 
-    # If domain specified, monkey-patch FirmwareLauncher to use it
-    # (avoids DDS session conflict with other running firmware)
     domain = getattr(args, 'domain', None)
     if domain is not None:
         from launcher import FirmwareLauncher
@@ -446,18 +160,15 @@ def run_game(args) -> GameRunResult:
             _orig_init(self, *a, **kw)
         FirmwareLauncher.__init__ = _patched_init
 
-    # Initialize SLAM odometry if requested
     odometry = None
     slam = getattr(args, 'slam', False)
     if slam:
-        # Add workspace root to path for layer_6 imports
         if str(_root) not in sys.path:
             sys.path.insert(0, str(_root))
         from layer_6.slam.odometry import Odometry
         odometry = Odometry()
         print("SLAM odometry enabled (Phase 1: IMU yaw + body velocity)")
 
-    # Initialize telemetry log if SLAM is active
     telemetry_log = None
     telem_path = None
     if slam:
@@ -469,7 +180,6 @@ def run_game(args) -> GameRunResult:
         telemetry_log = TelemetryLog(telem_path)
         print(f"Telemetry: {telem_path}")
 
-    # Select scene variant (scene_path override takes priority)
     scene_path_override = getattr(args, 'scene_path', None)
     if scene_path_override:
         scene_path = Path(scene_path_override)
@@ -484,395 +194,77 @@ def run_game(args) -> GameRunResult:
         scene_path = _root / "layers_1_2" / "unitree_robots" / args.robot / "scene.xml"
         print(f"Warning: scene_target.xml not found for {args.robot}, using scene.xml")
 
-    # Discover obstacle bodies from scene XML for ground-truth proximity
-    # checking (foreman referee, not robot sensors).
     obstacle_bodies = _find_obstacle_bodies(scene_path)
     track_bodies = ["target"] + obstacle_bodies
     print(f"Scene: {scene_path} ({len(obstacle_bodies)} obstacles)")
 
     headless = getattr(args, 'headless', False)
     sim = SimulationManager(
-        args.robot,
-        headless=headless,
-        scene=str(scene_path),
-        track_bodies=track_bodies,
-        domain=domain,
-    )
+        args.robot, headless=headless, scene=str(scene_path),
+        track_bodies=track_bodies, domain=domain)
     sim.start()
     perception = None
-    debug_server = None
     try:
         import math
         full_circle = getattr(args, 'full_circle', False)
         if full_circle:
             angle_range = (-math.pi, math.pi)
         else:
-            # Exclude front cone (+/-30deg): spawn to the sides and behind
             angle_range = [(math.pi / 6, math.pi), (-math.pi, -math.pi / 6)]
 
-        # Allow per-scenario override of angle_range
         angle_range_override = getattr(args, 'angle_range', None)
         if angle_range_override is not None:
             angle_range = angle_range_override
 
-        # Per-scenario timeout override
         timeout_steps = TARGET_TIMEOUT_STEPS
         timeout_per_target = getattr(args, 'timeout_per_target', None)
         if timeout_per_target is not None:
             timeout_steps = int(timeout_per_target / CONTROL_DT)
 
-        min_dist = getattr(args, 'min_dist', 3.0)
-        max_dist = getattr(args, 'max_dist', 6.0)
-
         game = TargetGame(
-            sim,
-            L4GaitParams=L4GaitParams,
-            make_low_cmd=_l4_sim._make_low_cmd,
-            stamp_cmd=_l4_sim._stamp_cmd,
-            num_targets=args.targets,
-            seed=getattr(args, 'seed', None),
-            angle_range=angle_range,
-            odometry=odometry,
-            min_dist=min_dist,
-            max_dist=max_dist,
-            timeout_steps=timeout_steps,
-        )
+            sim, L4GaitParams=L4GaitParams,
+            make_low_cmd=_l4_sim._make_low_cmd, stamp_cmd=_l4_sim._stamp_cmd,
+            num_targets=args.targets, seed=getattr(args, 'seed', None),
+            angle_range=angle_range, odometry=odometry,
+            min_dist=getattr(args, 'min_dist', 3.0),
+            max_dist=getattr(args, 'max_dist', 6.0),
+            timeout_steps=timeout_steps)
 
-        # Headless flag — controls whether viewer file writes run in tick
         game._headless = args.headless
-
-        # Register obstacle bodies for ground-truth proximity checking
         if obstacle_bodies:
             game.set_obstacle_bodies(obstacle_bodies)
-
-        # Set scene path for per-tick occupancy accuracy telemetry
         game.set_scene_path(str(scene_path))
 
-        # Optional custom spawn function (e.g. scattered scenario back-and-forth)
         spawn_fn = getattr(args, 'spawn_fn', None)
         if spawn_fn is not None:
             game._spawn_fn = spawn_fn
-
-        # Wire up telemetry log
         if telemetry_log is not None:
             game.set_telemetry(telemetry_log)
 
-        # Wire up DDS publishers/subscribers if SLAM is active
-        obstacles = getattr(args, 'obstacles', False)
-        if odometry is not None:
-            try:
-                from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
-                # PoseEstimate_ and PointCloud_ are in layers_1_2/messages.py,
-                # not layer_3/messages.py (which is cached in sys.modules from L5).
-                _l12_msgs = load_module_by_path("_l12_messages", str(_root / "layers_1_2" / "messages.py"))
-                PoseEstimate_ = _l12_msgs.PoseEstimate_
-                PointCloud_ = _l12_msgs.PointCloud_
-                from dds import dds_init, stamp_cmd
-                dds_domain = domain if domain is not None else 1
-                dds_init(domain_id=dds_domain, interface="lo")
+        from .game_setup import setup_perception, compute_occupancy, compute_scores
+        perception = setup_perception(args, game, sim, odometry,
+                                      obstacle_bodies, scene_path)
 
-                # Pose publisher
-                pose_pub = ChannelPublisher("rt/pose_estimate", PoseEstimate_)
-                pose_pub.Init()
-                # PoseEstimate_ is a Layer 6 internal message — no CRC needed.
-                # stamp_cmd only handles Layer 3 motor commands.
-                _noop_stamp = lambda msg: None
-                game.set_pose_publisher(pose_pub, PoseEstimate_, _noop_stamp)
-                print(f"DDS pose publisher on rt/pose_estimate (domain={dds_domain})")
-
-                # Point cloud subscriber + perception pipeline (if obstacles)
-                if obstacles:
-                    from layer_6.config.defaults import load_config
-                    from layer_6.planner.dwa import CurvatureDWAPlanner
-                    from .perception import PerceptionPipeline
-                    pcfg = load_config(args.robot)
-
-                    # Apply perception overrides (from tuning script)
-                    for key, val in getattr(args, 'perception_overrides', {}).items():
-                        setattr(pcfg, key, val)
-                    # Apply DWA overrides to pcfg fields (tuning names → pcfg names)
-                    for key, val in getattr(args, 'dwa_overrides', {}).items():
-                        setattr(pcfg, key, val)
-
-                    # Set scan interval as cooldown gap (measured from build
-                    # end, not start).  250ms gap guarantees 25 control ticks
-                    # between TSDF builds to prevent GIL starvation.
-                    if not hasattr(pcfg, 'scan_min_interval'):
-                        pcfg.scan_min_interval = 0.25
-                    # B2 LiDAR sits at world z≈0.645m (body 0.465 + sensor 0.18).
-                    # 0° rays hit obstacles at z≈0.65 — must be inside costmap band.
-                    # Default costmap_z_hi=0.55 misses all horizontal hits.
-                    pcfg.costmap_z_hi = 0.80
-
-                    # Instant convergence: lo_hit=3.0 crosses surface threshold
-                    # in one hit, matching god-view integration behavior.
-                    pcfg.tsdf_log_odds_hit = 3.0
-                    pcfg.tsdf_log_odds_max = 5.0
-                    pcfg.tsdf_log_odds_free = 0.25
-                    pcfg.tsdf_truncation = 0.5
-                    pcfg.tsdf_xy_extent = 10.0
-                    pcfg.tsdf_depth_extension = 5
-                    pcfg.tsdf_decay_rate = 0.0
-                    pcfg.tsdf_unknown_cell_cost = 0.5
-
-                    perception = PerceptionPipeline(odometry, pcfg)
-                    # B2 LiDAR at z≈0.645m. -7° channel at 3.5m→z=0.22.
-                    # 0.20 gives ~3.5m detection range while rejecting
-                    # -15° ground hits (z<0.13 at 2m+).
-                    # With direct scanner, use 0.05 to match god-view
-                    # (no ground noise risk since we use geom exclusion).
-                    # Without direct scanner, keep 0.20 to reject DDS
-                    # ground artifacts from progressive scan rotation.
-                    perception._MIN_WORLD_Z = 0.05
-
-                    # Direct scanner: instant raycasting bypasses DDS
-                    # progressive scan to eliminate motion-blur phantoms.
-                    # MUST be initialized BEFORE DDS subscription to prevent
-                    # early DDS scans from adding motion-blurred phantoms
-                    # to the robot TSDF before _direct_ready blocks them.
-                    # If god-view mode is active, create god_tsdf first and
-                    # share its MuJoCo model so both produce identical rays
-                    # (eliminates cell-boundary disagreements in scoring).
-                    _god_mj_model = None
-                    _god_mj_data = None
-                    if getattr(args, 'god', False) and obstacle_bodies:
-                        from .god_tsdf import GodViewTSDF
-                        god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
-                        game._god_view_tsdf = god_tsdf
-                        _god_mj_model = god_tsdf._model
-                        _god_mj_data = god_tsdf._data
-                        print(f"God-view TSDF: {god_tsdf._n_rays} rays, "
-                              f"exclude {len(god_tsdf._robot_geom_ids)} robot geoms, "
-                              f"voxel={god_tsdf._tsdf.voxel_size}m")
-
-                    perception.init_direct_scanner(
-                        str(scene_path), robot=args.robot,
-                        mj_model=_god_mj_model, mj_data=_god_mj_data)
-                    print(f"Direct scanner: {perception._direct_n_rays} rays, "
-                          f"exclude {len(perception._direct_robot_geoms)} robot + "
-                          f"{len(perception._direct_target_geoms)} target geoms")
-
-                    # Subscribe to DDS AFTER direct scanner is ready.
-                    # _direct_ready=True causes on_point_cloud to return
-                    # immediately, so DDS scans won't pollute the TSDF.
-                    cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
-                    cloud_sub.Init(perception.on_point_cloud, 5)
-                    game._perception = perception
-                    print(f"TSDF active: ±{pcfg.tsdf_xy_extent}m, "
-                          f"voxel={pcfg.tsdf_voxel_size}m, "
-                          f"output={pcfg.tsdf_output_resolution}m, "
-                          f"lo_hit={pcfg.tsdf_log_odds_hit}, "
-                          f"decay={pcfg.tsdf_decay_rate}")
-
-                    # Wire up curvature-based DWA planner
-                    game.set_dwa_planner(CurvatureDWAPlanner(pcfg))
-                    print(f"Curvature DWA active: {pcfg.dwa_n_curvatures} arcs, "
-                          f"max_arc={pcfg.dwa_max_arc_length}m, "
-                          f"v_max={pcfg.v_max}, w_max={pcfg.w_max}")
-
-                    # With direct scanner, first costmap comes from game
-                    # tick (step 50). Without direct scanner, wait for DDS.
-                    if not perception._direct_ready:
-                        import time as _time
-                        _pc_deadline = _time.monotonic() + 5.0
-                        while perception.costmap_query is None and _time.monotonic() < _pc_deadline:
-                            _time.sleep(0.1)
-                        if perception.costmap_query is not None:
-                            print(f"First costmap received ({perception.stats['builds']} builds)")
-                        else:
-                            print("Warning: no point cloud received after 5s (DWA will use fallback)")
-
-                    # Path critic with A* on world cost grid
-                    from .path_critic import PathCritic
-                    critic = PathCritic(robot=args.robot, robot_radius=0.35)
-                    game.set_path_critic(critic)
-
-            except Exception as e:
-                print(f"Warning: DDS setup failed: {e} (SLAM still works)")
-
-        # Debug viewer server
-        viewer = getattr(args, 'viewer', False)
-        if viewer:
-            from .debug_server import DebugServer
-            debug_server = DebugServer(port=9877)
-            debug_server.start()
-            game._debug_server = debug_server
-            # Send ground-truth obstacle volumes (once, on first client connect)
-            game._obstacle_geoms = _find_obstacle_geoms(scene_path)
-            # God-view costmap: binary obstacle footprints for Godot overlay.
-            # Red appears ONLY at actual obstacle cells, no EDT gradient halo.
-            if obstacle_bodies:
-                from .test_costmap_compare import build_god_view_binary
-                from layer_6.config.defaults import load_config as _load_pcfg
-                _pcfg = _load_pcfg(args.robot)
-                gv_grid, gv_meta = build_god_view_binary(
-                    str(scene_path),
-                    z_lo=_pcfg.costmap_z_lo, z_hi=_pcfg.costmap_z_hi,
-                    output_resolution=_pcfg.tsdf_output_resolution,
-                    xy_extent=_pcfg.tsdf_xy_extent)
-                game.set_god_view_costmap(gv_grid, gv_meta)
-                import numpy as _np
-                print(f"God-view costmap: {gv_grid.shape}, "
-                      f"{int(_np.sum(gv_grid == 254))} obstacle cells")
-
-        # God-view costmap overlay in MuJoCo viewer (headed only)
-        if getattr(args, 'god', False) and obstacle_bodies and not args.headless:
-            from .test_costmap_compare import build_god_view_costmap
-            from layer_6.config.defaults import load_config as _load_pcfg
-            import struct as _struct
-            import numpy as _np
-
-            _pcfg = _load_pcfg(args.robot)
-            gv_grid, gv_meta = build_god_view_costmap(
-                str(scene_path),
-                z_lo=_pcfg.costmap_z_lo, z_hi=_pcfg.costmap_z_hi,
-                output_resolution=_pcfg.tsdf_output_resolution,
-                xy_extent=_pcfg.tsdf_xy_extent,
-                truncation=_pcfg.tsdf_truncation)
-            # Write to temp file for firmware viewer to render.
-            # Rasterizer stores grid[x_idx, y_idx] but renderer reads
-            # grid[row, col] as row→Y, col→X. Transpose so axes match.
-            # Format: rows(u16) cols(u16) origin_x(f) origin_y(f) voxel_size(f) + raw u8
-            _god_file = "/tmp/god_view_costmap.bin"
-            gv_grid_t = gv_grid.T  # (x,y) → (y,x) = (row=Y, col=X)
-            rows, cols = gv_grid_t.shape
-            with open(_god_file, 'wb') as _f:
-                _f.write(_struct.pack('<HHfff', rows, cols,
-                                      gv_meta['origin_x'], gv_meta['origin_y'],
-                                      gv_meta['voxel_size']))
-                _f.write(gv_grid_t.tobytes())
-            n_lethal = int(_np.sum(gv_grid >= 253))
-            n_grad = int(_np.sum((gv_grid > 0) & (gv_grid < 253)))
-            print(f"God-view costmap: {gv_grid.shape}, "
-                  f"{n_lethal} lethal + {n_grad} gradient cells → {_god_file}")
-            # Set god-view on game so it can compute A* paths
-            game.set_god_view_costmap(gv_grid, gv_meta)
-            game._god_view_path_file = "/tmp/god_view_path.bin"
-
-        # God-view TSDF: perfect LiDAR → TSDF from known geometry.
-        # Only created when --god is passed (scoring + blue overlay).
-        # May already be created above (shared model with direct scanner).
-        if getattr(args, 'god', False) and obstacle_bodies:
-            if game._god_view_tsdf is None:
-                from .god_tsdf import GodViewTSDF
-                god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
-                game._god_view_tsdf = god_tsdf
-                print(f"God-view TSDF: {god_tsdf._n_rays} rays, "
-                      f"exclude {len(god_tsdf._robot_geom_ids)} robot geoms, "
-                      f"voxel={god_tsdf._tsdf.voxel_size}m")
-
-        # Path critic for non-obstacle runs (straight-line only, no A*)
         if game._path_critic is None:
             from .path_critic import PathCritic
             game.set_path_critic(PathCritic(robot=args.robot, robot_radius=0.35))
 
         stats = game.run()
-
         ato = game._path_critic.aggregate_ato() if game._path_critic else None
-
-        # Compute occupancy accuracy (TSDF vs ground-truth obstacles)
-        occ_accuracy = None
-        if perception is not None and getattr(args, 'obstacles', False):
-            try:
-                from .test_occupancy import compute_3ds_v2, compute_3ds_god
-                occ_accuracy = compute_3ds_v2(
-                    perception._tsdf, str(scene_path),
-                )
-                occ_accuracy['god'] = compute_3ds_god(
-                    perception._tsdf, str(scene_path),
-                )
-            except Exception as e:
-                print(f"Warning: occupancy accuracy failed: {e}")
-
-        # Compute perception F1 scores (god TSDF vs robot TSDF)
-        scores = None
-        god_tsdf_obj = getattr(game, '_god_view_tsdf', None)
-        robot_tsdf_obj = perception._tsdf if perception is not None else None
-        if god_tsdf_obj is not None and robot_tsdf_obj is not None:
-            try:
-                from .scores import compute_surface_f1, compute_cost_f1, compute_router_f1
-                from layer_6.config.defaults import load_config as _load_score_cfg
-                _scfg = _load_score_cfg(args.robot)
-                _z_lo = getattr(_scfg, 'costmap_z_lo', 0.05)
-                _z_hi = 0.80  # match the costmap_z_hi override above
-                _res = getattr(_scfg, 'tsdf_output_resolution', 0.05)
-
-                scores = {
-                    "surface": compute_surface_f1(god_tsdf_obj._tsdf, robot_tsdf_obj, _res),
-                    "cost": compute_cost_f1(god_tsdf_obj._tsdf, robot_tsdf_obj, _z_lo, _z_hi, _res),
-                }
-                # Router F1: use truth trail start → end as A* endpoints
-                trail = list(game.truth_trail)
-                if len(trail) >= 2:
-                    dx = trail[-1][0] - trail[0][0]
-                    dy = trail[-1][1] - trail[0][1]
-                    if (dx * dx + dy * dy) > 1.0:
-                        scores["router"] = compute_router_f1(
-                            god_tsdf_obj._tsdf, robot_tsdf_obj,
-                            trail[0], trail[-1], _z_lo, _z_hi, _res)
-                if "router" not in scores:
-                    scores["router"] = {"f1": 0.0, "precision": 0.0, "recall": 0.0,
-                                        "god_path_m": 0.0, "robot_path_m": 0.0}
-                sf = scores['surface']
-                print(f"\nScores: surface={sf['f1']:.1f} "
-                      f"(P={sf['precision']:.1f} R={sf['recall']:.1f} "
-                      f"n_god={sf['n_god']} n_robot={sf['n_robot']}) "
-                      f"cost={scores['cost']['f1']:.1f} "
-                      f"router={scores['router']['f1']:.1f}")
-
-                # Diagnostic: Z distribution of surface voxels
-                import numpy as _np
-                god_vox = god_tsdf_obj._tsdf.get_surface_voxels(include_history=True)
-                robot_vox = robot_tsdf_obj.get_surface_voxels(include_history=True)
-                if len(god_vox) > 0 and len(robot_vox) > 0:
-                    print(f"\n=== SURFACE VOXEL DIAGNOSTICS ===")
-                    print(f"God voxels: {len(god_vox)}, Robot voxels: {len(robot_vox)}")
-                    print(f"God Z: min={god_vox[:,2].min():.3f} max={god_vox[:,2].max():.3f} "
-                          f"mean={god_vox[:,2].mean():.3f}")
-                    print(f"Robot Z: min={robot_vox[:,2].min():.3f} max={robot_vox[:,2].max():.3f} "
-                          f"mean={robot_vox[:,2].mean():.3f}")
-                    # Z histogram at 0.1m bins
-                    for label, vox in [("God", god_vox), ("Robot", robot_vox)]:
-                        zbins = _np.arange(-0.5, 1.6, 0.1)
-                        hist, _ = _np.histogram(vox[:, 2], bins=zbins)
-                        nz = [(f"{zbins[i]:.1f}:{h}" ) for i, h in enumerate(hist) if h > 0]
-                        print(f"{label} Z hist: {' '.join(nz)}")
-                    # XY range
-                    print(f"God XY: x=[{god_vox[:,0].min():.1f},{god_vox[:,0].max():.1f}] "
-                          f"y=[{god_vox[:,1].min():.1f},{god_vox[:,1].max():.1f}]")
-                    print(f"Robot XY: x=[{robot_vox[:,0].min():.1f},{robot_vox[:,0].max():.1f}] "
-                          f"y=[{robot_vox[:,1].min():.1f},{robot_vox[:,1].max():.1f}]")
-                    # Surface history size
-                    print(f"God history: {len(god_tsdf_obj._tsdf._surface_history)}")
-                    print(f"Robot history: {len(robot_tsdf_obj._surface_history)}")
-                    # Active chunks
-                    print(f"God chunks: {len(god_tsdf_obj._tsdf._chunks)}")
-                    print(f"Robot chunks: {len(robot_tsdf_obj._chunks)}")
-                    # Scan counts
-                    if hasattr(game._perception, '_direct_scan_count'):
-                        print(f"Robot direct scans: {game._perception._direct_scan_count}")
-                    print(f"Robot DDS scans: {game._perception.stats.get('builds', 0)}")
-            except Exception as e:
-                print(f"Warning: score computation failed: {e}")
+        occ_accuracy = compute_occupancy(perception, args, scene_path)
+        scores = compute_scores(game, perception, args)
 
         return GameRunResult(
-            stats=stats,
-            telemetry_path=telem_path,
+            stats=stats, telemetry_path=telem_path,
             slam_trail=list(game.slam_trail),
             truth_trail=list(game.truth_trail),
             perception_stats=perception.stats if perception is not None else None,
-            ato_score=ato,
-            occupancy_accuracy=occ_accuracy,
+            ato_score=ato, occupancy_accuracy=occ_accuracy,
             tsdf=perception._tsdf if perception is not None else None,
-            scene_path=str(scene_path),
-            scores=scores,
-        )
+            scene_path=str(scene_path), scores=scores)
     finally:
-        # Shut down perception callback to prevent lingering DDS threads
         if perception is not None:
             perception.shutdown()
-        if debug_server is not None:
-            debug_server.stop()
         sim.stop()
 
 
@@ -901,7 +293,6 @@ def main():
     print(f"\nFinal: {result.stats.targets_reached}/{result.stats.targets_spawned} "
           f"reached ({result.stats.success_rate:.0%})")
 
-    # Print perception stats
     if result.perception_stats is not None:
         ps = result.perception_stats
         if ps.get("builds", 0) > 0:

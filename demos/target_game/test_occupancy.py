@@ -15,514 +15,20 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from pathlib import Path
 
 import numpy as np
 
+# Re-export for backward compatibility (game_setup.py, game_viz.py,
+# test_costmap_compare.py import from here)
+from .test_occupancy_3ds import compute_3ds_v2, compute_3ds_god  # noqa: F401
+from .test_occupancy_gt import (
+    materialize_log_odds, parse_obstacle_voxels,
+    parse_obstacle_surface_voxels,
+)
+
 _OCC_DIAG_COUNT = 0
-
-# Chunk constants from TSDF
-_CHUNK_BITS = 4
-_CHUNK_SIZE = 1 << _CHUNK_BITS  # 16
-
-
-def _materialize_log_odds(tsdf) -> np.ndarray:
-    """Build dense (nx, ny, nz) log_odds array from TSDF chunks.
-
-    Test-only helper — O(chunks) scatter into a preallocated dense array.
-    """
-    lo_dense = np.zeros((tsdf.nx, tsdf.ny, tsdf.nz), dtype=np.float32)
-    for (cx, cy, cz), chunk in tsdf._chunks.items():
-        gx = cx * _CHUNK_SIZE
-        gy = cy * _CHUNK_SIZE
-        gz = cz * _CHUNK_SIZE
-        sx = min(_CHUNK_SIZE, tsdf.nx - gx)
-        sy = min(_CHUNK_SIZE, tsdf.ny - gy)
-        sz = min(_CHUNK_SIZE, tsdf.nz - gz)
-        if sx > 0 and sy > 0 and sz > 0:
-            lo_dense[gx:gx+sx, gy:gy+sy, gz:gz+sz] = chunk.log_odds[:sx, :sy, :sz]
-    return lo_dense
-
-
-# ------------------------------------------------------------------
-# GT Surface Sampling
-# ------------------------------------------------------------------
-
-def _sample_box_surface(pos: tuple, half_extents: tuple,
-                        spacing: float) -> list[np.ndarray]:
-    """Sample all 6 faces of an axis-aligned box at ~spacing resolution.
-
-    Parameters
-    ----------
-    pos : (x, y, z) center of box
-    half_extents : (hx, hy, hz) half-sizes
-    spacing : sample spacing in meters
-
-    Returns list of (3,) arrays — one per sample point.
-    """
-    px, py, pz = pos
-    hx, hy, hz = half_extents
-    points = []
-
-    # Sample counts per face dimension (at least 1 sample)
-    nx = max(1, int(round(2 * hx / spacing)))
-    ny = max(1, int(round(2 * hy / spacing)))
-    nz = max(1, int(round(2 * hz / spacing)))
-
-    xs = np.linspace(px - hx, px + hx, nx + 1)
-    ys = np.linspace(py - hy, py + hy, ny + 1)
-    zs = np.linspace(pz - hz, pz + hz, nz + 1)
-
-    # +/- X faces
-    for y in ys:
-        for z in zs:
-            points.append(np.array([px - hx, y, z], dtype=np.float32))
-            points.append(np.array([px + hx, y, z], dtype=np.float32))
-    # +/- Y faces
-    for x in xs:
-        for z in zs:
-            points.append(np.array([x, py - hy, z], dtype=np.float32))
-            points.append(np.array([x, py + hy, z], dtype=np.float32))
-    # +/- Z faces
-    for x in xs:
-        for y in ys:
-            points.append(np.array([x, y, pz - hz], dtype=np.float32))
-            points.append(np.array([x, y, pz + hz], dtype=np.float32))
-
-    return points
-
-
-def _sample_cylinder_surface(pos: tuple, size: tuple,
-                              spacing: float) -> list[np.ndarray]:
-    """Sample curved surface + top/bottom caps of a vertical cylinder.
-
-    Parameters
-    ----------
-    pos : (x, y, z) center of cylinder
-    size : (radius, half_height)
-    spacing : sample spacing in meters
-
-    Returns list of (3,) arrays.
-    """
-    px, py, pz = pos
-    radius, half_h = size
-    points = []
-
-    # Curved surface: sample along circumference and height
-    circumference = 2 * math.pi * radius
-    n_angle = max(8, int(round(circumference / spacing)))
-    n_z = max(1, int(round(2 * half_h / spacing)))
-
-    angles = np.linspace(0, 2 * math.pi, n_angle, endpoint=False)
-    zs = np.linspace(pz - half_h, pz + half_h, n_z + 1)
-
-    for theta in angles:
-        cx = px + radius * math.cos(theta)
-        cy = py + radius * math.sin(theta)
-        for z in zs:
-            points.append(np.array([cx, cy, z], dtype=np.float32))
-
-    # Top and bottom caps: sample in concentric rings
-    n_rings = max(1, int(round(radius / spacing)))
-    for ring in range(n_rings + 1):
-        r = radius * ring / max(n_rings, 1)
-        if r < 1e-6:
-            # Center point
-            points.append(np.array([px, py, pz - half_h], dtype=np.float32))
-            points.append(np.array([px, py, pz + half_h], dtype=np.float32))
-        else:
-            circ = 2 * math.pi * r
-            n_pts = max(4, int(round(circ / spacing)))
-            for theta in np.linspace(0, 2 * math.pi, n_pts, endpoint=False):
-                cx = px + r * math.cos(theta)
-                cy = py + r * math.sin(theta)
-                points.append(
-                    np.array([cx, cy, pz - half_h], dtype=np.float32))
-                points.append(
-                    np.array([cx, cy, pz + half_h], dtype=np.float32))
-
-    return points
-
-
-def _sample_gt_surfaces(scene_xml_path: str,
-                         sample_spacing: float = 0.01) -> np.ndarray:
-    """Sample GT obstacle surfaces as a dense point cloud.
-
-    Returns (N, 3) world-frame float32 points on obstacle surfaces,
-    sampled at ~sample_spacing (default 1cm). Used as ground truth for
-    adherence / completeness / phantom metrics.
-    """
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from foreman.demos.target_game.__main__ import _find_obstacle_geoms
-
-    obstacles = _find_obstacle_geoms(Path(scene_xml_path))
-    points: list[np.ndarray] = []
-    for obs in obstacles:
-        if obs['type'] == 'box':
-            points.extend(
-                _sample_box_surface(obs['pos'], obs['size'], sample_spacing))
-        elif obs['type'] == 'cylinder':
-            points.extend(
-                _sample_cylinder_surface(obs['pos'], obs['size'],
-                                          sample_spacing))
-
-    if not points:
-        return np.zeros((0, 3), dtype=np.float32)
-    return np.stack(points).astype(np.float32)
-
-
-# ------------------------------------------------------------------
-# 3DS v2: Adherence / Completeness / Phantom Rate
-# ------------------------------------------------------------------
-
-def _extract_tsdf_surface(tsdf) -> np.ndarray:
-    """Extract TSDF surface voxels as (N, 3) world-frame coordinates.
-
-    Uses the default log-odds threshold (_OCC_LO_THRESHOLD = 2.0),
-    matching the costmap occupancy threshold. Includes surface history
-    so voxels confirmed during the run but later evicted still count
-    toward 3DS metrics.
-
-    Returns (N, 3) float32 array of world-frame voxel centers.
-    """
-    return tsdf.get_surface_voxels(include_history=True)
-
-
-def compute_3ds_v2(tsdf, scene_xml_path: str,
-                    adherence_tol: float = 0.03,
-                    phantom_tol: float = 0.05,
-                    sample_spacing: float = 0.01) -> dict:
-    """Compute 3DS v2 metrics: adherence, completeness, phantom rate.
-
-    Parameters
-    ----------
-    tsdf : TSDF
-    scene_xml_path : str
-        Path to the scene XML file containing obstacle definitions.
-    adherence_tol : float
-        Completeness tolerance — GT point is "covered" if a TSDF surface
-        voxel exists within this distance (meters). Default 3cm.
-    phantom_tol : float
-        Phantom tolerance — TSDF voxel is "phantom" if no GT surface
-        point exists within this distance (meters). Default 5cm.
-    sample_spacing : float
-        GT surface sampling density (meters). Default 1cm.
-
-    Returns
-    -------
-    dict with keys:
-        adherence_mm : float — mean TSDF-to-GT distance in mm
-        completeness_pct : float — % of GT surface covered
-        phantom_pct : float — % of TSDF surface that is phantom
-        n_tsdf_surface : int — number of TSDF surface voxels
-        n_gt_surface : int — number of GT surface sample points
-        n_converged : int — number of converged TSDF voxels
-    """
-    from scipy.spatial import cKDTree
-
-    tsdf_surface = _extract_tsdf_surface(tsdf)
-    gt_surface = _sample_gt_surfaces(scene_xml_path, sample_spacing)
-
-    n_tsdf = len(tsdf_surface)
-    n_gt = len(gt_surface)
-    n_converged = getattr(tsdf, 'n_converged', 0)
-
-    # Degenerate cases
-    if n_tsdf == 0 or n_gt == 0:
-        return {
-            "adherence_mm": float('inf') if n_gt > 0 else 0.0,
-            "completeness_pct": 0.0,
-            "phantom_pct": 100.0 if n_tsdf > 0 and n_gt == 0 else 0.0,
-            "n_tsdf_surface": n_tsdf,
-            "n_gt_surface": n_gt,
-            "n_converged": n_converged,
-        }
-
-    # Build KD-trees
-    gt_tree = cKDTree(gt_surface)
-    tsdf_tree = cKDTree(tsdf_surface)
-
-    # (a) Surface adherence: mean TSDF→GT distance
-    tsdf_to_gt_dists, _ = gt_tree.query(tsdf_surface, k=1)
-    adherence_mm = float(np.mean(tsdf_to_gt_dists) * 1000.0)
-
-    # (b) Completeness: fraction of GT points with a TSDF detection nearby
-    gt_to_tsdf_dists, _ = tsdf_tree.query(gt_surface, k=1)
-    completeness_pct = float(
-        np.sum(gt_to_tsdf_dists < adherence_tol) / n_gt * 100.0)
-
-    # (c) Phantom rate: fraction of TSDF voxels far from any GT surface
-    phantom_pct = float(
-        np.sum(tsdf_to_gt_dists > phantom_tol) / n_tsdf * 100.0)
-
-    return {
-        "adherence_mm": adherence_mm,
-        "completeness_pct": completeness_pct,
-        "phantom_pct": phantom_pct,
-        "n_tsdf_surface": n_tsdf,
-        "n_gt_surface": n_gt,
-        "n_converged": n_converged,
-    }
-
-
-def compute_3ds_god(tsdf, scene_xml_path: str,
-                    max_dist: float = 0.5,
-                    completeness_tol: float = 0.05,
-                    sample_spacing: float = 0.01,
-                    gt_z_range: tuple[float, float] | None = None) -> dict:
-    """God-mode 3DS: squared-distance penalty with omniscient GT.
-
-    Uses scene XML geometry as perfect ground truth (no sensor noise,
-    no occlusion). For each TSDF surface voxel, measures squared distance
-    to the nearest GT surface point. Phantoms far from any real surface
-    are punished aggressively via dist**2.
-
-    Parameters
-    ----------
-    tsdf : TSDF
-    scene_xml_path : str
-        Path to scene XML with obstacle definitions.
-    max_dist : float
-        Distance cap in meters. Voxels beyond this get maximum penalty.
-        Default 0.5m.
-    completeness_tol : float
-        A GT surface point is "detected" if a TSDF voxel exists within
-        this distance. Default 5cm.
-    sample_spacing : float
-        GT surface sampling density. Default 1cm.
-    gt_z_range : tuple[float, float], optional
-        Filter GT surface points to this Z range (z_lo, z_hi). Points
-        outside this range are excluded from completeness scoring since
-        the LiDAR min_z filter prevents them from ever being detected.
-        Precision and phantom scoring still use the full unfiltered GT
-        (a TSDF voxel near an undetectable GT face is still not phantom).
-
-    Returns
-    -------
-    dict with keys:
-        score : float — 0-100 composite score (100 = perfect)
-        precision_score : float — 0-100, surface accuracy via 1 - mean(dist^2)/max_dist^2
-        completeness_pct : float — % of GT surface points detected
-        phantom_penalty : float — 0-100, mean squared distance of phantom voxels
-        n_tsdf : int — number of TSDF surface voxels
-        n_gt : int — number of GT surface points (after Z filter)
-    """
-    from scipy.spatial import cKDTree
-
-    tsdf_surface = _extract_tsdf_surface(tsdf)
-    gt_surface = _sample_gt_surfaces(scene_xml_path, sample_spacing)
-
-    # Precision/phantom use full GT (unfiltered) — a TSDF voxel near
-    # a low-Z GT face is still a real surface, not a phantom.
-    gt_surface_full = gt_surface
-
-    # Completeness uses Z-filtered GT — surfaces below the LiDAR min_z
-    # can never be detected, so they shouldn't penalize completeness.
-    if gt_z_range is not None and len(gt_surface) > 0:
-        z_lo, z_hi = gt_z_range
-        z_mask = (gt_surface[:, 2] >= z_lo) & (gt_surface[:, 2] <= z_hi)
-        gt_surface_filtered = gt_surface[z_mask]
-    else:
-        gt_surface_filtered = gt_surface
-
-    n_tsdf = len(tsdf_surface)
-    n_gt = len(gt_surface_filtered)
-
-    n_gt_full = len(gt_surface_full)
-
-    if n_tsdf == 0 and n_gt == 0:
-        return {"score": 100.0, "precision_score": 100.0,
-                "completeness_pct": 100.0, "phantom_penalty": 0.0,
-                "n_tsdf": 0, "n_gt": 0}
-    if n_gt_full == 0:
-        return {"score": 0.0, "precision_score": 0.0,
-                "completeness_pct": 100.0, "phantom_penalty": 100.0,
-                "n_tsdf": n_tsdf, "n_gt": 0}
-    if n_tsdf == 0:
-        return {"score": 0.0, "precision_score": 100.0,
-                "completeness_pct": 0.0, "phantom_penalty": 0.0,
-                "n_tsdf": 0, "n_gt": n_gt}
-
-    # Full GT tree for precision and phantom scoring
-    gt_tree_full = cKDTree(gt_surface_full)
-    tsdf_tree = cKDTree(tsdf_surface)
-
-    # (a) Precision: for each TSDF voxel, squared distance to nearest GT
-    #     Uses FULL GT — a voxel near any GT face (even low-Z) is accurate.
-    tsdf_to_gt, _ = gt_tree_full.query(tsdf_surface, k=1)
-    capped = np.minimum(tsdf_to_gt, max_dist)
-    mean_sq = float(np.mean(capped ** 2))
-    precision_score = max(0.0, 100.0 * (1.0 - mean_sq / (max_dist ** 2)))
-
-    # (b) Completeness: fraction of Z-filtered GT points with TSDF nearby.
-    #     Only counts GT points the LiDAR can actually detect.
-    if n_gt > 0:
-        gt_filtered_tree_dists, _ = tsdf_tree.query(gt_surface_filtered, k=1)
-        completeness_pct = float(
-            np.sum(gt_filtered_tree_dists < completeness_tol) / n_gt * 100.0)
-    else:
-        completeness_pct = 0.0
-
-    # (c) Phantom penalty: mean squared distance of phantom voxels
-    #     (TSDF voxels with no FULL GT within completeness_tol)
-    phantom_mask = tsdf_to_gt > completeness_tol
-    n_phantom = int(np.sum(phantom_mask))
-    if n_phantom > 0:
-        phantom_dists = np.minimum(tsdf_to_gt[phantom_mask], max_dist)
-        phantom_penalty = float(
-            np.mean(phantom_dists ** 2) / (max_dist ** 2) * 100.0)
-    else:
-        phantom_penalty = 0.0
-
-    # Composite: weighted combination
-    #   50% precision (how accurate are detections)
-    #   30% completeness (how much GT is covered)
-    #   20% phantom penalty (spurious detections)
-    score = (0.50 * precision_score
-             + 0.30 * completeness_pct
-             - 0.20 * phantom_penalty)
-    score = max(0.0, min(100.0, score))
-
-    return {
-        "score": round(score, 1),
-        "precision_score": round(precision_score, 1),
-        "completeness_pct": round(completeness_pct, 1),
-        "phantom_penalty": round(phantom_penalty, 1),
-        "n_tsdf": n_tsdf,
-        "n_gt": n_gt,
-    }
-
-
-def _parse_obstacle_voxels(scene_xml_path: str, tsdf) -> set[tuple[int, int, int]]:
-    """Parse scene XML for obstacle geoms and compute *solid* occupied voxel indices.
-
-    Returns ALL voxels inside each obstacle (full volume).
-    Used by compute_occupancy_2d; for 3D surface comparison use
-    _parse_obstacle_surface_voxels() instead.
-    """
-    # Import here to avoid circular / preload issues
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from foreman.demos.target_game.__main__ import _find_obstacle_geoms
-
-    obstacles = _find_obstacle_geoms(Path(scene_xml_path))
-    voxels = set()
-    vs = tsdf.voxel_size
-    margin = vs * 0.5
-
-    for obs in obstacles:
-        px, py, pz = obs['pos']
-
-        if obs['type'] == 'box':
-            hx, hy, hz = obs['size']
-            x_lo = int(math.floor((px - hx - margin - tsdf.origin_x) / vs))
-            x_hi = int(math.ceil((px + hx + margin - tsdf.origin_x) / vs))
-            y_lo = int(math.floor((py - hy - margin - tsdf.origin_y) / vs))
-            y_hi = int(math.ceil((py + hy + margin - tsdf.origin_y) / vs))
-            z_lo = int(math.floor((pz - hz - margin - tsdf.z_min) / vs))
-            z_hi = int(math.ceil((pz + hz + margin - tsdf.z_min) / vs))
-            for ix in range(max(0, x_lo), min(tsdf.nx, x_hi + 1)):
-                for iy in range(max(0, y_lo), min(tsdf.ny, y_hi + 1)):
-                    for iz in range(max(0, z_lo), min(tsdf.nz, z_hi + 1)):
-                        voxels.add((ix, iy, iz))
-
-        elif obs['type'] == 'cylinder':
-            radius = obs['size'][0]
-            half_h = obs['size'][1]
-            eff_radius = radius + margin
-            x_lo = int(math.floor((px - eff_radius - tsdf.origin_x) / vs))
-            x_hi = int(math.ceil((px + eff_radius - tsdf.origin_x) / vs))
-            y_lo = int(math.floor((py - eff_radius - tsdf.origin_y) / vs))
-            y_hi = int(math.ceil((py + eff_radius - tsdf.origin_y) / vs))
-            z_lo = int(math.floor((pz - half_h - margin - tsdf.z_min) / vs))
-            z_hi = int(math.ceil((pz + half_h + margin - tsdf.z_min) / vs))
-            for ix in range(max(0, x_lo), min(tsdf.nx, x_hi + 1)):
-                wx = tsdf.origin_x + (ix + 0.5) * vs
-                for iy in range(max(0, y_lo), min(tsdf.ny, y_hi + 1)):
-                    wy = tsdf.origin_y + (iy + 0.5) * vs
-                    dx = wx - px
-                    dy = wy - py
-                    if dx * dx + dy * dy <= eff_radius * eff_radius:
-                        for iz in range(max(0, z_lo), min(tsdf.nz, z_hi + 1)):
-                            voxels.add((ix, iy, iz))
-
-    return voxels
-
-
-def _parse_obstacle_surface_voxels(
-    scene_xml_path: str, tsdf,
-) -> set[tuple[int, int, int]]:
-    """Parse scene XML and return the *surface shell* of each obstacle.
-
-    LiDAR detects obstacle surfaces, not interiors.  This function returns
-    only boundary voxels — voxels inside the obstacle that have at least
-    one face-neighbour outside.  This is a thin (1-voxel) shell.
-
-    The IoU metric uses 2-voxel Chebyshev tolerance when matching TSDF
-    detections against this shell, accounting for discretization and
-    TSDF truncation boundary offset.
-    """
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from foreman.demos.target_game.__main__ import _find_obstacle_geoms
-
-    obstacles = _find_obstacle_geoms(Path(scene_xml_path))
-    surface = set()
-    vs = tsdf.voxel_size
-    margin = vs * 0.5
-    _NEIGHBOURS = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
-
-    for obs in obstacles:
-        px, py, pz = obs['pos']
-
-        if obs['type'] == 'box':
-            hx, hy, hz = obs['size']
-            x_lo = int(math.floor((px - hx - margin - tsdf.origin_x) / vs))
-            x_hi = int(math.ceil((px + hx + margin - tsdf.origin_x) / vs))
-            y_lo = int(math.floor((py - hy - margin - tsdf.origin_y) / vs))
-            y_hi = int(math.ceil((py + hy + margin - tsdf.origin_y) / vs))
-            z_lo = int(math.floor((pz - hz - margin - tsdf.z_min) / vs))
-            z_hi = int(math.ceil((pz + hz + margin - tsdf.z_min) / vs))
-            solid = set()
-            for ix in range(max(0, x_lo), min(tsdf.nx, x_hi + 1)):
-                for iy in range(max(0, y_lo), min(tsdf.ny, y_hi + 1)):
-                    for iz in range(max(0, z_lo), min(tsdf.nz, z_hi + 1)):
-                        solid.add((ix, iy, iz))
-            for v in solid:
-                ix, iy, iz = v
-                for dx, dy, dz in _NEIGHBOURS:
-                    if (ix+dx, iy+dy, iz+dz) not in solid:
-                        surface.add(v)
-                        break
-
-        elif obs['type'] == 'cylinder':
-            radius = obs['size'][0]
-            half_h = obs['size'][1]
-            eff_radius = radius + margin
-            x_lo = int(math.floor((px - eff_radius - tsdf.origin_x) / vs))
-            x_hi = int(math.ceil((px + eff_radius - tsdf.origin_x) / vs))
-            y_lo = int(math.floor((py - eff_radius - tsdf.origin_y) / vs))
-            y_hi = int(math.ceil((py + eff_radius - tsdf.origin_y) / vs))
-            z_lo = int(math.floor((pz - half_h - margin - tsdf.z_min) / vs))
-            z_hi = int(math.ceil((pz + half_h + margin - tsdf.z_min) / vs))
-            solid = set()
-            for ix in range(max(0, x_lo), min(tsdf.nx, x_hi + 1)):
-                wx = tsdf.origin_x + (ix + 0.5) * vs
-                for iy in range(max(0, y_lo), min(tsdf.ny, y_hi + 1)):
-                    wy = tsdf.origin_y + (iy + 0.5) * vs
-                    dx = wx - px
-                    dy = wy - py
-                    if dx * dx + dy * dy <= eff_radius * eff_radius:
-                        for iz in range(max(0, z_lo), min(tsdf.nz, z_hi + 1)):
-                            solid.add((ix, iy, iz))
-            for v in solid:
-                ix, iy, iz = v
-                for dx, dy, dz in _NEIGHBOURS:
-                    if (ix+dx, iy+dy, iz+dz) not in solid:
-                        surface.add(v)
-                        break
-
-    return surface
 
 
 def compute_occupancy_accuracy(tsdf, scene_xml_path: str,
@@ -530,35 +36,20 @@ def compute_occupancy_accuracy(tsdf, scene_xml_path: str,
     """Compare TSDF occupied voxels against ground-truth obstacle surfaces.
 
     Compares raw TSDF detections (log_odds > 0) against the *surface band*
-    of ground-truth obstacles — not their solid interiors.  Only GT voxels
-    in observed territory are scored (the robot can't detect unscanned
-    surfaces).
-
-    A voxel is "observed" if any voxel in its 6-connected neighbourhood
-    has been touched by the TSDF (log_odds != 0).  This means the sensor
-    has cast rays near this location and had a chance to detect it.
+    of ground-truth obstacles. Only GT voxels in observed territory are scored.
 
     Returns dict with 'iou', 'precision', 'recall', and counts.
-    Full 3D voxel comparison.
     """
-    gt_surface = _parse_obstacle_surface_voxels(scene_xml_path, tsdf)
+    gt_surface = parse_obstacle_surface_voxels(scene_xml_path, tsdf)
 
-    # TSDF occupied voxels: log_odds > 1.0 (2+ LiDAR hits required).
-    # A single LiDAR hit gives lo=0.85.  Requiring >1.0 filters out
-    # single-hit noise (self-hits, edge artifacts) and matches the
-    # confidence level used by the cost grid for A* path planning.
-    # Real obstacles get hit repeatedly (lo=2-3.5), so 1.0 is well
-    # below the confirmed-obstacle floor.
-    lo = _materialize_log_odds(tsdf)
+    lo = materialize_log_odds(tsdf)
     _LO_THRESHOLD = 1.0
     occupied = np.argwhere(lo > _LO_THRESHOLD)
     tsdf_voxels = set(map(tuple, occupied))
 
     _NEIGHBOURS = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
 
-    # Observed mask: a GT surface voxel is "observed" if it or any
-    # face-neighbour has been touched by the TSDF (log_odds != 0).
-    scanned = lo != 0.0  # (nx, ny, nz) bool
+    scanned = lo != 0.0
     gt_observed = set()
     for v in gt_surface:
         ix, iy, iz = v
@@ -572,11 +63,6 @@ def compute_occupancy_accuracy(tsdf, scene_xml_path: str,
                 gt_observed.add(v)
                 break
 
-    # Tolerance matching with radius 2 voxels (0.2m).
-    # A TSDF voxel "matches" if any GT surface voxel is within Chebyshev
-    # distance 2 (and vice versa).  0.2m accounts for discretization,
-    # ray angle effects, and TSDF truncation boundary offset.
-    # Build offsets for Chebyshev distance ≤ 2 (5×5×5 cube minus corners > 2)
     _TOL = 2
     _OFFSETS = []
     for dx in range(-_TOL, _TOL + 1):
@@ -587,8 +73,8 @@ def compute_occupancy_accuracy(tsdf, scene_xml_path: str,
                 if max(abs(dx), abs(dy), abs(dz)) <= _TOL:
                     _OFFSETS.append((dx, dy, dz))
 
-    tsdf_matched = set()     # TSDF voxels near GT surface
-    gt_matched = set()       # GT surface voxels near a TSDF detection
+    tsdf_matched = set()
+    gt_matched = set()
     for v in tsdf_voxels:
         if v in gt_observed:
             tsdf_matched.add(v)
@@ -601,7 +87,6 @@ def compute_occupancy_accuracy(tsdf, scene_xml_path: str,
                 tsdf_matched.add(v)
                 gt_matched.add(nb)
                 break
-    # Also check: GT voxels matched by nearby TSDF voxels
     for v in gt_observed:
         if v in gt_matched:
             continue
@@ -664,11 +149,8 @@ def compute_occupancy_2d(tsdf, scene_xml_path: str) -> dict:
     """2D projected occupancy with tolerance-based precision/recall.
 
     Uses distance transforms to evaluate whether each TSDF detection is
-    within `tolerance` voxels of a GT obstacle, and vice versa. This
-    handles voxel boundary alignment, surface thickness, and log-odds
-    erosion without requiring exact cell matching.
-
-    Only scores cells that have been observed (any log_odds != 0 in Z band).
+    within `tolerance` voxels of a GT obstacle, and vice versa.
+    Only scores cells that have been observed.
     """
     from scipy.ndimage import binary_opening, distance_transform_edt
 
@@ -677,65 +159,47 @@ def compute_occupancy_2d(tsdf, scene_xml_path: str) -> dict:
     iz_lo = max(0, int((z_lo - tsdf.z_min) / vs))
     iz_hi = min(tsdf.nz, int((z_hi - tsdf.z_min) / vs) + 1)
 
-    z_slab = _materialize_log_odds(tsdf)[:, :, iz_lo:iz_hi]
+    z_slab = materialize_log_odds(tsdf)[:, :, iz_lo:iz_hi]
 
-    # TSDF: any occupied voxel in Z band -> cell occupied
     tsdf_2d = np.any(z_slab > 0, axis=2)
-
-    # Morphological opening: remove isolated 1-2 cell noise (robot self-hits,
-    # target marker residue, edge artifacts) while preserving real obstacle
-    # clusters which are always 3+ cells wide.
     tsdf_2d = binary_opening(tsdf_2d, iterations=1)
 
-    # GT: any ground-truth voxel in Z band -> cell occupied
-    gt_voxels_3d = _parse_obstacle_voxels(scene_xml_path, tsdf)
+    gt_voxels_3d = parse_obstacle_voxels(scene_xml_path, tsdf)
     gt_2d = np.zeros((tsdf.nx, tsdf.ny), dtype=bool)
     for ix, iy, iz in gt_voxels_3d:
         if iz_lo <= iz < iz_hi:
             gt_2d[ix, iy] = True
 
-    # Only score cells that have been observed (any log_odds != 0 in Z band)
     observed = np.any(z_slab != 0.0, axis=2)
 
-    # Restrict to observed cells only (unscanned cells aren't errors)
     tsdf_obs = tsdf_2d & observed
     gt_obs = gt_2d & observed
 
-    # Tolerance-based matching using distance transforms (in voxel units).
-    # 2.5 voxels = 0.25m — accounts for surface thickness, boundary
-    # discretization, log-odds erosion, and minor scan alignment errors.
     tol = 2.5
 
-    # Distance from each cell to nearest GT cell (voxel units)
     gt_dist = distance_transform_edt(~gt_obs) if np.any(gt_obs) else np.full_like(gt_obs, 999.0, dtype=float)
-    # Distance from each cell to nearest TSDF cell (voxel units)
     tsdf_dist = distance_transform_edt(~tsdf_obs) if np.any(tsdf_obs) else np.full_like(tsdf_obs, 999.0, dtype=float)
 
-    # Precision: fraction of TSDF cells within tolerance of a GT cell
     n_tsdf = int(np.sum(tsdf_obs))
     if n_tsdf > 0:
         precision = float(np.sum(gt_dist[tsdf_obs] <= tol) / n_tsdf)
     else:
         precision = 0.0
 
-    # Recall: fraction of GT cells within tolerance of a TSDF cell
     n_gt = int(np.sum(gt_obs))
     if n_gt > 0:
         recall = float(np.sum(tsdf_dist[gt_obs] <= tol) / n_gt)
     else:
         recall = 0.0
 
-    # F1 score as the composite metric (harmonic mean of P and R)
     if precision + recall > 0:
         iou = 2 * precision * recall / (precision + recall)
     else:
         iou = 0.0
 
-    # Diagnostic: print on calls 1 and 5
     global _OCC_DIAG_COUNT
     _OCC_DIAG_COUNT += 1
     if _OCC_DIAG_COUNT in (1, 5):
-        # Also compute exact-match stats for comparison
         exact_int = int(np.sum(tsdf_obs & gt_obs))
         fp_exact = tsdf_obs & ~gt_obs
         fn_exact = gt_obs & ~tsdf_obs
@@ -745,7 +209,6 @@ def compute_occupancy_2d(tsdf, scene_xml_path: str) -> dict:
         print(f"  Tolerance P={precision:.3f}  R={recall:.3f}  F1={iou:.3f}")
         print(f"  Exact-match: I={exact_int} FP={int(np.sum(fp_exact))} FN={int(np.sum(fn_exact))}")
 
-        # Unmatched TSDF cells (beyond tolerance from GT)
         if n_tsdf > 0:
             unmatched = tsdf_obs & (gt_dist > tol)
             n_unmatched = int(np.sum(unmatched))
@@ -792,10 +255,8 @@ def run_test(scenario_name: str, ticks: int = 500, domain: int = 20) -> dict:
     print(f"  ticks: {ticks}")
     print(f"{'='*60}")
 
-    # Import run_game lazily (triggers DDS preload)
     from foreman.demos.target_game.__main__ import run_game
 
-    # Build spawn_fn if scenario has a factory
     spawn_fn = None
     if scenario.spawn_fn_factory is not None:
         spawn_fn = scenario.spawn_fn_factory(scenario.target_seed)
@@ -822,12 +283,7 @@ def run_test(scenario_name: str, ticks: int = 500, domain: int = 20) -> dict:
 
     result = run_game(args)
 
-    # Extract TSDF from perception stats
-    # We need to access the TSDF directly — the run_game doesn't expose it.
-    # Re-run with direct access:
     print(f"\nNote: run_game completed. Checking if TSDF is accessible...")
-
-    # For now, report what we got from the run
     print(f"  Stats: {result.stats.targets_reached}/{result.stats.targets_spawned} targets")
     print(f"  Falls: {result.stats.falls}")
     if result.perception_stats:
@@ -855,7 +311,7 @@ def main():
             if not scenario.has_obstacles:
                 continue
             results[name] = run_test(name, ticks=args.ticks, domain=args.domain)
-            args.domain += 1  # avoid DDS domain collisions
+            args.domain += 1
 
         print(f"\n{'='*60}")
         print("OCCUPANCY ACCURACY SUMMARY")
