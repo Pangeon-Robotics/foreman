@@ -10,6 +10,30 @@ helpers. Navigation methods are provided by:
 Configuration constants, GameState, GameStatistics, and configure_for_robot
 live in game_config.py. All names are re-exported here for backward
 compatibility.
+
+Data Flow Compliance (Robot-View vs God-View)
+---------------------------------------------
+Two independent perception pipelines run in parallel:
+
+  ROBOT-VIEW (green dots, grey cubes, red costmap):
+    LiDAR → PerceptionPipeline._tsdf → world_cost_grid → PathCritic
+    Used by: _export_path (green dots), DWA planner, A* waypoints
+    Source: dwa_nav.py, dwa_control.py, path_critic.py, perception.py
+
+  GOD-VIEW (blue dots, blue cubes, blue costmap):
+    MuJoCo raycasts → GodViewTSDF → god_view_costmap → _astar_on_god_view
+    Used by: blue dot overlay, 3DS scoring, F1 metrics
+    Source: god_tsdf.py, _astar_on_god_view() below
+
+Robot-view code must NEVER access god-view data (GodViewTSDF, god_view
+costmap, scene XML geometry).  This separation validates the perception
+pipeline: robot-view shows what the robot actually perceives; god-view
+shows ground truth for comparison.
+
+Pose streams: robot-view uses SLAM x/y/yaw (via _get_nav_pose and
+set_imu_pose) for scan integration, cost grids, and navigation.
+God-view uses ground-truth MuJoCo body pose.  Both share GT z/roll/pitch
+(unobservable from dead-reckoning).
 """
 from __future__ import annotations
 
@@ -336,11 +360,13 @@ class TargetGame(
         if self._pose_pub is not None:
             self._publish_pose()
 
-        # Feed full 6-DOF pose to perception for IMU-corrected LiDAR transforms.
-        # Uses ground-truth MuJoCo body pose (x, y, z, roll, pitch, yaw).
+        # Feed SLAM horizontal pose + GT tilt to perception.
+        # SLAM provides x/y/yaw (what the robot believes); GT provides
+        # z/roll/pitch (unobservable from dead-reckoning).
         if self._perception is not None:
-            x, y, yaw, z, roll, pitch = self._get_robot_pose()
-            self._perception.set_imu_pose(x, y, z, roll, pitch, yaw)
+            _, _, _, z, roll, pitch = self._get_robot_pose()
+            p = self._odometry.pose
+            self._perception.set_imu_pose(p.x, p.y, z, roll, pitch, p.yaw)
 
     # --- Setters ---
 
@@ -434,7 +460,10 @@ class TargetGame(
         return max(0.0, min_d - 0.60)
 
     def _get_nav_pose(self) -> tuple[float, float, float]:
-        """Return (x, y, yaw) for navigation (always ground truth)."""
+        """Return (x, y, yaw) for navigation — SLAM when available, else GT."""
+        if self._odometry is not None:
+            p = self._odometry.pose
+            return p.x, p.y, p.yaw
         x, y, yaw, _, _, _ = self._get_robot_pose()
         return x, y, yaw
 
@@ -607,16 +636,17 @@ class TargetGame(
         # Raycast is fast (~5ms each via mj_multiRay C call).
         # Cost grid build is DEFERRED to phase 10.
         if _phase == 0:
-            _scan_x, _scan_y, _scan_yaw, _scan_z, _, _ = self._get_robot_pose()
+            _gt_x, _gt_y, _gt_yaw, _gt_z, _, _ = self._get_robot_pose()
 
             if self._god_view_tsdf is not None:
-                self._god_view_tsdf.update(_scan_x, _scan_y, _scan_yaw, _scan_z)
+                self._god_view_tsdf.update(_gt_x, _gt_y, _gt_yaw, _gt_z)
                 self._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
 
             if (self._perception is not None
                     and getattr(self._perception, '_direct_ready', False)):
+                nav_x, nav_y, nav_yaw = self._get_nav_pose()
                 self._perception.direct_scan_only(
-                    _scan_x, _scan_y, _scan_z, _scan_yaw)
+                    nav_x, nav_y, _gt_z, nav_yaw)
 
         # Phase 10: Cost grid build (~65-100ms — the expensive part).
         # Runs every OTHER cycle (2Hz) to limit GIL blocking.
@@ -680,7 +710,11 @@ def _astar_on_god_view(
     grid, meta, start: tuple[float, float], goal: tuple[float, float],
     robot_radius: float = 0.525,
 ) -> list[tuple[float, float]] | None:
-    """Run A* on a god-view cost grid and return world-frame waypoints.
+    """Run A* on a **god-view** cost grid and return world-frame waypoints.
+
+    GOD-VIEW ONLY: uses god-view costmap (from scene XML or GodViewTSDF)
+    and ground-truth robot position.  Renders as blue dots.  Not used by
+    the robot's perception/navigation pipeline.
 
     robot_radius defaults to 0.525m = 1.5 × B2 half-width, so A* avoids
     corridors narrower than 1.05m (1.5 × robot diameter).
@@ -693,4 +727,10 @@ def _astar_on_god_view(
     critic._cost_voxel_size = meta['voxel_size']
     critic._cost_truncation = meta.get('truncation', 0.5)
     critic._robot_radius = robot_radius
-    return critic._astar_on_cost_grid(start, goal, return_path=True)
+    path = critic._astar_on_cost_grid(start, goal, return_path=True,
+                                      force_passable=True)
+    if path is not None and len(path) >= 3:
+        path = PathCritic.smooth_path(
+            path, grid, meta['origin_x'], meta['origin_y'],
+            meta['voxel_size'])
+    return path
