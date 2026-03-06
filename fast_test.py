@@ -207,6 +207,7 @@ def main():
     all_results = []  # for JSON export
     path_effs = []
     v_avgs = []
+    slip_effs = []
     reg_gates = []
     total_falls = 0
 
@@ -238,6 +239,8 @@ def main():
             path_effs.append(r["path_efficiency"])
         if r.get("v_avg") is not None:
             v_avgs.append(r["v_avg"])
+        if r.get("slip_efficiency") is not None:
+            slip_effs.append(r["slip_efficiency"])
         if r.get("regression") is not None:
             reg_gates.append(r["regression"])
 
@@ -296,6 +299,9 @@ def main():
             mean_v = sum(v_avgs) / len(v_avgs)
             speed_ratio = compute_speed_ratio(mean_v)
             print(f"  Speed (v_avg):    {mean_v:.2f} m/s  (ratio={speed_ratio:.2f}, V_REF=2.0)")
+        if slip_effs:
+            mean_slip = sum(slip_effs) / len(slip_effs)
+            print(f"  Slip efficiency:  {mean_slip:.1%}  (min={min(slip_effs):.1%}, max={max(slip_effs):.1%})")
         if reg_gates:
             mean_rg = sum(reg_gates) / len(reg_gates)
             print(f"  Regression gate:  {mean_rg:.2f}  (min={min(reg_gates):.2f})")
@@ -347,6 +353,7 @@ def main():
         "mean_path_efficiency": round(sum(path_effs) / len(path_effs), 3) if path_effs else None,
         "mean_v_avg": round(sum(v_avgs) / len(v_avgs), 3) if v_avgs else None,
         "mean_speed_ratio": round(compute_speed_ratio(sum(v_avgs) / len(v_avgs)), 3) if v_avgs else None,
+        "mean_slip_efficiency": round(sum(slip_effs) / len(slip_effs), 3) if slip_effs else None,
         "mean_regression": round(sum(reg_gates) / len(reg_gates), 3) if reg_gates else None,
         "bottleneck": bottleneck if (path_effs and v_avgs and reg_gates) else None,
         "runs": all_results,

@@ -92,8 +92,10 @@ class DWANavigator:
         if (g._path_critic is not None
                 and g._target_step_count % 10 == 0
                 and not g._in_tip_mode):
+            v_cmd = C.STEP_LENGTH * g._smooth_heading_mod * C.GAIT_FREQ
             g._path_critic.record(
-                nav_x, nav_y, t=g._target_step_count * C.CONTROL_DT)
+                nav_x, nav_y, t=g._target_step_count * C.CONTROL_DT,
+                v_cmd=v_cmd)
 
         # A* waypoint guidance
         self._dwa_update_waypoints(
@@ -192,9 +194,13 @@ class DWANavigator:
         cooldown_elapsed = (
             g._target_step_count - last_replan_step >= 100)
 
-        # No waypoint yet -- need initial plan (bypass cooldown)
-        if g._current_waypoint is None:
+        # No waypoint yet -- need initial plan (bypass cooldown).
+        # When no waypoint AND cooldown elapsed, force replan immediately
+        # so the robot isn't left without guidance after a failed plan.
+        if g._current_waypoint is None and cooldown_elapsed:
             should_replan = True
+        elif g._current_waypoint is None:
+            should_replan = True  # initial plan bypasses cooldown
         elif cooldown_elapsed:
             # Reached current waypoint -- get next one
             wp_dist = math.hypot(
@@ -223,7 +229,7 @@ class DWANavigator:
                 and (g._last_dwa_result.n_feasible < 30
                      or g._last_dwa_result.score < 0.20
                      or getattr(g, '_last_threat_level', 0) > 0.2))
-            safety_interval = 300 if threat_nearby else 1000
+            safety_interval = 150 if threat_nearby else 1000
             if (g._target_step_count % safety_interval == 0
                     and g._target_step_count > 0):
                 should_replan = True

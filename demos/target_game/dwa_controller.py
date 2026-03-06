@@ -152,6 +152,9 @@ class DWAController:
                             g._smooth_dwa_fwd = max(
                                 g._smooth_dwa_fwd, 0.3)
                     heading_mod = min(heading_mod, g._smooth_dwa_fwd)
+                # Floor: maintain forward speed in open field
+                if dwa.n_feasible >= 35:
+                    g._smooth_dwa_fwd = max(g._smooth_dwa_fwd, 0.50)
                 elif dwa.n_feasible < 20:
                     heading_mod = min(heading_mod, g._smooth_dwa_fwd)
             elif dwa.n_feasible < 20:
@@ -192,10 +195,10 @@ class DWAController:
                 wz_penalty = (abs(g._smooth_wz) - 0.3) * 0.5
                 heading_mod = max(0.15, heading_mod - wz_penalty)
 
-            # Lateral stability cap
+            # Lateral stability cap (skip in open field)
             _sw = abs(g._smooth_wz)
-            if _sw > 0.4:
-                _safe_hmod = min(1.0, 0.40 / max(0.1, _sw))
+            if _sw > 0.4 and dwa.n_feasible < 35:
+                _safe_hmod = min(1.0, 0.50 / max(0.1, _sw))
                 heading_mod = min(heading_mod, max(0.20, _safe_hmod))
 
             # Turn brake

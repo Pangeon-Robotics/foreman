@@ -12,8 +12,8 @@ ATO_TABLE_LINE = re.compile(
     r"([\d.]+)\s+"           # ATO score
     r"(\d+%)\s+"             # path efficiency
     r"([\d.]+)\s+"           # v_avg
+    r"(\d+%)\s+"             # slip efficiency
     r"([\d.]+)m\s+"          # regression
-    r"([\d.]+)\s+"           # regression gate
     r"([\d.]+)s"             # stall
     r"(.*)"                  # optional TIMEOUT suffix
 )
@@ -23,6 +23,7 @@ ATO_AGG_LINE = re.compile(
     r"([\d.]+)\s+"           # aggregate ATO
     r"(\d+%)\s+"             # aggregate path efficiency
     r"([\d.]+)\s+"           # aggregate v_avg
+    r"(\d+%)\s+"             # aggregate slip efficiency
     r"([\d.]+)m\s+"          # total regression
     r"([\d.]+)s"             # total stall
 )
@@ -44,6 +45,7 @@ def parse_output(stdout: str) -> dict:
         # ATO component breakdown (from aggregate line)
         "path_efficiency": None,
         "v_avg": None,
+        "slip_efficiency": None,
         "regression": None,
         "stall": None,
     }
@@ -83,8 +85,10 @@ def parse_output(stdout: str) -> dict:
                 pe_str = m.group(4)  # e.g., "95%"
                 result["path_efficiency"] = int(pe_str.rstrip("%")) / 100.0
                 result["v_avg"] = float(m.group(5))
-                result["regression"] = float(m.group(6))
-                result["stall"] = float(m.group(7))
+                slip_str = m.group(6)  # e.g., "85%"
+                result["slip_efficiency"] = int(slip_str.rstrip("%")) / 100.0
+                result["regression"] = float(m.group(7))
+                result["stall"] = float(m.group(8))
 
     # Parse targets line ("Targets: 3/4 reached (75%)")
     for line in lines:

@@ -1,25 +1,22 @@
 """Path quality critic with ATO (A*-Theoretic Optimum) fitness metric.
 
-ATO score = 100 * min(1.0, budget_time / actual_time)
+ATO score = 100 * path_efficiency * speed_ratio * slip_efficiency
 
 where:
-  budget_time  = A*_distance / V_REF     (theoretical optimal transit time)
-  actual_time  = wall-clock time to reach target
+  path_efficiency = A*_distance / actual_distance   (route quality, ≤1.0)
+  speed_ratio     = v_avg / V_REF                   (speed vs reference, ≤1.0)
+  slip_efficiency = actual_distance / commanded_dist (grip quality, ≤1.0)
 
-Equivalently: ATO = 100 * min(1.0, path_efficiency * v_avg / V_REF)
+V_REF is the aspirational transit speed (2.0 m/s).  Any speed below V_REF
+smoothly discounts the score.  Any path longer than A*-optimal discounts.
+Any slippage (commanded distance > actual distance) discounts further.
 
-V_REF is a per-robot budget speed (m/s) representing expected mean transit
-speed on obstacle-rich terrain including ALL overhead (turning, SLAM drift,
-stuck recovery, obstacle avoidance).  It should be calibrated so that a
-competent navigation run scores ~90-95 ATO.
-
-Aggregate ATO = mean of per-target ATOs.  Timeouts score 0, so missing
-even one target out of four caps the aggregate at 75 (3*100 + 0)/4.
-This naturally gates the metric on completion without a separate term.
+Aggregate ATO = mean of per-target ATOs.  Timeouts score 0.
 
 Diagnostic columns explain WHY a score is low:
   - path: route quality (1.0 = optimal A* path)
   - v_avg: average walking speed (m/s)
+  - slip: grip efficiency (1.0 = no slip)
   - regress: meters traveled away from target (wrong direction)
   - stall: seconds spent nearly stationary (<0.1 m/s)
 """
@@ -35,8 +32,8 @@ from .path_smoother import smooth_path, plan_waypoints  # noqa: F401
 
 # Per-robot budget speeds (m/s).
 V_REF = {
-    "b2": 0.14,
-    "go2": 1.5,
+    "b2": 2.0,
+    "go2": 2.0,
     "go2w": 2.0,
     "b2w": 3.0,
 }
@@ -73,7 +70,8 @@ class PathCritic:
         self._cost_origin_x: float = 0.0
         self._cost_origin_y: float = 0.0
         self._cost_voxel_size: float = 0.1
-        self._path: list[tuple[float, float, float]] = []
+        # Each sample: (x, y, t, v_cmd) where v_cmd is commanded speed (m/s)
+        self._path: list[tuple[float, float, float, float]] = []
         self._target: tuple[float, float] | None = None
         self._reports: list[dict] = []
 
@@ -96,15 +94,20 @@ class PathCritic:
         """Store current target position for regression computation."""
         self._target = (target_x, target_y)
 
-    def record(self, x: float, y: float, t: float = 0.0) -> None:
-        """Record a position sample. Call at DWA replan rate (10Hz)."""
+    def record(self, x: float, y: float, t: float = 0.0,
+               v_cmd: float = 0.0) -> None:
+        """Record a position sample with commanded speed.
+
+        v_cmd: commanded forward speed in m/s (step_length * gait_freq).
+        Used to compute slippage (commanded vs actual displacement).
+        """
         if self._path:
-            px, py, _ = self._path[-1]
+            px, py, _, _ = self._path[-1]
             dx, dy = x - px, y - py
             if dx * dx + dy * dy < 0.03 * 0.03:
-                self._path[-1] = (px, py, t)
+                self._path[-1] = (px, py, t, v_cmd)
                 return
-        self._path.append((x, y, t))
+        self._path.append((x, y, t, v_cmd))
 
     def target_reached(self, target_x: float, target_y: float) -> dict:
         """Compute ATO fitness when a target is reached."""
@@ -137,8 +140,15 @@ class PathCritic:
         end = path[-1]
 
         actual = 0.0
+        commanded = 0.0
         for a, b in zip(path, path[1:]):
-            actual += math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+            seg_dist = math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+            actual += seg_dist
+            dt = b[2] - a[2]
+            if dt > 0:
+                # Use average of commanded speeds at segment endpoints
+                v_cmd_avg = (a[3] + b[3]) * 0.5
+                commanded += v_cmd_avg * dt
 
         total_time = path[-1][2] - path[0][2]
         avg_speed = actual / max(total_time, 0.01)
@@ -154,6 +164,12 @@ class PathCritic:
         path_efficiency = best / max(actual, 0.01)
         path_efficiency = min(path_efficiency, 1.0)
 
+        # Slip efficiency: actual / commanded (capped at 1.0)
+        if commanded > 0.01:
+            slip_efficiency = min(1.0, actual / commanded)
+        else:
+            slip_efficiency = 1.0
+
         tx, ty = target_x, target_y
         regression = 0.0
         for a, b in zip(path, path[1:]):
@@ -166,8 +182,8 @@ class PathCritic:
         if timed_out:
             ato_score = 0.0
         else:
-            budget_time = best / self._v_ref
-            ato_score = 100.0 * min(1.0, budget_time / max(total_time, 0.01))
+            speed_ratio = min(1.0, avg_speed / self._v_ref)
+            ato_score = 100.0 * path_efficiency * speed_ratio * slip_efficiency
 
         stall_time = 0.0
         for a, b in zip(path, path[1:]):
@@ -184,10 +200,12 @@ class PathCritic:
             "target": (target_x, target_y),
             "astar_dist": round(best, 2),
             "actual_dist": round(actual, 2),
+            "commanded_dist": round(commanded, 2),
             "total_time": round(total_time, 1),
             "ato_score": round(ato_score, 1),
             "path_efficiency": round(path_efficiency, 3),
             "avg_speed": round(avg_speed, 2),
+            "slip_efficiency": round(slip_efficiency, 3),
             "regression": round(regression, 1),
             "stall_time": round(stall_time, 1),
             "timed_out": timed_out,
@@ -202,11 +220,12 @@ class PathCritic:
 
         print(f"\n=== ATO FITNESS (V_ref={self._v_ref:.2f} m/s) ===")
         print(f" {'#':>2}  {'A*_dist':>7}  {'time':>6}    {'ATO':>4}  {'path':>5}  "
-              f"{'v_avg':>5}  {'regress':>7}  {'stall':>6}")
-        print("-" * 66)
+              f"{'v_avg':>5}  {'slip':>5}  {'regress':>7}  {'stall':>6}")
+        print("-" * 76)
 
         total_astar = 0.0
         total_actual = 0.0
+        total_commanded = 0.0
         total_time = 0.0
         total_regression = 0.0
         total_stall = 0.0
@@ -217,28 +236,31 @@ class PathCritic:
             ato = r["ato_score"]
             pe = r["path_efficiency"]
             v = r["avg_speed"]
+            slip = r.get("slip_efficiency", 1.0)
             reg = r["regression"]
             stall = r["stall_time"]
             timeout = r["timed_out"]
 
             total_astar += a_dist
             total_actual += r["actual_dist"]
+            total_commanded += r.get("commanded_dist", r["actual_dist"])
             total_time += t
             total_regression += reg
             total_stall += stall
 
             suffix = "  TIMEOUT" if timeout else ""
             print(f" {i:>2}  {a_dist:>6.1f}m  {t:>5.1f}s  {ato:>5.1f}  {pe:>4.0%}  "
-                  f"{v:>5.2f}  {reg:>6.1f}m  {stall:>5.1f}s{suffix}")
+                  f"{v:>5.2f}  {slip:>4.0%}  {reg:>6.1f}m  {stall:>5.1f}s{suffix}")
 
         agg_ato = sum(r["ato_score"] for r in self._reports) / len(self._reports)
         agg_pe = total_astar / max(total_actual, 0.01)
         agg_pe = min(agg_pe, 1.0)
         agg_speed = total_actual / max(total_time, 0.01)
+        agg_slip = min(1.0, total_actual / max(total_commanded, 0.01))
 
-        print("-" * 66)
+        print("-" * 76)
         print(f"     {total_astar:>6.1f}m  {total_time:>5.1f}s  {agg_ato:>5.1f}  {agg_pe:>4.0%}  "
-              f"{agg_speed:>5.2f}  {total_regression:>6.1f}m  "
+              f"{agg_speed:>5.2f}  {agg_slip:>4.0%}  {total_regression:>6.1f}m  "
               f"{total_stall:>5.1f}s")
 
     def running_ato(self) -> tuple[float, float, float, float, float]:
@@ -249,13 +271,19 @@ class PathCritic:
         start = path[0]
         end = path[-1]
         actual = 0.0
+        commanded = 0.0
         for a, b in zip(path, path[1:]):
             actual += math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+            dt = b[2] - a[2]
+            if dt > 0:
+                commanded += (a[3] + b[3]) * 0.5 * dt
         straight = math.sqrt((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2)
         pe = min(straight / max(actual, 0.01), 1.0)
         total_time = path[-1][2] - path[0][2]
         avg_speed = actual / max(total_time, 0.01)
-        sr = avg_speed / self._v_ref
+        sr = min(1.0, avg_speed / self._v_ref)
+        slip = min(1.0, actual / max(commanded, 0.01)) if commanded > 0.01 else 1.0
+        ato = 100.0 * pe * sr * slip
         tx, ty = self._target
         regression = 0.0
         for a, b in zip(path, path[1:]):
@@ -264,9 +292,7 @@ class PathCritic:
             delta = d_b - d_a
             if delta > 0:
                 regression += delta
-        budget = straight / self._v_ref
-        ato = 100.0 * min(1.0, budget / max(total_time, 0.01))
-        return (ato, pe, sr, 1.0, regression)
+        return (ato, pe, sr, slip, regression)
 
     def aggregate_ato(self) -> float:
         """Return the aggregate ATO score across all targets."""

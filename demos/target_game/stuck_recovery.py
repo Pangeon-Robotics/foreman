@@ -59,6 +59,10 @@ class StuckRecovery:
             prolonged_stuck = (streak >= 3
                               and not g._in_tip_mode
                               and dwa_feas < 30)
+            # Progress-based stuck: fires regardless of feas
+            progress_stuck = (streak >= 4
+                              and not g._in_tip_mode
+                              and dist > 1.5)
             # Low-score stuck
             low_score_stuck = (
                 no_progress
@@ -66,17 +70,25 @@ class StuckRecovery:
                 and g._last_dwa_result.score < 0.05
                 and dwa_feas < 15
                 and not g._in_tip_mode)
-            if jammed or blocked_fwd or prolonged_stuck or low_score_stuck:
-                self._stuck_recovery_countdown = 100  # 1s at 100Hz
+            if (jammed or blocked_fwd or prolonged_stuck
+                    or low_score_stuck or progress_stuck):
                 self._no_progress_streak = 0
-                if abs(g._smooth_dwa_turn) > 0.1:
+                # Open-field progress_stuck: shorter, proportional TIP
+                # to avoid 80° overshoot that causes orbit oscillation.
+                if progress_stuck and dwa_feas >= 30:
+                    self._stuck_recovery_countdown = 60  # 0.6s
                     self._stuck_recovery_wz = math.copysign(
-                        C.TURN_WZ, g._smooth_dwa_turn)
-                elif abs(heading_err) > 0.05:
-                    self._stuck_recovery_wz = math.copysign(
-                        C.TURN_WZ, heading_err)
+                        C.TURN_WZ * 0.7, heading_err)
                 else:
-                    self._stuck_recovery_wz = C.TURN_WZ
+                    self._stuck_recovery_countdown = 100  # 1s
+                    if abs(g._smooth_dwa_turn) > 0.1:
+                        self._stuck_recovery_wz = math.copysign(
+                            C.TURN_WZ, g._smooth_dwa_turn)
+                    elif abs(heading_err) > 0.05:
+                        self._stuck_recovery_wz = math.copysign(
+                            C.TURN_WZ, heading_err)
+                    else:
+                        self._stuck_recovery_wz = C.TURN_WZ
                 g._current_waypoint = None
                 g._wp_commit_until = 0
                 reason = ("jammed" if jammed else
@@ -96,7 +108,10 @@ class StuckRecovery:
         """Execute stuck recovery maneuver. Returns True always."""
         g = self.game
         self._stuck_recovery_countdown -= 1
-        if self._stuck_recovery_countdown >= 70:
+        # Stand-still phase: first ~30% of recovery, then turn
+        # For 100-tick recovery: stand >= 70, turn 0-69
+        # For 60-tick recovery: stand >= 40, turn 0-39
+        if self._stuck_recovery_countdown >= 40:
             params = g._L4GaitParams(
                 gait_type='trot', step_length=0.0, wz=0.0,
                 gait_freq=C.GAIT_FREQ, step_height=0.0,
@@ -120,7 +135,7 @@ class StuckRecovery:
         if g._target_step_count % C.TELEMETRY_INTERVAL == 0:
             t = g._target_step_count * C.CONTROL_DT
             phase = ("STOP"
-                     if self._stuck_recovery_countdown >= 70
+                     if self._stuck_recovery_countdown >= 40
                      else "TURN")
             x_gt, y_gt, _, _, _, _ = g._get_robot_pose()
             clr = g._gt_clearance()

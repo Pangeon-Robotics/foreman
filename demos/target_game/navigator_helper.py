@@ -46,7 +46,10 @@ class Navigator:
         if (g._path_critic is not None
                 and g._target_step_count % 10 == 0
                 and abs(heading_err) <= C.THETA_THRESHOLD):
-            g._path_critic.record(nav_x, nav_y, t=g._target_step_count * C.CONTROL_DT)
+            v_cmd = C.STEP_LENGTH * max(0.0, math.cos(heading_err)) * C.GAIT_FREQ
+            g._path_critic.record(
+                nav_x, nav_y, t=g._target_step_count * C.CONTROL_DT,
+                v_cmd=v_cmd)
 
         if abs(heading_err) > C.THETA_THRESHOLD:
             # TURN IN PLACE -- arc-based rotation with diagonal stepping

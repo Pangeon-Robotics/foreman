@@ -134,6 +134,17 @@ def export_path(game, target_x, target_y):
                 )
                 _astar_mode = "constrained-tight"
 
+            # Last resort: force-passable path (through obstacles).
+            # Better than no path — gives waypoint guidance even when
+            # surrounded by high-cost cells.
+            if raw is None or len(raw) < 2:
+                pc._robot_radius = 0.05
+                raw = pc._astar_core(
+                    (x_gt, y_gt), (target_x, target_y),
+                    return_path=True, force_passable=True,
+                )
+                _astar_mode = "forced"
+
             pc._robot_radius = saved_radius
 
         if raw is None or len(raw) < 2:
