@@ -35,8 +35,7 @@ SPEED_RAMP = [
 ]
 
 
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
+from foreman.demos.target_game.utils import clamp
 
 
 def theoretical_speed(step_length: float, gait_freq: float) -> float:

@@ -21,37 +21,16 @@ class CriticResult:
 
 
 def run_all_critics(result, criteria: dict, telemetry_path: Path | None) -> list[CriticResult]:
-    """Run all applicable critics and return results.
-
-    Parameters
-    ----------
-    result : GameRunResult
-        Output from run_game().
-    criteria : dict
-        Pass thresholds from ScenarioDefinition.pass_criteria.
-    telemetry_path : Path or None
-        Path to JSONL telemetry file.
-    """
+    """Run all applicable critics and return results."""
     results = []
-
-    # Parse telemetry once for all critics that need it
     telem = _parse_telemetry(telemetry_path) if telemetry_path else {}
 
-    # Universal critics (run on every scenario)
+    # Universal critics
     results.append(target_success(result, criteria))
     results.append(no_falls(result, criteria))
 
     if result.slam_trail and result.truth_trail:
         results.append(slam_accuracy(result, criteria))
-
-    # DWA-dependent critics (only if DWA telemetry exists)
-    if "dwa" in telem:
-        results.append(forward_progress(result, telem, criteria))
-        results.append(dwa_feasibility(telem, criteria))
-        results.append(dwa_oscillation(result, telem, criteria))
-        results.append(collision_free(telem, criteria))
-        results.append(wrong_way_turn(telem, criteria))
-        results.append(walking_away(telem, criteria))
 
     # Ground-truth proximity critic (foreman referee using physics engine)
     if "proximity" in telem:
@@ -134,141 +113,13 @@ def slam_accuracy(result, criteria: dict) -> CriticResult:
     )
 
 
-def forward_progress(result, telem: dict, criteria: dict) -> CriticResult:
-    """Check robot generally moved toward targets (monotonic distance decrease).
-
-    Uses DWA telemetry distance-to-target readings. Allows small increases
-    (0.1m tolerance) for obstacle detours. Measures percentage of 10Hz
-    windows where distance decreased or held steady.
-    """
-    threshold = criteria.get("forward_progress_pct", 0.80)
-
-    dwa_records = telem.get("dwa", [])
-    dists = [r["dist"] for r in dwa_records if "dist" in r]
-    if len(dists) < 2:
-        return CriticResult("forward_progress", True, 1.0, "Not enough data (skipped)")
-
-    # Count windows where distance decreased (with 0.1m tolerance for detours)
-    windows_good = sum(1 for i in range(1, len(dists)) if dists[i] <= dists[i-1] + 0.1)
-    total_windows = len(dists) - 1
-    progress_pct = windows_good / total_windows if total_windows > 0 else 1.0
-
-    passed = progress_pct >= threshold
-    return CriticResult(
-        name="forward_progress",
-        passed=passed,
-        score=progress_pct,
-        details=(f"{progress_pct:.0%} of windows showed progress "
-                 f"({windows_good}/{total_windows}), need {threshold:.0%}"),
-    )
-
-
-def dwa_feasibility(telem: dict, criteria: dict) -> CriticResult:
-    """Check DWA had enough feasible arcs on average.
-
-    Low feasibility means the costmap is so cluttered that DWA can't
-    find paths, likely causing the robot to stand still.
-    """
-    min_mean = criteria.get("min_dwa_feasible_mean", 20)
-
-    dwa_records = telem.get("dwa", [])
-    if not dwa_records:
-        return CriticResult("dwa_feasibility", True, 1.0, "No DWA data (skipped)")
-
-    feasible_counts = [r.get("n_feasible", 0) for r in dwa_records]
-    mean_feasible = sum(feasible_counts) / len(feasible_counts)
-
-    passed = mean_feasible >= min_mean
-    return CriticResult(
-        name="dwa_feasibility",
-        passed=passed,
-        score=min(1.0, mean_feasible / 105.0),  # 105 arcs total in DWA grid
-        details=f"mean {mean_feasible:.0f} feasible arcs (need {min_mean}+, max 105)",
-    )
-
-
-def dwa_oscillation(result, telem: dict, criteria: dict) -> CriticResult:
-    """Check robot isn't flip-flopping between left/right turns.
-
-    Counts significant turn direction reversals (ignoring small turns
-    below 0.1 rad/s) and normalizes per target reached.
-    """
-    max_per_target = criteria.get("max_dwa_oscillation_per_target", 8)
-
-    dwa_records = telem.get("dwa", [])
-    if len(dwa_records) < 3:
-        return CriticResult("dwa_oscillation", True, 1.0, "Not enough data (skipped)")
-
-    turns = [r.get("turn", 0) for r in dwa_records]
-    sign_changes = 0
-    for i in range(1, len(turns)):
-        # Only count reversals where both turns are significant
-        if (turns[i] * turns[i-1] < 0
-                and abs(turns[i]) > 0.1
-                and abs(turns[i-1]) > 0.1):
-            sign_changes += 1
-
-    targets = max(1, result.stats.targets_reached)
-    per_target = sign_changes / targets
-    max_total = max_per_target * targets
-
-    passed = sign_changes <= max_total
-    return CriticResult(
-        name="dwa_oscillation",
-        passed=passed,
-        score=max(0.0, 1.0 - per_target / (max_per_target * 2)),
-        details=(f"{sign_changes} turn reversals ({per_target:.1f}/target, "
-                 f"max {max_per_target}/target)"),
-    )
-
-
-def collision_free(telem: dict, criteria: dict) -> CriticResult:
-    """Check no long sequences of DWA emergency stops.
-
-    An emergency stop is when n_feasible == 0 (DWA found no valid arcs).
-    Short single-step zeros are normal (costmap stale), but consecutive
-    zeros mean the robot is stuck.
-    """
-    max_consecutive = criteria.get("max_consecutive_estops", 2)
-
-    dwa_records = telem.get("dwa", [])
-    if not dwa_records:
-        return CriticResult("collision_free", True, 1.0, "No DWA data (skipped)")
-
-    feasible_counts = [r.get("n_feasible", 0) for r in dwa_records]
-
-    # Find longest run of n_feasible == 0
-    max_run = 0
-    current_run = 0
-    for f in feasible_counts:
-        if f == 0:
-            current_run += 1
-            max_run = max(max_run, current_run)
-        else:
-            current_run = 0
-
-    total_estops = sum(1 for f in feasible_counts if f == 0)
-    passed = max_run <= max_consecutive
-    return CriticResult(
-        name="collision_free",
-        passed=passed,
-        score=max(0.0, 1.0 - max_run / (max_consecutive * 3)),
-        details=(f"max {max_run} consecutive e-stops (limit {max_consecutive}), "
-                 f"{total_estops} total out of {len(feasible_counts)} samples"),
-    )
-
-
 def obstacle_proximity(telem: dict, criteria: dict) -> CriticResult:
     """Check robot maintained minimum clearance from obstacles.
 
     FOREMAN REFEREE — uses MuJoCo ground-truth body positions, not robot
-    sensors. The robot's control loop uses only LiDAR/costmap/DWA for
+    sensors. The robot's control loop uses only LiDAR/costmap for
     obstacle avoidance; this critic validates the outcome using the
     physics engine's omniscient view.
-
-    Measures center-to-center distance from robot base to each obstacle
-    body. Since obstacle radii are 0.2-0.3m and the robot half-width is
-    ~0.25m, a center distance below ~0.5m indicates contact.
     """
     min_clearance_threshold = criteria.get("min_obstacle_clearance", 0.5)
 
@@ -279,7 +130,6 @@ def obstacle_proximity(telem: dict, criteria: dict) -> CriticResult:
     clearances = [r["min_clearance"] for r in prox_records]
     min_seen = min(clearances)
     mean_clearance = sum(clearances) / len(clearances)
-    # Count how many samples were below threshold (potential collisions)
     violations = sum(1 for c in clearances if c < min_clearance_threshold)
 
     passed = min_seen >= min_clearance_threshold
@@ -291,86 +141,4 @@ def obstacle_proximity(telem: dict, criteria: dict) -> CriticResult:
         details=(f"min clearance {min_seen:.2f}m (threshold {min_clearance_threshold:.2f}m), "
                  f"mean {mean_clearance:.2f}m, "
                  f"{violations}/{len(clearances)} samples below threshold"),
-    )
-
-
-def wrong_way_turn(telem: dict, criteria: dict) -> CriticResult:
-    """Check robot isn't consistently turning away from the target.
-
-    Uses DWA telemetry: goal_ry (target lateral offset in robot frame)
-    and sent_wz (actual yaw rate command sent to L4, after heading-
-    proportional blend and smoothing). When target is to the left
-    (goal_ry > 0), sent_wz should be positive, and vice versa.
-
-    Uses sent_wz (not raw DWA turn) because the DWA legitimately
-    turns away from the target during obstacle avoidance — what matters
-    is the actual command after blending with heading control.
-
-    Only counts samples where both signals are significant — small
-    values near zero are noise, not wrong-way decisions.
-    """
-    max_rate = criteria.get("max_wrong_turn_rate", 0.30)
-
-    dwa_records = telem.get("dwa", [])
-    violations = 0
-    significant = 0
-    for r in dwa_records:
-        goal_ry = r.get("goal_ry", 0)
-        turn = r.get("sent_wz", r.get("turn", 0))
-        # Only count when both are significant (not noise)
-        if abs(goal_ry) > 0.3 and abs(turn) > 0.1:
-            significant += 1
-            if turn * goal_ry < 0:  # signs disagree — turning wrong way
-                violations += 1
-
-    if significant < 5:
-        return CriticResult("wrong_way_turn", True, 1.0, "Not enough data (skipped)")
-
-    violation_rate = violations / significant
-    passed = violation_rate <= max_rate
-    return CriticResult(
-        name="wrong_way_turn",
-        passed=passed,
-        score=max(0.0, 1.0 - violation_rate),
-        details=(f"{violations}/{significant} wrong-way turns "
-                 f"({violation_rate:.0%}, max {max_rate:.0%})"),
-    )
-
-
-def walking_away(telem: dict, criteria: dict) -> CriticResult:
-    """Check robot isn't walking forward when target is behind it.
-
-    Uses DWA telemetry: goal_rx (target forward offset in robot frame)
-    and forward (speed command 0-1). When goal_rx < 0 the target is
-    behind the robot. Walking forward with purpose (forward > 0.3)
-    in this state means the robot is moving away from the target.
-
-    Some walk-away is expected during obstacle detours, but sustained
-    walk-away indicates a control failure (wrong heading, bad DWA).
-    """
-    max_rate = criteria.get("max_walking_away_rate", 0.15)
-
-    dwa_records = telem.get("dwa", [])
-    violations = 0
-    significant = 0
-    for r in dwa_records:
-        goal_rx = r.get("goal_rx", 1.0)
-        forward = r.get("forward", 0)
-        # Only count purposeful forward motion
-        if forward > 0.3:
-            significant += 1
-            if goal_rx < -0.5:  # target clearly behind robot
-                violations += 1
-
-    if significant < 5:
-        return CriticResult("walking_away", True, 1.0, "Not enough data (skipped)")
-
-    violation_rate = violations / significant
-    passed = violation_rate <= max_rate
-    return CriticResult(
-        name="walking_away",
-        passed=passed,
-        score=max(0.0, 1.0 - violation_rate),
-        details=(f"{violations}/{significant} walk-away samples "
-                 f"({violation_rate:.0%}, max {max_rate:.0%})"),
     )

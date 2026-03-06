@@ -28,7 +28,7 @@ class ScenarioDefinition:
     target_seed: int
     timeout_per_target: float  # seconds per target before timeout
     full_circle: bool        # spawn targets in all directions?
-    has_obstacles: bool = True  # scene has obstacles (enables DWA + perception)
+    has_obstacles: bool = True  # scene has obstacles (enables perception + costmap)
     use_slam: bool = True      # enable SLAM odometry
     min_dist: float = 3.0
     max_dist: float = 6.0
@@ -86,13 +86,12 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
         target_seed=42,
         timeout_per_target=60.0,
         full_circle=True,
-        has_obstacles=False,  # baseline: no obstacles, no DWA
+        has_obstacles=False,  # baseline: no obstacles
         pass_criteria={
             "target_success_rate": 1.0,
             "max_falls": 0,
             "max_slam_drift_mean": 0.5,
             "max_slam_drift_final": 1.0,
-            "forward_progress_pct": 0.80,
         },
     ),
     "scattered": ScenarioDefinition(
@@ -117,12 +116,7 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             "max_falls": 3,
             "max_slam_drift_mean": 100.0,   # relaxed: dead-reckoning drifts without loop closure
             "max_slam_drift_final": 200.0,  # relaxed: tighten when L6 SLAM gets correction
-            "min_dwa_feasible_mean": 15,
-            "max_dwa_oscillation_per_target": 30,  # cluttered scenes cause legitimate reversals
-            "max_consecutive_estops": 50,  # near obstacles, DWA can have extended 0-feasible runs
             "min_obstacle_clearance": 0.45,  # center-to-center minus margin for dynamic gait sway
-            "max_wrong_turn_rate": 0.30,  # ≤30% of significant turn samples may oppose goal
-            "max_walking_away_rate": 0.15,  # ≤15% of forward-walking samples may have target behind
         },
     ),
     "corridor": ScenarioDefinition(
@@ -139,7 +133,6 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
             "target_success_rate": 0.33,  # at least 1 of 3
             "max_falls": 2,
             "max_slam_drift_mean": 0.5,
-            "min_dwa_feasible_mean": 15,
             "min_obstacle_clearance": 0.5,
         },
     ),
@@ -156,7 +149,6 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
         pass_criteria={
             "target_success_rate": 0.5,  # at least 1 of 2
             "max_falls": 0,
-            "min_dwa_feasible_mean": 15,
             "min_obstacle_clearance": 0.5,
         },
     ),
@@ -173,7 +165,6 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
         pass_criteria={
             "target_success_rate": 0.5,
             "max_falls": 0,
-            "min_dwa_feasible_mean": 10,
             "min_obstacle_clearance": 0.5,
         },
     ),
@@ -189,7 +180,6 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
         pass_criteria={
             "target_success_rate": 0.5,
             "max_falls": 1,
-            "min_dwa_feasible_mean": 10,
             "min_obstacle_clearance": 0.5,
         },
     ),

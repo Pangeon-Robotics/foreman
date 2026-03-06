@@ -22,7 +22,7 @@ def print_report(results: dict) -> None:
 
     # Header
     header = (f"{'Scenario':<15} {'Targets':>8} {'Success':>8} {'Falls':>6} "
-              f"{'ATO':>6} {'SLAM Drift':>11} {'DWA Feas':>9} {'3DS':>12} "
+              f"{'ATO':>6} {'SLAM Drift':>11} {'3DS':>12} "
               f"{'3DS-G':>6} {'Critics':>10} {'Result':>8}")
     print(header)
     print("-" * len(header))
@@ -56,13 +56,6 @@ def print_report(results: dict) -> None:
             if drifts:
                 slam_str = f"{sum(drifts)/len(drifts):.2f}m"
 
-        # DWA feasibility (from critic results)
-        dwa_str = "n/a"
-        for c in result.critic_results:
-            if c.name == "dwa_feasibility":
-                dwa_str = f"{c.score * 105:.0f}/105"
-                break
-
         # 3DS v2: adherence/completeness/phantom
         occ_str = "n/a"
         god_str = "n/a"
@@ -88,7 +81,7 @@ def print_report(results: dict) -> None:
         result_str = "PASS" if all_passed else "FAIL"
 
         print(f"{name:<15} {targets_str:>8} {success_str:>8} {falls_str:>6} "
-              f"{ato_str:>6} {slam_str:>11} {dwa_str:>9} {occ_str:>12} "
+              f"{ato_str:>6} {slam_str:>11} {occ_str:>12} "
               f"{god_str:>6} {critics_str:>10} {result_str:>8}")
 
     # Detailed failures

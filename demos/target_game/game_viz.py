@@ -138,16 +138,13 @@ def stream_debug_viewer(game) -> None:
             joints = list(st.joint_positions[:12])
         except Exception:
             pass
-        dwa = game._last_dwa_result
         game._debug_server.send_robot_state(
             slam_x, slam_y, slam_yaw, z, roll, pitch,
             joints, tx, ty,
             game._state.value,
-            dwa.forward if dwa else 0.0,
-            dwa.turn if dwa else 0.0,
-            dwa.n_feasible if dwa else 0,
+            0.0, 0.0, 0,
             0.0, 0.0,
-            game._in_tip_mode,
+            getattr(game, '_heading_in_tip', False),
         )
 
     if game._step_count % 50 == 0 and game._perception is not None:
@@ -217,7 +214,7 @@ def tick_perception(game) -> None:
 
     # Phase 0: God-view + DirectScanner raycasts (same pose for F1 scoring)
     if _phase == 0:
-        _gt_x, _gt_y, _gt_yaw, _gt_z, _, _ = game._get_robot_pose()
+        _gt_x, _gt_y, _gt_yaw, _gt_z, _gt_roll, _gt_pitch = game._get_robot_pose()
         if game._god_view_tsdf is not None:
             game._god_view_tsdf.update(_gt_x, _gt_y, _gt_yaw, _gt_z)
             game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
@@ -225,7 +222,8 @@ def tick_perception(game) -> None:
                 and getattr(game._perception, '_direct_ready', False)):
             nav_x, nav_y, nav_yaw = game._get_nav_pose()
             game._perception.direct_scan_only(
-                nav_x, nav_y, _gt_z, nav_yaw)
+                nav_x, nav_y, _gt_z, nav_yaw,
+                roll=_gt_roll, pitch=_gt_pitch)
 
     # Phase 10: Cost grid build (~65-100ms).
     # Runs every OTHER cycle (2Hz) to limit GIL blocking.
@@ -262,8 +260,15 @@ def get_occ_str(game) -> str:
             if tsdf is not None:
                 game._cached_occ = compute_3ds_v2(
                     tsdf, game._scene_xml_path)
+                # Z-filter GT for completeness: exclude surfaces
+                # below LiDAR min detection height
+                _lidar_min_z = getattr(
+                    game._perception, '_MIN_WORLD_Z', 0.05)
+                _tsdf_z_hi = getattr(
+                    game._perception._cfg, 'costmap_z_hi', 0.80)
                 game._cached_occ['god'] = compute_3ds_god(
-                    tsdf, game._scene_xml_path)
+                    tsdf, game._scene_xml_path,
+                    gt_z_range=(_lidar_min_z, _tsdf_z_hi))
                 game._occ_compute_step = game._step_count
         except Exception:
             pass

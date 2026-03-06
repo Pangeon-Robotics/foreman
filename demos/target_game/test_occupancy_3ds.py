@@ -162,10 +162,14 @@ def compute_3ds_god(tsdf, scene_xml_path: str,
     else:
         phantom_penalty = 0.0
 
-    # Composite: 50% precision + 30% completeness - 20% phantom
-    score = (0.50 * precision_score
-             + 0.30 * completeness_pct
-             - 0.20 * phantom_penalty)
+    # Composite: 40% precision + 20% completeness + 40% purity
+    # Precision: are detected surfaces in the right place?
+    # Purity: no phantom hallucinations?
+    # Completeness: coverage (exploration-limited, weighted lower)
+    purity_score = max(0.0, 100.0 - phantom_penalty)
+    score = (0.40 * precision_score
+             + 0.20 * completeness_pct
+             + 0.40 * purity_score)
     score = max(0.0, min(100.0, score))
 
     return {

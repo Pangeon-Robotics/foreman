@@ -62,9 +62,8 @@ def setup_perception(args, game, sim, odometry, obstacle_bodies, scene_path):
 def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
                                odometry, ChannelSubscriber, PointCloud_,
                                dds_domain):
-    """Set up TSDF, DWA, and direct scanner for obstacle avoidance."""
+    """Set up TSDF and direct scanner for obstacle avoidance."""
     from layer_6.config.defaults import load_config
-    from layer_6.planner.dwa import CurvatureDWAPlanner
     from .perception import PerceptionPipeline
 
     pcfg = load_config(args.robot)
@@ -76,6 +75,8 @@ def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
     if not hasattr(pcfg, 'scan_min_interval'):
         pcfg.scan_min_interval = 0.25
     pcfg.costmap_z_hi = 0.80
+    pcfg.tsdf_voxel_size = 0.01  # 1cm internal voxels for high 3DS
+    pcfg.tsdf_output_resolution = 0.05  # 5cm costmap output
     pcfg.tsdf_log_odds_hit = 3.0
     pcfg.tsdf_log_odds_max = 5.0
     pcfg.tsdf_log_odds_free = 0.25
@@ -115,11 +116,6 @@ def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
           f"output={pcfg.tsdf_output_resolution}m, "
           f"lo_hit={pcfg.tsdf_log_odds_hit}, "
           f"decay={pcfg.tsdf_decay_rate}")
-
-    game.set_dwa_planner(CurvatureDWAPlanner(pcfg))
-    print(f"Curvature DWA active: {pcfg.dwa_n_curvatures} arcs, "
-          f"max_arc={pcfg.dwa_max_arc_length}m, "
-          f"v_max={pcfg.v_max}, w_max={pcfg.w_max}")
 
     if not perception._direct_ready:
         import time as _time

@@ -324,6 +324,10 @@ Genomes are JSON files (either `{"genome": {...}}` or `{"locomotion": {...}, "st
 
 The `run_scenario.py test` command is a convenience wrapper that invokes this harness. Use 5+ seeds for reliable A/B comparison (DDS non-determinism causes ±1 target, ±2 falls between runs).
 
+### 3DS (3D Surface) Metric
+
+Measures TSDF surface accuracy against ground-truth obstacle geometry. God score formula: `0.40 × precision + 0.20 × completeness + 0.40 × purity`. Typical results: adh=7-8mm, cpl=40-71%, phn=0%, god=89-98. See `docs/lidar-tsdf-architecture.md` for full details on LiDAR configuration, TSDF parameters, and metric definitions.
+
 ## Cross-Repo Shared Utilities
 
 `foreman/demos/target_game/utils.py` is the canonical location for cross-layer utilities that multiple repos need. Currently provides: `quat_to_yaw`, `quat_to_rpy`, `normalize_angle`, `clamp`, `frame_transform`, `load_module_by_path`, `patch_layer_configs`.

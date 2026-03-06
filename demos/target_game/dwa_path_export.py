@@ -1,7 +1,7 @@
 """Robot-view A* path export for headed viewer rendering.
 
-Standalone functions extracted from DWANavigatorMixin for path validation,
-waypoint extraction, and path export to temp files.
+Functions for path validation, waypoint extraction, and path export
+to temp files (green dots in MuJoCo viewer).
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ PATH_HOLD_TICKS = 500
 
 # Minimum ticks before first path export (wait for TSDF data).
 # At 100Hz control, 100 ticks = 1 second.
-PATH_WARMUP_TICKS = 100
+PATH_WARMUP_TICKS = 50
 
 # Diagnostic threshold: cells with cost >= this are counted as "obs".
 VIZ_OBS_THRESHOLD = 177
@@ -41,8 +41,11 @@ def validate_committed_path(committed_path, committed_path_step, step_count,
     if (end[0] - target_x)**2 + (end[1] - target_y)**2 > 4.0:
         return None
 
-    # Time-based hold expired -- replan with fresh cost data
-    if step_count - committed_path_step >= PATH_HOLD_TICKS:
+    # Time-based hold expired -- replan with fresh cost data.
+    # Short hold (1s) for the first few seconds while TSDF is building,
+    # then full hold (5s) once obstacle data is established.
+    hold = PATH_HOLD_TICKS if step_count > 500 else 100
+    if step_count - committed_path_step >= hold:
         return None
 
     # Trim: drop points the robot has already passed

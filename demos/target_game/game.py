@@ -3,9 +3,6 @@
 Core TargetGame class with state machine, SLAM integration, and pose
 helpers. Navigation and scoring are provided by composed helpers:
   - Navigator (heading-based and wheeled) in navigator_helper.py
-  - DWANavigator (DWA planning) in dwa_navigator.py
-  - DWAController (DWA gait conversion) in dwa_controller.py
-  - StuckRecovery (stuck detection/recovery) in stuck_recovery.py
   - GameScoring (lifecycle, scoring, analysis) in game_scoring.py
 
 Configuration constants live in game_config.py; all names are re-exported
@@ -28,9 +25,6 @@ from .game_config import (
     configure_for_robot,
 )
 from .navigator_helper import Navigator
-from .dwa_navigator import DWANavigator
-from .dwa_controller import DWAController
-from .stuck_recovery import StuckRecovery
 from .game_scoring import GameScoring
 from .game_viz import (
     stream_debug_viewer, write_god_view_path,
@@ -87,27 +81,11 @@ class TargetGame:
         self._PoseMsg = None
         self._pose_stamp = None
         self._perception = None
-        self._dwa_planner = None
-        self._last_dwa_result = None
         self._telemetry = None
         self._path_critic = None
-        self._avoidance_sign = 0
-        self._avoidance_since = 0.0
-        self._avoidance_dist = 0.0
-        self._goal_bearing = 0.0
-        self._smooth_dwa_turn = 0.0
-        self._smooth_dwa_fwd = 1.0
-        self._dist_ring = []
-        self._recent_regression = 0.0
         self._fall_tick_count = 0
         self._post_fall_settle = 0
-        self._stabilize_countdown = 0
-        self._smooth_heading_mod = 1.0
-        self._smooth_wz = 0.0
-        self._decel_tick_count = 0
-        self._last_threat_time = 0.0
         self._min_target_dist = float('inf')
-        self._slam_drift_latched = False
         self._kp = KP_START
         self._kd = KD_START
         self._spawner = TargetSpawner(
@@ -129,18 +107,9 @@ class TargetGame:
         self._cached_occ: dict | None = None
         self._occ_compute_step: int = -999
         self._step_and_shift = None
-        self._in_tip_mode = False
-        self._tip_start_step = 0
-        self._tip_start_heading = 0.0
-        self._tip_cooldown_until = 0
-        self._current_waypoint = None
-        self._wp_commit_until = 0
+        self._current_waypoint = None  # DEPRECATED — navigation uses _committed_path
         self._committed_path = None
         self._committed_path_step = 0
-        self._progress_window_dist = float('inf')
-        self._progress_window_step = 0
-        self._closest_approach = float('inf')
-        self._reg_start_step = 0
         self._rp_log = []
         self._cached_pose: (
             tuple[float, float, float, float, float, float] | None
@@ -149,10 +118,9 @@ class TargetGame:
 
         # --- Composed helpers ---
         self.nav = Navigator(self)
-        self.dwa_nav = DWANavigator(self)
-        self.dwa_ctrl = DWAController(self)
-        self.stuck = StuckRecovery(self)
         self.scoring = GameScoring(self)
+
+    _PATH_VIZ_FILE = "/tmp/dwa_best_arc.bin"
 
     # --- Pose helpers ---
 
@@ -213,11 +181,6 @@ class TargetGame:
 
     # --- Setters ---
 
-    def set_dwa_planner(self, planner) -> None:
-        self._dwa_planner = planner
-
-    _PATH_VIZ_FILE = "/tmp/dwa_best_arc.bin"
-
     def set_path_critic(self, critic) -> None:
         self._path_critic = critic
 
@@ -254,10 +217,12 @@ class TargetGame:
         return _gt_clearance_fn(self)
 
     def _get_nav_pose(self) -> tuple[float, float, float]:
-        """Return (x, y, yaw) for navigation -- SLAM when available."""
-        if self._odometry is not None:
-            p = self._odometry.pose
-            return p.x, p.y, p.yaw
+        """Return (x, y, yaw) for navigation -- ground truth.
+
+        SLAM odometry drifts too much for heading-proportional control
+        (6m+ position drift, 40°+ yaw noise).  SLAM is still used for
+        perception (TSDF scan integration) via _update_slam().
+        """
         x, y, yaw, _, _, _ = self._get_robot_pose()
         return x, y, yaw
 
@@ -361,9 +326,6 @@ class TargetGame:
         elif self._state == GameState.WALK_TO_TARGET:
             if WHEELED:
                 self.nav.tick_walk_wheeled()
-            elif (self._dwa_planner is not None
-                    and self._perception is not None):
-                self.dwa_nav.tick_walk_dwa()
             else:
                 self.nav.tick_walk_heading()
 

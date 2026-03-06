@@ -1,7 +1,7 @@
 """Perception pipeline for the target game.
 
 Subscribes to LiDAR point cloud, builds TSDF/costmap, and exposes
-the latest costmap for the DWA planner. Runs the heavy work (EDT)
+the latest costmap for A* path planning. Runs the heavy work (EDT)
 on point cloud arrival (~10Hz), not at control rate (100Hz).
 """
 from __future__ import annotations
@@ -13,8 +13,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Re-export for backward compatibility (dwa_control.py imports from here)
-from .reactive_scan import ReactiveScanResult, reactive_scan  # noqa: F401
 
 
 class LiveCostmapQuery:
@@ -119,7 +117,7 @@ class PerceptionPipeline:
         self._build_times: list[float] = []
 
         # Safety valve: consecutive feas=0 counter.
-        self._feas_zero_count = 0
+
         self._force_feasible = False
 
         # Scan throttle
@@ -163,16 +161,18 @@ class PerceptionPipeline:
         init_direct_scanner(self, scene_xml_path, robot, mj_model, mj_data)
 
     def direct_scan(self, x: float, y: float, z: float,
-                    yaw: float) -> int:
+                    yaw: float, roll: float = 0.0,
+                    pitch: float = 0.0) -> int:
         """Cast rays and integrate into TSDF. Returns number of valid hits."""
         from .direct_scanner import direct_scan
-        return direct_scan(self, x, y, z, yaw)
+        return direct_scan(self, x, y, z, yaw, roll, pitch)
 
     def direct_scan_only(self, x: float, y: float, z: float,
-                         yaw: float) -> int:
+                         yaw: float, roll: float = 0.0,
+                         pitch: float = 0.0) -> int:
         """Raycast + TSDF integration only, NO cost grid build."""
         from .direct_scanner import direct_scan_only
-        return direct_scan_only(self, x, y, z, yaw)
+        return direct_scan_only(self, x, y, z, yaw, roll, pitch)
 
     def build_cost_grids_from_main(self) -> None:
         """Build cost grids from TSDF. Call from game tick on a staggered phase."""
@@ -305,17 +305,6 @@ class PerceptionPipeline:
             print(f"  [perc] build#{n} {elapsed_ms:.0f}ms "
                   f"(cg={cg_ms:.0f} astar={astar_ms:.0f}) "
                   f"chunks={self._tsdf.n_chunks}")
-
-    def report_dwa_feas(self, n_feasible: int) -> None:
-        """Report DWA feasibility count (called at 20Hz replan rate)."""
-        if n_feasible == 0:
-            self._feas_zero_count += 1
-            if self._feas_zero_count >= 15:
-                from .costmap_builder import clear_local_tsdf
-                clear_local_tsdf(self)
-                self._feas_zero_count = 0
-        else:
-            self._feas_zero_count = 0
 
     @property
     def costmap_query(self):

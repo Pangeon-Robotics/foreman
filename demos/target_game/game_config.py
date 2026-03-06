@@ -39,33 +39,8 @@ TURN_STEP_HEIGHT = 0.08
 TURN_DUTY_CYCLE = 0.55
 TURN_STANCE_WIDTH = 0.12
 TURN_WZ = 2.0
-THETA_THRESHOLD = 0.6
-TIP_STEP_LENGTH = 0.10   # m — stride for differential TIP (minimal forward drift)
+THETA_THRESHOLD = 1.0
 _TIP_WZ_SCALE = 1.0      # 1:1 — TURN_WZ is the actual TIP yaw rate (matches tip_demo.py)
-
-# --- Gait parameter smoothing (context-dependent EMA) ---
-# Near obstacles: slow decel preserves smooth avoidance curves
-_EMA_ALPHA_DOWN_OBSTACLE = 0.04   # tau ~0.25s — faster decel near obstacles, tracks DWA better
-_EMA_ALPHA_UP_OBSTACLE = 0.12     # tau ~0.08s — faster recovery after clearing obstacle
-# Open field: faster tracking prevents orbit, still smooth enough to prevent falls
-_EMA_ALPHA_DOWN_OPEN = 0.08       # tau ~0.13s — 13 ticks decel, tracks DWA better
-_EMA_ALPHA_UP_OPEN = 0.15         # tau ~0.07s — fast turn→walk recovery
-# Wz smoothing
-_EMA_ALPHA_WZ_OBSTACLE = 0.10     # tau ~0.1s
-_EMA_ALPHA_WZ_OPEN = 0.15         # tau ~0.07s
-# DWA turn smoothing: suppress frame-to-frame oscillation
-_DWA_TURN_ALPHA = 0.20            # tau ~0.25s at 20Hz replan — crisper waypoint following
-# Minimum decel before walk→turn mode switch
-_MIN_DECEL_TICKS = 15             # 0.15s at 100 Hz
-
-# --- DWA control flow tuning (tunable via extended genome) ---
-DWA_FWD_DECEL_ALPHA = 0.15     # forward speed deceleration EMA
-DWA_FWD_ACCEL_ALPHA = 0.15     # forward speed acceleration EMA — conservative ramp
-DWA_HEADING_MOD_ALPHA = 0.20   # heading_mod EMA smoothing
-DWA_WZ_SMOOTH_ALPHA = 0.25     # wz EMA smoothing in DWA mode
-TIP_EXIT_FWD_BOOST = 0.50      # post-TIP _smooth_dwa_fwd jumpstart (50% — gentler)
-TURN_STEP_FLOOR = 0.50         # min heading_mod at >30deg heading error (open field)
-CLOSE_RANGE_WZ_ALPHA = 0.15    # wz smoothing in close-range approach
 
 # --- Wheeled robot parameters (set by configure_for_robot) ---
 
@@ -89,7 +64,7 @@ ROBOT_DEFAULTS = {
         "KP_YAW": 2.0, "WZ_LIMIT": 1.5,
         "TURN_FREQ": 3.0, "TURN_STEP_HEIGHT": 0.08,
         "TURN_DUTY_CYCLE": 0.55, "TURN_STANCE_WIDTH": 0.12,
-        "TURN_WZ": 2.0, "THETA_THRESHOLD": 0.6,
+        "TURN_WZ": 2.0, "THETA_THRESHOLD": 1.0,
     },
     "go2": {
         "NOMINAL_BODY_HEIGHT": 0.27,       # MJCF keyframe z (actual sim standing height)
@@ -149,6 +124,35 @@ ROBOT_DEFAULTS = {
         "WHEEL_MAX_TURN": 12.0,           # Nm max differential
     },
 }
+
+
+# --- Dynamic stability (gait-engineer — DO NOT REMOVE) ---
+STABILITY_ENABLED = True
+BODY_HEIGHT_DROP = 0.04       # m — lower CoM at speed
+STANCE_WIDTH_SPEED = 0.04     # m — wider stance at speed
+STEP_HEIGHT_FAST = 0.07       # m — lower step at speed (less pitch)
+TURN_LEAN_WIDTH = 0.05        # m — extra stance width during turns
+
+
+def apply_stability(heading_mod: float, wz: float) -> tuple:
+    """Dynamic body_height, stance_width, step_height, adjusted_wz for stability.
+
+    Called by navigator_helper.py. DO NOT REMOVE.
+    """
+    if not STABILITY_ENABLED:
+        return BODY_HEIGHT, STANCE_WIDTH, STEP_HEIGHT, wz
+    speed_frac = min(1.0, abs(heading_mod))
+    bh = BODY_HEIGHT - speed_frac * BODY_HEIGHT_DROP
+    sw = STANCE_WIDTH + speed_frac * STANCE_WIDTH_SPEED
+    turn_frac = min(1.0, abs(wz) / max(WZ_LIMIT, 0.1))
+    sw += turn_frac * TURN_LEAN_WIDTH
+    sh = STEP_HEIGHT - speed_frac * (STEP_HEIGHT - STEP_HEIGHT_FAST)
+    # Dampen wz proportional to forward speed to prevent heading overshoot.
+    # L4 differential stride: right_scale = 1+wz*0.5, left_scale = 1-wz*0.5
+    # At wz=0.8: ratio 1.4/0.6 = 2.3:1 (stable). At wz=1.5: 1.75/0.25 = 7:1 (overshoot).
+    wz_cap = 1.5 - speed_frac * 0.7  # 1.5 at rest, 0.8 at full speed
+    adj_wz = max(-wz_cap, min(wz_cap, wz))
+    return bh, sw, sh, adj_wz
 
 
 STARTUP_SETTLE_STEPS = 50  # 0.5s at 100 Hz — let robot settle before first gait command

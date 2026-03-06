@@ -1,15 +1,19 @@
 """Heading-based and wheeled navigation for target game.
 
 Provides Navigator with tick_walk_heading() and tick_walk_wheeled() methods.
-These implement the non-DWA navigation paths: heading-proportional control
-for legged robots and differential wheel drive.
+Heading-proportional control for legged robots and differential wheel drive.
+
+When a costmap is available, tick_walk_heading() follows the committed A*
+path (green dots) for obstacle avoidance. Without a costmap, it steers
+directly at the target.
 """
 from __future__ import annotations
 
 import math
 
 from . import game_config as C
-from .utils import clamp as _clamp
+from .dwa_path_export import export_path, waypoint_from_path
+from .utils import clamp as _clamp, normalize_angle as _normalize_angle
 
 
 class Navigator:
@@ -18,15 +22,41 @@ class Navigator:
     def __init__(self, game):
         self.game = game
 
+    # ------------------------------------------------------------------
+    # Waypoint from committed path (green dots = navigation path)
+    # ------------------------------------------------------------------
+
+    def _waypoint_heading(self, nav_x, nav_y, nav_yaw, target, dist):
+        """Return heading error — toward next waypoint on committed path.
+
+        The committed path (green dots) is the single A* path used for
+        both visualization and navigation. We extract a waypoint 2m
+        ahead along that path. Falls back to target heading when no
+        path is available or when close to the target.
+        """
+        g = self.game
+        if dist > 1.5 and g._committed_path is not None and len(g._committed_path) >= 2:
+            wp = waypoint_from_path(g._committed_path, nav_x, nav_y,
+                                    lookahead=2.0)
+            if wp is not None:
+                wp_dx = wp[0] - nav_x
+                wp_dy = wp[1] - nav_y
+                wp_err = _normalize_angle(
+                    math.atan2(wp_dy, wp_dx) - nav_yaw)
+                # Sanity: if waypoint is behind us, steer at target instead
+                if abs(wp_err) < math.pi / 2:
+                    return wp_err
+        return target.heading_error(nav_x, nav_y, nav_yaw)
+
+    # ------------------------------------------------------------------
+    # Main tick
+    # ------------------------------------------------------------------
+
     def tick_walk_heading(self):
         """Walk toward target using L4 GaitParams directly.
 
-        Matches GA training episode logic (episode.py:1771-1811):
-        - Large heading error -> turn in place (L4 arc mode)
-        - Small heading error -> walk with differential stride
-
-        When SLAM odometry is active, heading/distance use the estimated
-        pose. Fall detection still uses ground truth (z-height).
+        Steers toward A* waypoints when a costmap is available,
+        otherwise heads directly at the target.
         """
         g = self.game
         x_truth, y_truth, yaw_truth, z, roll, pitch = g._get_robot_pose()
@@ -39,21 +69,47 @@ class Navigator:
 
         # Navigation uses SLAM pose when available
         nav_x, nav_y, nav_yaw = g._get_nav_pose()
-        heading_err = target.heading_error(nav_x, nav_y, nav_yaw)
         dist = target.distance_to(nav_x, nav_y)
+
+        # A* path planning — single path for both green dots and navigation.
+        # export_path() manages its own replan cooldown (PATH_HOLD_TICKS)
+        # and writes the committed path to the temp file (green dots).
+        if g._path_critic is not None and g._target_step_count % 10 == 0:
+            export_path(g, target.x, target.y)
+        heading_err = self._waypoint_heading(
+            nav_x, nav_y, nav_yaw, target, dist)
+
+        # TIP threshold with hysteresis.
+        # B2 differential stride produces limited yaw rate — TIP handles
+        # large heading corrections. Narrow hysteresis band (0.7× exit)
+        # reduces overshoot by exiting TIP sooner.
+        tip_enter = C.THETA_THRESHOLD
+        tip_exit = C.THETA_THRESHOLD * 0.7
+        in_tip = getattr(g, '_heading_in_tip', False)
+        should_tip = (abs(heading_err) > tip_enter
+                      or (in_tip and abs(heading_err) > tip_exit))
 
         # Path critic: record position at 10Hz (skip TIP -- stationary phase)
         if (g._path_critic is not None
                 and g._target_step_count % 10 == 0
-                and abs(heading_err) <= C.THETA_THRESHOLD):
-            v_cmd = C.STEP_LENGTH * max(0.0, math.cos(heading_err)) * C.GAIT_FREQ
+                and not should_tip):
+            v_cmd = C.STEP_LENGTH * max(0.15, math.cos(heading_err)) * C.GAIT_FREQ
             g._path_critic.record(
                 nav_x, nav_y, t=g._target_step_count * C.CONTROL_DT,
                 v_cmd=v_cmd)
 
-        if abs(heading_err) > C.THETA_THRESHOLD:
-            # TURN IN PLACE -- arc-based rotation with diagonal stepping
-            wz = (C.TURN_WZ if heading_err > 0 else -C.TURN_WZ) * C._TIP_WZ_SCALE
+        # Smooth wz to prevent heading oscillation from gait-induced yaw wobble.
+        # Without smoothing, each stride cycle produces a yaw perturbation that
+        # reverses the wz command, causing limit-cycle oscillation.
+        _prev_wz = getattr(g, '_smooth_wz', 0.0)
+
+        if should_tip:
+            # TURN IN PLACE with proportional wz (40-100% based on error)
+            g._heading_in_tip = True
+            err_frac = min(1.0, abs(heading_err) / tip_enter)
+            tip_wz = C.TURN_WZ * (0.4 + 0.6 * err_frac)
+            wz = math.copysign(tip_wz, heading_err) * C._TIP_WZ_SCALE
+            g._smooth_wz = 0.0  # reset walk wz when entering TIP
             params = g._L4GaitParams(
                 gait_type='trot', wz=wz, step_length=0.0,
                 gait_freq=C.TURN_FREQ, step_height=C.TURN_STEP_HEIGHT,
@@ -62,23 +118,32 @@ class Navigator:
                 turn_in_place=True,
             )
         else:
-            # WALK -- L4 differential stride (layer_4/generator.py:134-164)
+            # WALK with differential stride turning
+            g._heading_in_tip = False
             g._reset_tip()
-            # Decel taper in last 30% before threshold so WALK->TURN
-            # transition doesn't pitch the robot forward from momentum.
-            taper_start = 0.7 * C.THETA_THRESHOLD
-            if abs(heading_err) > taper_start:
-                decel = (C.THETA_THRESHOLD - abs(heading_err)) / (C.THETA_THRESHOLD - taper_start)
-                decel = max(0.0, decel)
+            heading_mod = max(0.15, math.cos(heading_err))
+            kp_yaw = C.KP_YAW
+            wz_lim = C.WZ_LIMIT
+            wz = _clamp(kp_yaw * heading_err, -wz_lim, wz_lim)
+            # EMA smooth wz to dampen gait-induced yaw oscillation
+            wz = 0.3 * wz + 0.7 * _prev_wz
+            g._smooth_wz = wz
+            # Use apply_stability if available, else pass through
+            if hasattr(C, 'apply_stability'):
+                bh, sw, sh, adj_wz = C.apply_stability(heading_mod, wz)
             else:
-                decel = 1.0
-            heading_mod = decel * max(0.0, math.cos(heading_err))
-            wz = _clamp(C.KP_YAW * heading_err, -C.WZ_LIMIT, C.WZ_LIMIT)
+                bh, sw, sh, adj_wz = C.BODY_HEIGHT, C.STANCE_WIDTH, C.STEP_HEIGHT, wz
+            # Clearance-based speed limiting: slow down near obstacles.
+            # Without DWA, this is the only local obstacle avoidance.
+            clr = g._gt_clearance()
+            if clr < 1.0:
+                clr_brake = max(0.15, clr / 1.0)
+                heading_mod *= clr_brake
             params = g._L4GaitParams(
                 gait_type='trot', step_length=C.STEP_LENGTH * heading_mod,
-                gait_freq=C.GAIT_FREQ, step_height=C.STEP_HEIGHT,
-                duty_cycle=C.DUTY_CYCLE, stance_width=C.STANCE_WIDTH, wz=wz,
-                body_height=C.BODY_HEIGHT,
+                gait_freq=C.GAIT_FREQ, step_height=sh,
+                duty_cycle=C.DUTY_CYCLE, stance_width=sw, wz=adj_wz,
+                body_height=bh,
             )
 
         g._send_l4(params)
@@ -86,7 +151,7 @@ class Navigator:
         # Log pitch/roll every step for diagnostics
         r_deg = math.degrees(roll)
         p_deg = math.degrees(pitch)
-        mode = "T" if abs(heading_err) > C.THETA_THRESHOLD else "W"
+        mode = "T" if should_tip else "W"
         if len(g._rp_log) > 0:
             prev = g._rp_log[-1]
             droll = (r_deg - prev[1]) / C.CONTROL_DT
@@ -97,23 +162,39 @@ class Navigator:
 
         if g._target_step_count % C.TELEMETRY_INTERVAL == 0:
             t = g._target_step_count * C.CONTROL_DT
-            is_tip = abs(heading_err) > C.THETA_THRESHOLD
-            mode_str = "TIP" if is_tip else "WALK"
-            if is_tip:
-                sent_wz = C.TURN_WZ if heading_err > 0 else -C.TURN_WZ
+            mode_str = "TIP" if should_tip else "WALK"
+            if should_tip:
+                sent_wz = wz
                 sent_step = 0.0
             else:
                 sent_wz = wz
-                sent_step = C.STEP_LENGTH * heading_mod
+                sent_step = C.STEP_LENGTH * max(0.15, math.cos(heading_err))
             clr = g._gt_clearance()
             clr_s = f" clr={clr:.1f}" if clr < 50 else ""
             occ = g._get_occ_str()
+            # Velocity diagnostic
+            _prev = getattr(g, '_nav_prev_pos', None)
+            if _prev is not None:
+                _dx = x_truth - _prev[0]
+                _dy = y_truth - _prev[1]
+                _v = math.sqrt(_dx*_dx + _dy*_dy) / (C.TELEMETRY_INTERVAL * C.CONTROL_DT)
+            else:
+                _v = 0.0
+            g._nav_prev_pos = (x_truth, y_truth)
+            wp_s = ""
+            if g._committed_path is not None and len(g._committed_path) >= 2:
+                _wp = waypoint_from_path(g._committed_path, nav_x, nav_y,
+                                         lookahead=2.0)
+                if _wp is not None:
+                    wp_d = math.hypot(_wp[0] - nav_x, _wp[1] - nav_y)
+                    wp_s = f" wp({wp_d:.1f}m)"
             print(
                 f"[{g._target_index}/{g._num_targets}] "
                 f"{mode_str:<5} t={t:.1f} d={dist:.1f} "
                 f"err={math.degrees(heading_err):+.0f}\u00b0 "
+                f"v={_v:.2f} step={sent_step:.2f} "
                 f"({x_truth:.1f},{y_truth:.1f})"
-                f"{clr_s}{occ}")
+                f"{clr_s}{wp_s}{occ}")
 
         if dist < g._reach_threshold:
             g.scoring.on_reached()

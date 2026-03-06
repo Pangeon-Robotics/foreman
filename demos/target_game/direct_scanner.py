@@ -74,10 +74,10 @@ def init_direct_scanner(pipeline, scene_xml_path: str,
     pipeline._direct_exclude_geoms = (
         pipeline._direct_robot_geoms | pipeline._direct_target_geoms)
 
-    # Pre-compute ray directions (matching lidar.py defaults)
-    h_angles = np.deg2rad(np.arange(0.0, 360.0, 0.18))
-    v_angles_deg = [-15, -13, -11, -9, -7, -5, -3, -1,
-                    1, 3, 5, 7, 9, 11, 13, 15]
+    # Pre-compute ray directions: 128 vertical channels at ±30° for
+    # high completeness in 3DS metrics.  Horizontal: 0.36° step (1000 rays).
+    h_angles = np.deg2rad(np.arange(0.0, 360.0, 0.72))
+    v_angles_deg = np.linspace(-30.0, 30.0, 128).tolist()
     dirs = []
     for v_deg in v_angles_deg:
         v_rad = np.deg2rad(v_deg)
@@ -110,7 +110,8 @@ def init_direct_scanner(pipeline, scene_xml_path: str,
     pipeline._direct_scan_count = 0
 
 
-def _cast_rays(pipeline, x: float, y: float, z: float, yaw: float):
+def _cast_rays(pipeline, x: float, y: float, z: float, yaw: float,
+               roll: float = 0.0, pitch: float = 0.0):
     """Cast rays and return (hits, sx, sy) or None if no valid hits."""
     import mujoco
 
@@ -124,10 +125,14 @@ def _cast_rays(pipeline, x: float, y: float, z: float, yaw: float):
     sz = z + off[2]
     sensor_pos = np.array([sx, sy, sz], dtype=np.float64)
 
-    R_yaw = np.array([
-        [c, -s, 0], [s, c, 0], [0, 0, 1],
-    ], dtype=np.float64)
-    rays_world = (R_yaw @ pipeline._direct_ray_dirs.T).T
+    # Full rotation: R(yaw) * R(pitch) * R(roll) for IMU-corrected rays
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    R_roll = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float64)
+    R_pitch = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float64)
+    R_yaw = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+    R = R_yaw @ R_pitch @ R_roll
+    rays_world = (R @ pipeline._direct_ray_dirs.T).T
     rays_flat = np.ascontiguousarray(rays_world.flatten())
 
     mujoco.mj_multiRay(
@@ -169,12 +174,12 @@ def _cast_rays(pipeline, x: float, y: float, z: float, yaw: float):
 
 
 def direct_scan(pipeline, x: float, y: float, z: float,
-                yaw: float) -> int:
+                yaw: float, roll: float = 0.0, pitch: float = 0.0) -> int:
     """Cast rays and integrate into TSDF. Call from game tick.
 
     Returns number of valid hits integrated.
     """
-    result = _cast_rays(pipeline, x, y, z, yaw)
+    result = _cast_rays(pipeline, x, y, z, yaw, roll, pitch)
     if result is None:
         return 0
 
@@ -200,13 +205,14 @@ def direct_scan(pipeline, x: float, y: float, z: float,
 
 
 def direct_scan_only(pipeline, x: float, y: float, z: float,
-                     yaw: float) -> int:
+                     yaw: float, roll: float = 0.0,
+                     pitch: float = 0.0) -> int:
     """Raycast + TSDF integration only, NO cost grid build.
 
     Cost grid build is deferred to build_cost_grids_from_main()
     on a later tick to avoid blocking the control loop for 200+ms.
     """
-    result = _cast_rays(pipeline, x, y, z, yaw)
+    result = _cast_rays(pipeline, x, y, z, yaw, roll, pitch)
     if result is None:
         return 0
 

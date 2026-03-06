@@ -101,43 +101,10 @@ class GameScoring:
         g._target_step_count = 0
         g._reach_threshold = g._reach_threshold_base
         g._min_target_dist = float('inf')
-        g._slam_drift_latched = False
-        g._in_tip_mode = False
-        g._tip_start_step = 0
-        g._tip_start_heading = 0.0
-        g._tip_cooldown_until = 0
-        g._tip_cooldown = 0
         g._reset_tip()
-        g._smooth_heading_mod = 0.65
-        g._smooth_wz = 0.0
-        g._decel_tick_count = 0
-        g._smooth_dwa_turn = 0.0
-        g._smooth_dwa_fwd = 1.0
-        g._avoidance_sign = 0
-        g._avoidance_dist = 0.0
-        g._last_threat_level = 0.0
         g._current_waypoint = None
-        g._wp_commit_until = 0
-        g._last_replan_pos = None
-        g._last_replan_step = -999
-        g._use_waypoint_latch = False
-        # Reset stuck recovery helper state
-        g.stuck.reset()
-        g._orbit_heading_ticks = 0
-        g._orbit_dist_ticks = 0
-        g._orbit_dist_active = False
-        g._orbit_slow_ticks = 0
-        g._tip_ticks = 0
-        g._prev_heading_err = 0.0
         g._committed_path = None
         g._committed_path_step = 0
-        g._last_good_heading_step = -999
-        g._progress_window_dist = float('inf')
-        g._progress_window_step = 0
-        g._dist_ring = []
-        g._recent_regression = 0.0
-        g._closest_approach = float('inf')
-        g._reg_start_step = 0
         g._stats.targets_spawned += 1
 
         target_z = min(C.NOMINAL_BODY_HEIGHT, 0.30)
