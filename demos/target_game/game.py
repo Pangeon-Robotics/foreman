@@ -8,6 +8,10 @@ helpers. Navigation and scoring are provided by composed helpers:
 Configuration constants live in game_config.py; all names are re-exported
 here for backward compatibility. Robot-view code must NEVER access god-view
 data (GodViewTSDF, god_view_costmap, scene XML geometry).
+
+Layer compliance: legged robots send MotionCommands through Layer 5's
+send_motion_command(). Layer 5 handles gait selection, gain scheduling,
+and Layer 4 dispatch. Wheeled robots bypass L5 (documented violation).
 """
 from __future__ import annotations
 
@@ -15,13 +19,12 @@ import math
 from typing import TYPE_CHECKING
 
 from .game_config import (
-    BODY_HEIGHT, CONTROL_DT, FALL_CONFIRM_TICKS, FALL_THRESHOLD,
+    CONTROL_DT, FALL_CONFIRM_TICKS, FALL_THRESHOLD,
     GameState, GameStatistics,
-    GAIT_FREQ, KP_FULL, KP_START, KD_FULL, KD_START,
     NOMINAL_BODY_HEIGHT, REACH_DISTANCE, ROBOT_DEFAULTS,
-    STARTUP_RAMP_SECONDS, STARTUP_SETTLE_STEPS,
-    TARGET_TIMEOUT_STEPS, TELEMETRY_INTERVAL, TURN_FREQ,
-    WHEEL_HOME_Q, WHEELED,
+    STARTUP_SETTLE_STEPS,
+    TARGET_TIMEOUT_STEPS, TELEMETRY_INTERVAL,
+    WHEELED,
     configure_for_robot,
 )
 from .navigator_helper import Navigator
@@ -45,15 +48,14 @@ class TargetGame:
     """Random target navigation game.
 
     Runs a state machine that spawns targets and drives the robot toward
-    them using L4 GaitParams directly (same path as GA training).
+    them. Legged robots use Layer 5 MotionCommands (L5 handles gait
+    selection, gains, L4 dispatch). Wheeled robots bypass L5.
     """
 
     def __init__(
         self,
         sim,
-        L4GaitParams=None,
-        make_low_cmd=None,
-        stamp_cmd=None,
+        robot: str = 'b2',
         num_targets: int = 5,
         min_dist: float = 3.0,
         max_dist: float = 6.0,
@@ -62,12 +64,10 @@ class TargetGame:
         seed: int | None = None,
         angle_range: tuple[float, float] | list[tuple[float, float]] = (
             -math.pi / 2, math.pi / 2),
-        odometry: Odometry | None = None,
+        odometry: 'Odometry | None' = None,
     ):
         self._sim = sim
-        self._L4GaitParams = L4GaitParams
-        self._make_low_cmd = make_low_cmd
-        self._stamp_cmd = stamp_cmd
+        self._robot = robot
         self._num_targets = num_targets
         self._reach_threshold_base = reach_threshold
         self._reach_threshold = reach_threshold
@@ -86,8 +86,6 @@ class TargetGame:
         self._fall_tick_count = 0
         self._post_fall_settle = 0
         self._min_target_dist = float('inf')
-        self._kp = KP_START
-        self._kd = KD_START
         self._spawner = TargetSpawner(
             min_distance=min_dist, max_distance=max_dist,
             reach_threshold=reach_threshold, seed=seed)
@@ -97,7 +95,6 @@ class TargetGame:
         self._target_index = 0
         self._step_count = 0
         self._target_step_count = 0
-        self._home_q = WHEEL_HOME_Q if WHEELED else None
         self._debug_server = None
         self._god_view_costmap: tuple | None = None
         self._god_view_path_file: str | None = None
@@ -106,15 +103,18 @@ class TargetGame:
         self._scene_xml_path: str | None = None
         self._cached_occ: dict | None = None
         self._occ_compute_step: int = -999
-        self._step_and_shift = None
         self._current_waypoint = None  # DEPRECATED — navigation uses _committed_path
         self._committed_path = None
         self._committed_path_step = 0
+        self._costmap_changed = False
         self._rp_log = []
         self._cached_pose: (
             tuple[float, float, float, float, float, float] | None
         ) = None
         self._glitch_ticks = 0
+
+        # L5 MotionCommand class — resolved lazily to avoid config collision
+        self._MotionCommand = None
 
         # --- Composed helpers ---
         self.nav = Navigator(self)
@@ -122,16 +122,45 @@ class TargetGame:
 
     _PATH_VIZ_FILE = "/tmp/dwa_best_arc.bin"
 
+    # --- L5 MotionCommand ---
+
+    def _get_motion_command_class(self):
+        """Lazily resolve L5's MotionCommand class."""
+        if self._MotionCommand is None:
+            from config.defaults import MotionCommand
+            self._MotionCommand = MotionCommand
+        return self._MotionCommand
+
+    def _send_motion(self, vx: float = 0.0, wz: float = 0.0,
+                     behavior: str = 'walk') -> None:
+        """Send a MotionCommand through Layer 5."""
+        MC = self._get_motion_command_class()
+        cmd = MC(vx=vx, wz=wz, behavior=behavior, robot=self._robot)
+        try:
+            self._sim.send_motion_command(cmd, dt=CONTROL_DT,
+                                            terrain=False)
+        except RuntimeError:
+            rc = None
+            try:
+                fw = self._sim._firmware
+                if fw is not None and fw._proc is not None:
+                    rc = fw._proc.poll()
+            except Exception:
+                pass
+            print(f"Simulation stopped unexpectedly (firmware exit={rc})")
+            self._state = GameState.DONE
+
     # --- Pose helpers ---
 
     def _get_robot_pose(self):
         """Return (x, y, yaw, z, roll, pitch) from ground truth.
 
         Includes glitch rejection: jumps > 2m are rejected for up to
-        0.5s (50 ticks at 100Hz).  If the new position persists beyond
+        0.5s (25 ticks at 50Hz).  If the new position persists beyond
         the grace period, it's accepted as real (fall recovery, collision).
         """
         body = self._sim.get_body("base")
+        self._cached_body = body  # cache for _update_slam
         x = float(body.pos[0])
         y = float(body.pos[1])
         z = float(body.pos[2])
@@ -142,7 +171,7 @@ class TargetGame:
             dx = x - self._cached_pose[0]
             dy = y - self._cached_pose[1]
             if math.sqrt(dx * dx + dy * dy) > 2.0:
-                if self._glitch_ticks < 50:
+                if self._glitch_ticks < 50:  # 0.5s at 100Hz
                     self._glitch_ticks += 1
                     return self._cached_pose
                 # Grace period expired — accept new position
@@ -157,7 +186,7 @@ class TargetGame:
         from types import SimpleNamespace
         l5_state = self._sim.get_state()
         imu_quat = l5_state.imu_quaternion
-        body = self._sim.get_body("base")
+        body = getattr(self, '_cached_body', None) or self._sim.get_body("base")
         vx_world = float(body.linvel[0])
         vy_world = float(body.linvel[1])
         c = math.cos(truth_yaw)
@@ -171,11 +200,14 @@ class TargetGame:
                        else self._step_count * CONTROL_DT),
         )
         self._odometry.update(state, CONTROL_DT)
-        if self._pose_pub is not None:
+        # Pose publishing disabled during deferred perception runs:
+        # DDS write traffic + GIL contention destabilizes gait timing.
+        if (self._pose_pub is not None
+                and self._step_count % 10 == 0):
             self._publish_pose()
 
-        if self._perception is not None:
-            _, _, _, z, roll, pitch = self._get_robot_pose()
+        if self._perception is not None and self._cached_pose is not None:
+            z, roll, pitch = self._cached_pose[3], self._cached_pose[4], self._cached_pose[5]
             p = self._odometry.pose
             self._perception.set_imu_pose(p.x, p.y, z, roll, pitch, p.yaw)
 
@@ -226,16 +258,6 @@ class TargetGame:
         x, y, yaw, _, _, _ = self._get_robot_pose()
         return x, y, yaw
 
-    def _get_tip_scales(self):
-        if self._step_and_shift is None:
-            from step_and_shift import StepAndShift
-            self._step_and_shift = StepAndShift(gait_freq=TURN_FREQ)
-        return self._step_and_shift.update(CONTROL_DT)
-
-    def _reset_tip(self):
-        if self._step_and_shift is not None:
-            self._step_and_shift.reset()
-
     @property
     def slam_trail(self) -> list[tuple[float, float]]:
         return self._slam_trail
@@ -253,7 +275,7 @@ class TargetGame:
             if self._fall_tick_count >= FALL_CONFIRM_TICKS:
                 self._stats.falls += 1
                 self._fall_tick_count = 0
-                self._post_fall_settle = 500
+                self._post_fall_settle = 500  # 5s at 100Hz
                 print(f"FALL DETECTED at z={z:.3f}m "
                       f"(sustained {FALL_CONFIRM_TICKS} ticks)")
                 self._state = GameState.SPAWN_TARGET
@@ -261,23 +283,6 @@ class TargetGame:
         else:
             self._fall_tick_count = 0
         return False
-
-    def _send_l4(self, params):
-        """Send L4 GaitParams directly to Layer 4."""
-        try:
-            self._sim.send_command(
-                params, self._sim._t, kp=self._kp, kd=self._kd)
-            self._sim._t += CONTROL_DT
-        except RuntimeError:
-            rc = None
-            try:
-                fw = self._sim._firmware
-                if fw is not None and fw._proc is not None:
-                    rc = fw._proc.poll()
-            except Exception:
-                pass
-            print(f"Simulation stopped unexpectedly (firmware exit={rc})")
-            self._state = GameState.DONE
 
     # --- Public API forwarding ---
 
@@ -293,7 +298,6 @@ class TargetGame:
             return False
 
         self._step_count += 1
-        self._update_gains()
 
         # Update SLAM odometry
         _, _, truth_yaw, _, _, _ = self._get_robot_pose()
@@ -306,18 +310,12 @@ class TargetGame:
         if self._debug_server is not None and self._debug_server.has_client:
             stream_debug_viewer(self)
 
-        # God-view A* path for MuJoCo overlay (written to temp file)
-        write_god_view_path(self)
+        # God-view A* path for MuJoCo overlay (only with debug viewer)
+        if self._debug_server is not None:
+            write_god_view_path(self)
 
-        # Staggered perception work (god-view, scan, cost grid, path critic)
+        # Perception: LiDAR scan → TSDF → costmap → route replan flag
         tick_perception(self)
-
-        # Dynamic reach threshold
-        if self._state == GameState.WALK_TO_TARGET:
-            t = self._target_step_count * CONTROL_DT
-            self._reach_threshold = min(
-                self._reach_threshold_base + t * 0.02,
-                self._reach_threshold_base + 1.0)
 
         if self._state == GameState.STARTUP:
             self.scoring.tick_startup()
@@ -330,13 +328,3 @@ class TargetGame:
                 self.nav.tick_walk_heading()
 
         return self._state != GameState.DONE
-
-    def _update_gains(self):
-        """Smoothly ramp PD gains over first 2.5s."""
-        if self._kp >= KP_FULL:
-            return
-        t = self._step_count * CONTROL_DT
-        progress = min(1.0, t / STARTUP_RAMP_SECONDS)
-        alpha = progress * progress * (3.0 - 2.0 * progress)
-        self._kp = KP_START + alpha * (KP_FULL - KP_START)
-        self._kd = KD_START + alpha * (KD_FULL - KD_START)

@@ -121,7 +121,7 @@ python -m foreman.demos.target_game --robot b2 --slam --obstacles  # SLAM + obst
 ```
 Supported robots: **b2** (legged), **go2** (legged), **go2w** (wheeled), **b2w** (wheeled). Per-robot defaults (gains, step params, body height) live in `game_config.py:ROBOT_DEFAULTS`.
 
-Runs Layers 1-4 together (legged robots use L4 GaitParams directly, wheeled robots use differential wheel torque). Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time (see gotcha below).
+Runs the full stack: legged robots send MotionCommands through Layer 5 (which handles gait selection, gain scheduling, and Layer 4 dispatch). Wheeled robots use L5's `send_wheel_command()` (PD leg hold + differential wheel torque). Navigation steering uses Layer 6's WaypointNavigator for proportional control. Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time (see gotcha below).
 
 With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body velocity) via `perception.py:PerceptionPipeline`. With `--obstacles`: loads `scene_target_obstacles.xml` and enables LiDAR point cloud processing into costmaps + DWA local planning. Costmap visualization is handled by `viz.py:CostmapOverlay`.
 
@@ -137,7 +137,7 @@ With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body vel
 | `game_setup.py` | Game initialization helpers (scenes, perception) | Both |
 | `game_viz.py` | Game visualization file writers | Both |
 | `game_astar.py` | God-view A* wrapper for game | **God-view only** |
-| `navigator_helper.py` | Navigator helper (heading/wheeled nav) | Robot-view |
+| `navigator_helper.py` | Navigator helper (L6 steering → L5 MotionCmd) | Robot-view |
 | `dwa_navigator.py` | DWANavigator helper (DWA planning, waypoints) | **Robot-view only** |
 | `dwa_path_export.py` | Green dot path export + constrained A* | Robot-view |
 | `dwa_controller.py` | DWAController helper (gait conversion, telemetry) | Robot-view |
@@ -243,12 +243,15 @@ MuJoCo and DDS use different orderings. **Forgetting this causes immediate robot
 ### Cross-Layer Config Namespace Collision
 Layers 3, 4, and 5 each have a `config/` package. When imported into the same process (e.g., target game), `importlib.import_module("config.b2")` resolves to the wrong layer's config via `sys.modules`. The target game `__main__.py` works around this by loading each layer's config by file path and injecting into `_active_config` globals. If adding new cross-layer demos, follow the same pattern.
 
-### L4-Direct Control Path (Target Game)
-The target game bypasses Layer 5 and sends L4 GaitParams directly to Layer 4. This is intentional — it matches the GA training control path (`episode.py` also sends GaitParams directly). The game implements its own turn/walk switching via `THETA_THRESHOLD` and its own PD gain ramp (smoothstep from KP_START to KP_FULL over 2.5s).
+### Layer Compliance (Target Game)
+The target game uses the highest applicable layer for each task:
+- **Navigation** (heading → vx/wz): L6-level proportional steering in `navigator_helper.py`
+- **Locomotion** (MotionCommand → gait → joints): Layer 5's `send_motion_command()` handles gait selection, TIP detection, gain scheduling, and Layer 4 dispatch
+- **Wheeled robots** (go2w, b2w): Use L5's `send_wheel_command(fwd, turn, dt)` for PD leg hold + differential wheel torque.
 
-Wheeled robots (go2w, b2w) bypass even L4 — they hold legs rigid at a pre-specified keyframe pose via PD and drive wheels with pure differential torque. No gait generator is involved.
+Gait parameters (freq, step length, gains, TIP thresholds) are owned by Layer 5's `RobotConfig`. The target game does NOT construct L4 GaitParams or manage PD gains.
 
-**Critical**: if you add control logic to the demo, it MUST also be added to `training/ga/episode.py` (or vice versa). The v12 postmortem documents how a control path mismatch between training and demo invalidated an entire training run.
+**`--genome` is deprecated.** Genome files applied gait params at the game level, bypassing L5. Gait tuning now happens in Layer 5's robot configs.
 
 ### Hardware Abstraction
 **Allowed** (available on real robot): joint encoders (`motor_state[i].q`, `.dq`, `.tau_est`), IMU, foot contact forces
@@ -296,19 +299,15 @@ Test gains: kp=500, kd=25. Production gains (kp=2500) cause oscillation in simul
 - `improvements/IMPLEMENTATION_PLAN.md` — Next phase planning (HNN/RL)
 - `foreman/postmortems/` — Postmortems from training runs and integration issues
 - `foreman/plans/` — Version-specific design docs (v10-v14)
+- `foreman/docs/pd-control-law.md` — PD servo law, cascaded architecture, gain tuning, qd_target feedforward
+- `foreman/docs/perception-timing-architecture.md` — Perception pipeline, timing rates, event-driven chain
 - Each layer's own `CLAUDE.md` — Authoritative for that layer's development
 
-## Genome Versions
+## Genome Versions (DEPRECATED)
 
-The target game `__main__.py` handles multiple genome formats via auto-detection:
+Genome application (`--genome`) is deprecated. Gait parameters are now owned by Layer 5's `RobotConfig`. The `genome_loader.py` file remains for reference but is no longer imported.
 
-| Version | Key marker | Genes | Notes |
-|---------|-----------|-------|-------|
-| v9 | `FREQ` | 8 | Walk-only params |
-| v10 | `P1_FL_HIP` | 8 + turn joint deltas | Adds per-joint turn offsets |
-| v12 | `GAIT_FREQ` | 13 | Sovereign walk + turn (separate turn genes) |
-
-Genomes are JSON files (either `{"genome": {...}}` or `{"locomotion": {...}, "steering": {...}}`). The `_apply_genome()` function flattens, detects version, expands to L5 constants, and patches module-level globals at runtime.
+Historical genome formats: v9 (8 walk genes), v10 (8 + turn joint deltas), v12 (13 sovereign walk + turn genes). These patched module-level gait globals at runtime, bypassing Layer 5.
 
 ## Validation Metrics
 
@@ -342,7 +341,7 @@ The DDS preload has a separate canonical location per repo: `training/ga/dds_pre
 
 The v12 training run evolved champions with 96+ fitness that completely failed in the headed demo: no turns, vibrating feet, wandering arcs. Root cause: training sent GaitParams directly to L4 (`send_gait_params`), but the demo routed through Layer 5 (`MotionCommand`). The two paths have different turn/walk switching logic, different wz clamping, and different parameter routing.
 
-**Train and demo MUST use the same control path.** If training bypasses a layer, the demo must bypass it identically. The v14 fix was Option B: the demo now also sends L4 GaitParams directly (matching training), with the same `THETA_THRESHOLD` switching and `TURN_WZ` values.
+**Train and demo MUST use the same control path.** Both should route through Layer 5's `send_motion_command()`. The v14 postmortem showed that bypassing L5 in either path causes parameter drift. Training episodes should also use MotionCommands (separate repo, needs same compliance fix).
 
 **Accumulating fitness terms need physical caps.** The GA exploited unbounded `heading_progress` by oscillating across the target heading (17.5 rad per target vs. pi max meaningful). Cap: `min(heading_progress, pi)` per target.
 

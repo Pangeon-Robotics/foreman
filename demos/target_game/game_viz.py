@@ -147,7 +147,7 @@ def stream_debug_viewer(game) -> None:
             getattr(game, '_heading_in_tip', False),
         )
 
-    if game._step_count % 50 == 0 and game._perception is not None:
+    if game._step_count % 25 == 0 and game._perception is not None:
         tsdf = game._perception._tsdf
         if tsdf is not None:
             game._debug_server.send_tsdf(tsdf)
@@ -176,7 +176,7 @@ def write_god_view_path(game) -> None:
     """Write god-view A* path to temp file for MuJoCo overlay."""
     if (game._god_view_path_file is None
             or game._god_view_costmap is None
-            or game._step_count % 50 != 0):
+            or game._step_count % 25 != 0):
         return
 
     from .game_astar import astar_on_god_view
@@ -204,20 +204,26 @@ def write_god_view_path(game) -> None:
 
 
 def tick_perception(game) -> None:
-    """Run staggered perception work within the tick cycle.
+    """Run perception pipeline: LiDAR scan → TSDF → costmap → route replan.
 
-    Spreads expensive operations across different ticks to avoid
-    blocking the control loop for 200-300ms on a single tick.
-    Each operation runs at 4Hz (every 25 ticks) but offset.
+    Event-driven chain:
+      1. LiDAR scan at ~4Hz (every 25 ticks at 100Hz) updates TSDF
+      2. TSDF change triggers costmap rebuild
+      3. Costmap change sets _costmap_changed flag → route replans
+
+    God-view TSDF (if enabled) runs on same schedule for F1 scoring.
     """
-    _phase = game._step_count % 25
-
-    # Phase 0: God-view + DirectScanner raycasts (same pose for F1 scoring)
-    if _phase == 0:
+    # LiDAR scan at ~4Hz (every 25 ticks = 0.25s at 100Hz)
+    if game._step_count % 25 == 0:
         _gt_x, _gt_y, _gt_yaw, _gt_z, _gt_roll, _gt_pitch = game._get_robot_pose()
+
+        # God-view TSDF (for F1 scoring only, not used for navigation)
         if game._god_view_tsdf is not None:
             game._god_view_tsdf.update(_gt_x, _gt_y, _gt_yaw, _gt_z)
-            game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
+            if not game._headless:
+                game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
+
+        # Robot-view LiDAR scan → TSDF update
         if (game._perception is not None
                 and getattr(game._perception, '_direct_ready', False)):
             nav_x, nav_y, nav_yaw = game._get_nav_pose()
@@ -225,35 +231,33 @@ def tick_perception(game) -> None:
                 nav_x, nav_y, _gt_z, nav_yaw,
                 roll=_gt_roll, pitch=_gt_pitch)
 
-    # Phase 10: Cost grid build (~65-100ms).
-    # Runs every OTHER cycle (2Hz) to limit GIL blocking.
-    _cycle = game._step_count // 25
-    if _phase == 10 and _cycle % 2 == 0 and game._perception is not None:
-        game._perception.build_cost_grids_from_main()
+            # TSDF changed → rebuild costmap (event-driven)
+            game._perception.build_cost_grids_from_main()
 
-    # Phase 15: Path critic update + viewer file writes
-    if _phase == 15:
-        if (game._perception is not None
-                and game._path_critic is not None):
-            cost_grid = game._perception.world_cost_grid
-            meta = game._perception.world_cost_meta
-            if cost_grid is not None and meta is not None:
-                game._path_critic.set_world_cost(
-                    cost_grid, meta['origin_x'], meta['origin_y'],
-                    meta['voxel_size'],
-                    truncation=meta.get('truncation', 0.5))
-        if (not game._headless
-                and game._perception is not None
-                and game._perception._tsdf is not None):
-            write_robot_tsdf_file(game._perception._tsdf)
-            write_robot_costmap_file(game._perception._tsdf)
+            # Costmap → path critic (single source of truth for routing)
+            if game._path_critic is not None:
+                cost_grid = game._perception.world_cost_grid
+                meta = game._perception.world_cost_meta
+                if cost_grid is not None and meta is not None:
+                    game._path_critic.set_world_cost(
+                        cost_grid, meta['origin_x'], meta['origin_y'],
+                        meta['voxel_size'],
+                        truncation=meta.get('truncation', 0.5))
+                    # Signal route replan needed
+                    game._costmap_changed = True
+
+            # Viewer file writes (only in headed mode)
+            if (not game._headless
+                    and game._perception._tsdf is not None):
+                write_robot_tsdf_file(game._perception._tsdf)
+                write_robot_costmap_file(game._perception._tsdf)
 
 
 def get_occ_str(game) -> str:
     """Return formatted occupancy accuracy string, recomputing every 2000 ticks."""
     if game._scene_xml_path is None or game._perception is None:
         return ""
-    if game._step_count - game._occ_compute_step >= 2000:
+    if game._step_count - game._occ_compute_step >= 2000:  # 20s at 100Hz
         try:
             from .test_occupancy import compute_3ds_v2, compute_3ds_god
             tsdf = game._perception._tsdf

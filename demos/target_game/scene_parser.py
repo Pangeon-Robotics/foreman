@@ -20,7 +20,7 @@ def _find_obstacle_bodies(scene_path: Path) -> list[str]:
         tree = ET.parse(scene_path)
         for body in tree.iter("body"):
             name = body.get("name", "")
-            if name.startswith("obs_"):
+            if name.startswith("obs_") or name.startswith("obstacle_"):
                 names.append(name)
     except (ET.ParseError, FileNotFoundError):
         pass
@@ -36,7 +36,7 @@ def _find_obstacle_geoms(scene_path: Path) -> list[dict]:
     Used by debug_server (viewer wireframes) and test_occupancy (ground truth).
     """
     import xml.etree.ElementTree as ET
-    _PREFIXES = ("obs_", "wall_")
+    _PREFIXES = ("obs_", "obstacle_", "wall_")
     obstacles = []
     try:
         tree = ET.parse(scene_path)

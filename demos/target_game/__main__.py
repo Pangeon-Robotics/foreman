@@ -10,7 +10,6 @@ if _os.path.exists(_SYS_DDSC):
     _ctypes.CDLL(_SYS_DDSC, mode=_ctypes.RTLD_GLOBAL)
 
 import argparse
-import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,14 +24,9 @@ if _layer5 not in sys.path:
     sys.path.insert(0, _layer5)
 
 from simulation import SimulationManager
-from config.defaults import MotionCommand  # noqa: F401
-
-_l4_sim = sys.modules["_l4_simulation"]
-L4GaitParams = _l4_sim.GaitParams
 
 from .game import TargetGame, configure_for_robot, GameStatistics, CONTROL_DT, TARGET_TIMEOUT_STEPS
 from .utils import load_module_by_path, patch_layer_configs
-from .genome_loader import _apply_genome
 from .scene_parser import _find_obstacle_bodies, _find_obstacle_geoms
 
 
@@ -127,26 +121,8 @@ def run_game(args) -> GameRunResult:
     print(f"Starting target game: robot={args.robot}, targets={args.targets}")
     configure_for_robot(args.robot)
 
-    genome = getattr(args, 'genome', None)
-    if genome:
-        print(f"\nApplying evolved genome: {genome}")
-        _apply_genome(genome)
-
-    from . import game as game_mod
-    from . import game_config as game_cfg
-    if args.robot == "b2":
-        if game_mod.TURN_WZ > 3.0:
-            game_mod.TURN_WZ = 3.0
-            game_cfg.TURN_WZ = 3.0
-            print(f"  Safety cap: TURN_WZ capped to {game_mod.TURN_WZ} for B2")
-        if game_mod.TURN_STANCE_WIDTH < 0.12:
-            game_mod.TURN_STANCE_WIDTH = 0.12
-            game_cfg.TURN_STANCE_WIDTH = 0.12
-            print(f"  Safety cap: TURN_STANCE_WIDTH raised to {game_mod.TURN_STANCE_WIDTH} for B2")
-        if game_mod.TURN_DUTY_CYCLE > 0.55:
-            game_mod.TURN_DUTY_CYCLE = 0.55
-            game_cfg.TURN_DUTY_CYCLE = 0.55
-            print(f"  Safety cap: TURN_DUTY_CYCLE lowered to {game_mod.TURN_DUTY_CYCLE} for B2")
+    if getattr(args, 'genome', None):
+        print(f"Warning: --genome is deprecated (gait params owned by Layer 5, ignored)")
 
     patch_layer_configs(args.robot, Path(_root))
 
@@ -222,8 +198,7 @@ def run_game(args) -> GameRunResult:
             timeout_steps = int(timeout_per_target / CONTROL_DT)
 
         game = TargetGame(
-            sim, L4GaitParams=L4GaitParams,
-            make_low_cmd=_l4_sim._make_low_cmd, stamp_cmd=_l4_sim._stamp_cmd,
+            sim, robot=args.robot,
             num_targets=args.targets, seed=getattr(args, 'seed', None),
             angle_range=angle_range, odometry=odometry,
             min_dist=getattr(args, 'min_dist', 3.0),
@@ -251,6 +226,7 @@ def run_game(args) -> GameRunResult:
 
         stats = game.run()
         ato = game._path_critic.aggregate_ato() if game._path_critic else None
+
         occ_accuracy = compute_occupancy(perception, args, scene_path)
         scores = compute_scores(game, perception, args)
 
@@ -275,7 +251,7 @@ def main():
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--genome", type=str, default=None,
-                        help="Path to GA-evolved genome JSON file")
+                        help="DEPRECATED: gait params now owned by Layer 5")
     parser.add_argument("--full-circle", action="store_true",
                         help="Spawn targets at any angle (uniform -pi to pi)")
     parser.add_argument("--domain", type=int, default=None,

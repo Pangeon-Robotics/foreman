@@ -101,6 +101,11 @@ def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
               f"exclude {len(god_tsdf._robot_geom_ids)} robot geoms, "
               f"voxel={god_tsdf._tsdf.voxel_size}m")
 
+    # Reduce ray count when SLAM is active to limit GIL blocking.
+    # Full 64K rays take 200-450ms; 8K rays take ~25ms.
+    slam = getattr(args, 'slam', False)
+    if slam:
+        perception._use_reduced_rays = True
     perception.init_direct_scanner(
         str(scene_path), robot=args.robot,
         mj_model=_god_mj_model, mj_data=_god_mj_data)
@@ -108,8 +113,13 @@ def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
           f"exclude {len(perception._direct_robot_geoms)} robot + "
           f"{len(perception._direct_target_geoms)} target geoms")
 
-    cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
-    cloud_sub.Init(perception.on_point_cloud, 5)
+    # Only subscribe to DDS point clouds if DirectScanner isn't active.
+    # The DDS subscriber's background thread acquires the GIL on every
+    # callback (even if the callback returns immediately), starving the
+    # control loop and destabilizing the gait.
+    if not perception._direct_ready:
+        cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
+        cloud_sub.Init(perception.on_point_cloud, 5)
     game._perception = perception
     print(f"TSDF active: +/-{pcfg.tsdf_xy_extent}m, "
           f"voxel={pcfg.tsdf_voxel_size}m, "

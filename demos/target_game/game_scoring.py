@@ -22,16 +22,10 @@ class GameScoring:
     def tick_startup(self):
         """Hold neutral stand for settle period."""
         g = self.game
-        if C.WHEELED and g._home_q is not None:
-            g.nav._send_wheeled(0.0, 0.0)
+        if C.WHEELED:
+            g._sim.send_wheel_command(0.0, 0.0, dt=C.CONTROL_DT)
         else:
-            params = g._L4GaitParams(
-                gait_type='trot', step_length=0.0,
-                gait_freq=C.GAIT_FREQ, step_height=0.0,
-                duty_cycle=1.0, stance_width=0.0, wz=0.0,
-                body_height=C.BODY_HEIGHT,
-            )
-            g._send_l4(params)
+            g._send_motion(behavior='stand')
         if g._step_count >= C.STARTUP_SETTLE_STEPS:
             x, y, yaw, z, roll, pitch = g._get_robot_pose()
             roll_deg = abs(math.degrees(roll))
@@ -46,20 +40,7 @@ class GameScoring:
                 g._state = C.GameState.DONE
                 return
             if C.WHEELED:
-                if g._home_q is None:
-                    state = g._sim.get_robot_state()
-                    g._home_q = [
-                        state.joint_positions[i] for i in range(12)]
-                    print(
-                        f"Startup complete (wheeled, L4 pose): "
-                        f"z={z:.3f}m  home_q="
-                        f"[{g._home_q[0]:.3f}, "
-                        f"{g._home_q[1]:.3f}, "
-                        f"{g._home_q[2]:.3f}]")
-                else:
-                    print(
-                        f"Startup complete (wheeled): z={z:.3f}m  "
-                        f"home_q={C.WHEEL_HOME_Q[:3]}")
+                print(f"Startup complete (wheeled): z={z:.3f}m")
             else:
                 print(
                     f"Startup complete: z={z:.3f}m  "
@@ -78,14 +59,14 @@ class GameScoring:
             g._post_fall_settle -= 1
             _, _, _, z, _, _ = g._get_robot_pose()
             recovered = z > C.NOMINAL_BODY_HEIGHT * 0.85
-            if not recovered and g._post_fall_settle > 0:
-                params = g._L4GaitParams(
-                    gait_type='trot', step_length=0.0,
-                    gait_freq=C.GAIT_FREQ, step_height=0.0,
-                    duty_cycle=1.0, stance_width=0.0, wz=0.0,
-                    body_height=C.BODY_HEIGHT,
-                )
-                g._send_l4(params)
+            if not recovered:
+                if g._post_fall_settle > 0:
+                    g._send_motion(behavior='stand')
+                    return
+                # Settle expired without recovery — end game to avoid
+                # cascading falls that inflate the fall counter.
+                print("Fall recovery failed after 5s — ending game")
+                g._state = C.GameState.DONE
                 return
 
         nav_x, nav_y, nav_yaw = g._get_nav_pose()
@@ -101,7 +82,6 @@ class GameScoring:
         g._target_step_count = 0
         g._reach_threshold = g._reach_threshold_base
         g._min_target_dist = float('inf')
-        g._reset_tip()
         g._current_waypoint = None
         g._committed_path = None
         g._committed_path_step = 0

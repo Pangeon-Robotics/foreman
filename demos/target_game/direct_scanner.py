@@ -74,10 +74,18 @@ def init_direct_scanner(pipeline, scene_xml_path: str,
     pipeline._direct_exclude_geoms = (
         pipeline._direct_robot_geoms | pipeline._direct_target_geoms)
 
-    # Pre-compute ray directions: 128 vertical channels at ±30° for
-    # high completeness in 3DS metrics.  Horizontal: 0.36° step (1000 rays).
-    h_angles = np.deg2rad(np.arange(0.0, 360.0, 0.72))
-    v_angles_deg = np.linspace(-30.0, 30.0, 128).tolist()
+    # Pre-compute ray directions. Use reduced ray count when SLAM is
+    # active to avoid GIL contention (numpy ops in scan thread block
+    # the control loop, destabilizing the robot at 100Hz).
+    # Full: 128 V × 500 H = 64000 rays (~200ms with obstacles).
+    # Reduced: 32 V × 250 H = 8000 rays (~25ms with obstacles).
+    _use_reduced = getattr(pipeline, '_use_reduced_rays', False)
+    if _use_reduced:
+        h_angles = np.deg2rad(np.arange(0.0, 360.0, 1.44))  # 250 rays
+        v_angles_deg = np.linspace(-30.0, 30.0, 32).tolist()
+    else:
+        h_angles = np.deg2rad(np.arange(0.0, 360.0, 0.72))  # 500 rays
+        v_angles_deg = np.linspace(-30.0, 30.0, 128).tolist()
     dirs = []
     for v_deg in v_angles_deg:
         v_rad = np.deg2rad(v_deg)

@@ -44,7 +44,7 @@ def validate_committed_path(committed_path, committed_path_step, step_count,
     # Time-based hold expired -- replan with fresh cost data.
     # Short hold (1s) for the first few seconds while TSDF is building,
     # then full hold (5s) once obstacle data is established.
-    hold = PATH_HOLD_TICKS if step_count > 500 else 100
+    hold = PATH_HOLD_TICKS if step_count > 250 else 50
     if step_count - committed_path_step >= hold:
         return None
 
@@ -115,22 +115,21 @@ def export_path(game, target_x, target_y):
         _astar_mode = "no-pc"
         pc = game._path_critic
         if pc is not None and pc._cost_grid is not None:
-            # Constrained A* with tight clearance (0.15m) --
-            # blocks cells >= 177, so the path is obstacle-free.
+            # Constrained A* with moderate clearance (0.25m) --
+            # balances obstacle avoidance with path availability.
             saved_radius = pc._robot_radius
-            pc._robot_radius = 0.15
+            pc._robot_radius = 0.25
             raw = pc._astar_core(
                 (x_gt, y_gt), (target_x, target_y),
                 return_path=True, force_passable=False,
             )
             _astar_mode = "constrained"
 
-            # Tight fallback: when robot is near obstacles (cost >= 177
-            # at start), the 0.15m radius blocks surrounding cells and
-            # A* can't expand.  Try 0.05m (blocks only >= 228, right
-            # on the surface) so we still get a path.
+            # Tight fallback: when robot is near obstacles, the 0.25m
+            # radius blocks surrounding cells and A* can't expand.
+            # Try 0.10m so we still get a path.
             if raw is None or len(raw) < 2:
-                pc._robot_radius = 0.05
+                pc._robot_radius = 0.10
                 raw = pc._astar_core(
                     (x_gt, y_gt), (target_x, target_y),
                     return_path=True, force_passable=False,
