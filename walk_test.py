@@ -1,12 +1,16 @@
-"""Walk test for B2 quadruped — headed (MuJoCo viewer).
+"""Continuous stride ramp-up test for B2 with slip detection.
 
-Walks straight for 15s, then turns (wz=0.3) for 10s.
+Keeps gait_freq=0.5Hz constant. Ramps commanded vx from 0.1 to 1.0 m/s
+over 120s so stride length grows visibly. Uses Layer 5's SlipDetector
+for real per-tick traction monitoring (contact forces, torque-motion
+mismatch, IMU response, diagonal symmetry).
 
 Usage:
     python foreman/walk_test.py
 """
 
 import ctypes
+import glob as _glob
 import math
 import os
 import subprocess
@@ -14,96 +18,103 @@ import sys
 import time
 from pathlib import Path
 
-# --- DDS preload (must happen before any DDS imports) ---
+import numpy as np
+
 _SYS_DDSC = "/usr/lib/x86_64-linux-gnu/libddsc.so.0.10.4"
 if os.path.exists(_SYS_DDSC):
     ctypes.CDLL(_SYS_DDSC, mode=ctypes.RTLD_GLOBAL)
 
-# --- Kill stale firmware and session files ---
 subprocess.run(["pkill", "-9", "-f", "firmware_sim.py"], capture_output=True)
 time.sleep(1)
 subprocess.run(["rm", "-f", "/tmp/robo_sessions/b2_domain52.json"], capture_output=True)
 
-# --- Path setup ---
-_root = Path(__file__).resolve().parents[1]   # workspace root
-_foreman = Path(__file__).resolve().parent    # foreman/
+# Clean stale visualization files
+for f in _glob.glob("/tmp/robot_view_*.bin") + _glob.glob("/tmp/god_view_*.bin"):
+    os.remove(f)
+for f in _glob.glob("/tmp/costmap_*.bin"):
+    os.remove(f)
+
+_root = Path(__file__).resolve().parents[1]
+_foreman = Path(__file__).resolve().parent
 _layer5 = str(_root / "layer_5")
 
 if _layer5 not in sys.path:
     sys.path.insert(0, _layer5)
-
 if str(_foreman.parent) not in sys.path:
     sys.path.insert(0, str(_foreman.parent))
 
 from config.defaults import MotionCommand
 from simulation import SimulationManager
+from slip_detector import SlipDetector
 from foreman.demos.target_game.utils import patch_layer_configs
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 DOMAIN = 52
 ROBOT = "b2"
-VX_CMD = 1.0          # m/s forward
-DT = 0.01             # s per control tick (100 Hz)
-SETTLE_STEPS = 300    # 3s stand
-STRAIGHT_STEPS = 1500 # 15s straight walk
-TURN_STEPS = 1000     # 10s turning walk
-TURN_WZ = 0.3         # rad/s turn rate
-TICK_SLEEP = 0.005    # half real-time for headed mode
+DT = 0.01
+TICK_SLEEP = 0.005
+
+VX_START = 0.1
+VX_END = 1.0
+RAMP_SECONDS = 120
+SETTLE_SECONDS = 5
+REPORT_INTERVAL = 5  # seconds
 
 
 def _yaw_deg(body):
-    """Extract yaw in degrees from body quaternion [w,x,y,z]."""
     q = body.quat
     return math.degrees(math.atan2(2*(q[0]*q[3]+q[1]*q[2]), 1-2*(q[2]**2+q[3]**2)))
 
 
 def main():
-    print("=" * 60)
-    print("B2 Walk Test (headed)")
-    print(f"  vx={VX_CMD} m/s, turn wz={TURN_WZ} rad/s")
-    print(f"  Domain={DOMAIN}")
-    print("=" * 60)
-
     patch_layer_configs(ROBOT, _root)
-
-    from config.defaults import STEP_LENGTH_SCALE, MAX_STEP_LENGTH, BASE_FREQ, TROT_STEP_HEIGHT, DUTY_CYCLES
-    print(f"\n  L5 config check:")
-    print(f"    STEP_LENGTH_SCALE={STEP_LENGTH_SCALE}, MAX_STEP_LENGTH={MAX_STEP_LENGTH}")
-    print(f"    BASE_FREQ={BASE_FREQ}, TROT_STEP_HEIGHT={TROT_STEP_HEIGHT}")
-    print(f"    DUTY_CYCLES['trot']={DUTY_CYCLES['trot']}")
     from velocity_mapper import map_velocity
-    sl, freq, sh = map_velocity(VX_CMD)
-    print(f"    map_velocity({VX_CMD}) -> step_length={sl}, freq={freq}, step_height={sh}\n")
+
+    print("=" * 80)
+    print("B2 Stride Ramp (0.5Hz, vx 0.1→1.0 over 120s) + SlipDetector")
+    print("=" * 80)
 
     _scene = str(_root / "Assets" / "unitree_robots" / "b2" / "scene_scenario_open.xml")
     sim = SimulationManager(ROBOT, headless=False, domain=DOMAIN, transitions=False,
                             scene=_scene)
     sim.start()
-
-    # Give firmware time to initialise
     time.sleep(2.0)
 
-    # --- Phase 1: Settle (stand 3s) ---
-    print("\n[1/4] Settling (3s stand)...")
-    for _ in range(SETTLE_STEPS):
+    slip = SlipDetector(mass=83.5)  # B2
+
+    # Settle
+    print(f"\nSettling ({SETTLE_SECONDS}s)...")
+    for _ in range(SETTLE_SECONDS * 100):
         cmd = MotionCommand(vx=0.0, behavior="stand", robot=ROBOT)
         sim.send_motion_command(cmd, dt=DT, terrain=False)
         time.sleep(TICK_SLEEP)
 
     body = sim.get_body("base")
-    if body:
-        print(f"  After settle: x={float(body.pos[0]):.3f} z={float(body.pos[2]):.3f}")
+    print(f"  Start: x={float(body.pos[0]):.3f}, z={float(body.pos[2]):.3f}")
 
-    # --- Phase 2: Straight walk (15s) ---
-    print(f"\n[2/4] Straight walk: vx={VX_CMD}, wz=0.0 for 15s...")
-    x0 = float(body.pos[0]) if body else 0.0
+    # Ramp
+    print(f"\nRamping vx from {VX_START} to {VX_END} over {RAMP_SECONDS}s...")
+    print(f"\n{'t':>5}  {'vx_cmd':>6}  {'step':>5}  {'v_theory':>8}  {'v_actual':>8}  "
+          f"{'trac':>5}  {'slip_v':>6}  {'conf':>4}  {'yaw':>6}  {'z_min':>5}")
+    print("-" * 80)
+
+    total_steps = RAMP_SECONDS * 100
     z_min = 999.0
     fell = False
 
-    for i in range(STRAIGHT_STEPS):
-        cmd = MotionCommand(vx=VX_CMD, wz=0.0, behavior="trot", robot=ROBOT)
+    prev_x = float(body.pos[0])
+    prev_y = float(body.pos[1])
+    report_steps = REPORT_INTERVAL * 100
+
+    # Accumulate traction readings per report interval
+    trac_samples = []
+    slip_v_samples = []
+    conf_samples = []
+
+    for i in range(total_steps):
+        frac = i / total_steps
+        vx_cmd = VX_START + (VX_END - VX_START) * frac
+
+        cmd = MotionCommand(vx=vx_cmd, wz=0.0, behavior="trot", robot=ROBOT)
         sim.send_motion_command(cmd, dt=DT, terrain=False)
 
         body = sim.get_body("base")
@@ -113,90 +124,53 @@ def main():
             if z < 0.25:
                 fell = True
 
-            # Print every 1s
-            if i % 100 == 0:
-                t = i * DT
-                x = float(body.pos[0])
-                vx_actual = float(body.linvel[0])
-                yaw = _yaw_deg(body)
-                print(f"  t={t:5.1f}s  x={x:+7.3f}  z={z:.3f}  vx={vx_actual:+.3f}  yaw={yaw:+6.1f}°")
+        # Run slip detector every tick
+        robot_state = sim.get_robot_state()
+        if robot_state is not None:
+            est = slip.update(robot_state, commanded_vx=vx_cmd, commanded_wz=0.0)
+            trac_samples.append(est.traction)
+            slip_v_samples.append(est.slip_velocity)
+            conf_samples.append(est.confidence)
+
+        # Report
+        if (i + 1) % report_steps == 0 and body:
+            t = (i + 1) * DT
+            x_now = float(body.pos[0])
+            y_now = float(body.pos[1])
+            dx = x_now - prev_x
+            dy = y_now - prev_y
+            dist = math.sqrt(dx*dx + dy*dy)
+            v_actual = dist / REPORT_INTERVAL
+
+            sl, freq, _ = map_velocity(vx_cmd)
+            v_theory = sl * freq
+            yaw = _yaw_deg(body)
+
+            mean_trac = np.mean(trac_samples) if trac_samples else 0.0
+            mean_slip_v = np.mean(slip_v_samples) if slip_v_samples else 0.0
+            mean_conf = np.mean(conf_samples) if conf_samples else 0.0
+
+            print(f"{t:5.0f}  {vx_cmd:6.2f}  {sl:5.3f}  {v_theory:8.3f}  {v_actual:8.3f}  "
+                  f"{mean_trac:5.2f}  {mean_slip_v:6.3f}  {mean_conf:4.2f}  "
+                  f"{yaw:+5.1f}°  {z_min:5.3f}")
+
+            prev_x, prev_y = x_now, y_now
+            z_min = 999.0
+            trac_samples.clear()
+            slip_v_samples.clear()
+            conf_samples.clear()
 
         time.sleep(TICK_SLEEP)
 
-    body = sim.get_body("base")
-    x_after_straight = float(body.pos[0]) if body else 0.0
-    straight_disp = x_after_straight - x0
-    straight_speed = straight_disp / (STRAIGHT_STEPS * DT)
-    print(f"  Straight phase: displacement={straight_disp:.3f}m, avg_speed={straight_speed:.3f} m/s")
+        if fell:
+            t = (i + 1) * DT
+            sl, _, _ = map_velocity(vx_cmd)
+            print(f"\n  *** FELL at t={t:.1f}s, vx_cmd={vx_cmd:.2f}, step={sl:.3f}m ***")
+            break
 
-    # --- Phase 3: Turn walk (10s) ---
-    print(f"\n[3/4] Turn walk: vx={VX_CMD}, wz={TURN_WZ} for 10s...")
-    import numpy as np
-    turn_vx_samples = []
-    turn_wz_samples = []
-
-    for i in range(TURN_STEPS):
-        cmd = MotionCommand(vx=VX_CMD, wz=TURN_WZ, behavior="trot", robot=ROBOT)
-        sim.send_motion_command(cmd, dt=DT, terrain=False)
-
-        body = sim.get_body("base")
-        if body:
-            z = float(body.pos[2])
-            z_min = min(z_min, z)
-            if z < 0.25:
-                fell = True
-
-            vx_actual = float(body.linvel[0])
-            # Angular velocity around z
-            wz_actual = float(body.angvel[2]) if hasattr(body, 'angvel') else 0.0
-            turn_vx_samples.append(vx_actual)
-            turn_wz_samples.append(wz_actual)
-
-            # Print every 1s
-            if i % 100 == 0:
-                t = (STRAIGHT_STEPS + i) * DT
-                x = float(body.pos[0])
-                yaw = _yaw_deg(body)
-                print(f"  t={t:5.1f}s  x={x:+7.3f}  z={z:.3f}  vx={vx_actual:+.3f}  yaw={yaw:+6.1f}°  wz={wz_actual:+.3f}")
-
-        time.sleep(TICK_SLEEP)
-
-    # --- Phase 4: Summary ---
-    print("\n[4/4] Summary")
-    print("=" * 60)
-
-    body = sim.get_body("base")
-    if body:
-        x_final = float(body.pos[0])
-        y_final = float(body.pos[1])
-        total_disp = np.sqrt((x_final - x0) ** 2 + y_final ** 2)
-        total_time = (STRAIGHT_STEPS + TURN_STEPS) * DT
-        avg_speed = total_disp / total_time
-
-        print(f"  Total displacement : {total_disp:.3f} m")
-        print(f"  Total time         : {total_time:.1f} s")
-        print(f"  Average speed      : {avg_speed:.3f} m/s")
-        print(f"  Speed ratio (v/cmd): {avg_speed / VX_CMD:.2f}")
-
-    if turn_vx_samples:
-        vx_arr = np.array(turn_vx_samples)
-        wz_arr = np.array(turn_wz_samples)
-        print(f"\n  Turn phase vx: mean={vx_arr.mean():.3f}, min={vx_arr.min():.3f}, max={vx_arr.max():.3f}")
-        print(f"  Turn phase wz: mean={wz_arr.mean():.3f}, min={wz_arr.min():.3f}, max={wz_arr.max():.3f}")
-
-    slip_ratio = straight_speed / VX_CMD if VX_CMD > 0 else 0.0
-    print(f"\n  Straight slip ratio: {slip_ratio:.2f} (1.0 = no slip)")
-    print(f"  Min body z         : {z_min:.3f}")
-    print(f"  Fell               : {'YES' if fell else 'NO'}")
-
-    if fell:
-        print("\n  [FAIL] Robot fell!")
-    elif avg_speed < 0.1:
-        print("\n  [FAIL] Robot barely moved")
-    else:
-        print(f"\n  [OK] Walked at {avg_speed:.2f} m/s, {'no falls' if not fell else 'FELL'}")
-
-    print("\nDone. Stopping simulation.")
+    print("\n" + "=" * 80)
+    print(f"  Fell: {'YES' if fell else 'NO'}")
+    print("Done.")
     sim.stop()
 
 
