@@ -20,36 +20,30 @@ _GENOMES = {
         "latest": _WORKSPACE / "training" / "models" / "b2" / "ga_best" / "final_best.json",
         "v16": _WORKSPACE / "training" / "models" / "b2" / "ga_v16_champion_r1.json",
         "v17": _WORKSPACE / "training" / "models" / "b2" / "ga_v17_champion.json",
+        # Future champions: just use "latest" (points to ga_best/final_best.json)
     },
 }
 
-
-def _flatten_genome(data):
-    """Extract flat genome dict from either grouped or flat format."""
-    if "genome" in data:
-        return data["genome"]
-    flat = {}
-    for key in ("gait_timing", "trajectory", "body_pose", "navigation", "horizon"):
-        if key in data:
-            flat.update(data[key])
-    return flat
 
 
 def _print_genome_info(genome_path):
     """Print genome parameters and fitness function being evaluated."""
     data = json.loads(Path(genome_path).read_text())
-    g = _flatten_genome(data)
 
     print(f"\n  Genome: {Path(genome_path).name}")
     print(f"  GA fitness: {data.get('fitness', '?')}")
     print()
-    print(f"  v17 per-timestep fitness = mean of:")
-    print(f"    4.0 x stride_elegance   quadratic reward for step_length (0.10-0.70m)")
-    print(f"    2.0 x stability         1 - K*(roll^2 + pitch^2 + d_roll^2 + d_pitch^2)")
-    print(f"    2.0 x grip              fraction of stance feet with slip < 0.15 m/s")
-    print(f"    1.5 x speed             velocity toward target / 2.0 m/s")
-    print(f"    1.0 x turn              heading error reduction rate")
-    print(f"  fall = 0")
+
+    # Import fitness component info from training (single source of truth)
+    try:
+        sys.path.insert(0, str(_WORKSPACE / "training"))
+        from ga.episodes.fitness import COMPONENT_INFO
+        print(f"  Per-timestep fitness = mean of:")
+        for name, weight, description in COMPONENT_INFO:
+            print(f"    {weight:.1f} x {name:20s} {description}")
+        print(f"  fall = 0")
+    except ImportError:
+        print(f"  (fitness info unavailable — see training/ga/episodes/fitness.py)")
     print()
 
 

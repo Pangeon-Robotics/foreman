@@ -39,7 +39,7 @@ class TickSample:
     droll: float = 0.0         # deg/s
     dpitch: float = 0.0        # deg/s
 
-    # v17 fitness components (0-1 each)
+    # Per-timestep fitness components (0-1 each, see training/ga/episodes/fitness.py)
     stability: float = 0.0
     grip: float = 0.0
     speed: float = 0.0
