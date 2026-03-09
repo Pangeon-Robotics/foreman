@@ -302,9 +302,7 @@ class PerceptionPipeline:
             n = len(self._build_times)
             cg_ms = getattr(self, '_last_cg_ms', 0)
             astar_ms = getattr(self, '_last_astar_ms', 0)
-            print(f"  [perc] build#{n} {elapsed_ms:.0f}ms "
-                  f"(cg={cg_ms:.0f} astar={astar_ms:.0f}) "
-                  f"chunks={self._tsdf.n_chunks}")
+            pass  # slow build logged internally (>150ms)
 
     @property
     def costmap_query(self):

@@ -101,7 +101,8 @@ def export_path(game, target_x, target_y):
 
     x_gt, y_gt, _, _, _, _ = game._get_robot_pose()
     if game._committed_path is None:
-        print(f"  [EXPORT] REPLAN gt=({x_gt:.2f},{y_gt:.2f})", flush=True)
+        game._gt.record_event("path_replan", step=game._step_count,
+                              x=x_gt, y=y_gt)
 
     # Try reusing committed path (trim using GT)
     path = validate_committed_path(
@@ -200,9 +201,10 @@ def export_path(game, target_x, target_y):
                         _max_obs_cost = max(_max_obs_cost, c)
                     else:
                         _n_free += 1
-        print(f"  [PATH] mode={_astar_mode} pts={len(raw)} "
-              f"free={_n_free} obs={_n_obs}(max={_max_obs_cost}) "
-              f"unk={_n_unk}", flush=True)
+        game._gt.record_event("path_commit", step=game._step_count,
+                              mode=_astar_mode, pts=len(raw),
+                              free=_n_free, obs=_n_obs,
+                              max_obs_cost=_max_obs_cost, unk=_n_unk)
 
         # Smooth the A* grid path into natural curves (0.08m spacing)
         if len(raw) >= 3 and game._path_critic is not None:

@@ -129,7 +129,6 @@ With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body vel
 | File | Concern | Data domain |
 |------|---------|-------------|
 | `__main__.py` | Entry point, DDS preload, run_game(), main() | Both (wires pipelines) |
-| `genome_loader.py` | Genome expansion (v9/v10/v12) and application | N/A |
 | `scene_parser.py` | Scene XML obstacle body/geom parsing | N/A |
 | `game.py` | TargetGame core (init, tick, pose helpers) | Both (tick dispatches) |
 | `game_config.py` | Constants, enums, ROBOT_DEFAULTS, `configure_for_robot()` | N/A |
@@ -139,7 +138,7 @@ With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body vel
 | `game_astar.py` | God-view A* wrapper for game | **God-view only** |
 | `navigator_helper.py` | Navigator helper (L6 steering → L5 MotionCmd) | Robot-view |
 | `dwa_navigator.py` | DWANavigator helper (DWA planning, waypoints) | **Robot-view only** |
-| `dwa_path_export.py` | Green dot path export + constrained A* | Robot-view |
+| `path_export.py` | Green dot path export + constrained A* | Robot-view |
 | `dwa_controller.py` | DWAController helper (gait conversion, telemetry) | Robot-view |
 | `stuck_recovery.py` | StuckRecovery helper (stuck detection + TIP) | Robot-view |
 | `path_critic.py` | PathCritic (ATO metrics, recording, summary) | Data-agnostic |

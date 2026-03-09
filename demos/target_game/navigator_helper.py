@@ -12,7 +12,8 @@ from __future__ import annotations
 import math
 
 from . import game_config as C
-from .dwa_path_export import export_path
+from .path_export import export_path
+from .telemetry import TickSample
 from .utils import normalize_angle as _normalize_angle
 
 # Slip detection (Layer 5 module, hardware-compatible)
@@ -74,9 +75,6 @@ class Navigator:
     # Walk speed
     VX_WALK = 1.0       # m/s (increase once turn-radius-aware routing is in)
     WZ_MAX = 1.5        # rad/s — L5 clamps at 1.5
-
-    # TIP (placeholder — not used in WALK mode)
-    TURN_WZ = 2.0
 
     def __init__(self, game):
         self.game = game
@@ -173,14 +171,43 @@ class Navigator:
             else:
                 _v = 0.0
             g._nav_prev_pos = (x_truth, y_truth)
-            _trac = f" trac={slip_est.traction:.2f}" if slip_est else ""
-            print(
-                f"[{g._target_index}/{g._num_targets}] "
-                f"WALK  t={t:.1f} d={dist:.1f} "
-                f"err={math.degrees(heading_err):+.0f}\u00b0 "
-                f"v={_v:.2f} vx={vx:.2f} wz={wz:+.2f}"
-                f"{_trac} "
-                f"({x_truth:.1f},{y_truth:.1f})")
+
+            # Fitness components from L5 telemetry
+            _lt = g._sim.telemetry if hasattr(g._sim, 'telemetry') else None
+            if _lt is not None:
+                _energy = _lt.body_roll**2 + _lt.body_pitch**2 + 0.01 * (_lt.d_roll**2 + _lt.d_pitch**2)
+                _stability = max(0.0, 1.0 - 4.0 * _energy)
+                _step_len = _lt.step_length
+                _grip = _lt.traction
+            else:
+                _stability = 1.0
+                _step_len = 0.0
+                _grip = 1.0
+
+            _t_se = max(0.0, min(1.0, (_step_len - 0.10) / 0.60))
+            _stride_elegance = _t_se * _t_se
+
+            _heading_to_target = math.atan2(target.y - y_truth, target.x - x_truth)
+            _v_toward = _v * math.cos(yaw_truth - _heading_to_target)
+            _speed = max(0.0, min(1.0, _v_toward / 2.0))
+
+            _prev_herr = getattr(self, '_prev_tick_heading_err', heading_err)
+            _delta = abs(_prev_herr) - abs(heading_err)
+            _turn = max(0.0, min(1.0, _delta / (C.TELEMETRY_INTERVAL * C.CONTROL_DT) / math.pi))
+            self._prev_tick_heading_err = heading_err
+
+            g._gt.record_tick(TickSample(
+                step=g._step_count, t=t,
+                target_index=g._target_index, num_targets=g._num_targets,
+                mode="W", x=x_truth, y=y_truth, z=z,
+                roll=r_deg, pitch=p_deg, yaw=yaw_truth,
+                dist=dist, heading_err=heading_err,
+                vx_cmd=vx, wz_cmd=wz, v_actual=_v,
+                traction=_lt.traction if _lt else (slip_est.traction if slip_est else None),
+                droll=droll, dpitch=dpitch,
+                stability=_stability, grip=_grip, speed=_speed,
+                turn=_turn, stride_elegance=_stride_elegance,
+            ))
 
         if dist < g._reach_threshold:
             g.scoring.on_reached()
@@ -234,11 +261,14 @@ class Navigator:
 
         if g._target_step_count % C.TELEMETRY_INTERVAL == 0:
             t = g._target_step_count * C.CONTROL_DT
-            print(
-                f"[{g._target_index}/{g._num_targets}] "
-                f"DRIVE t={t:.1f} d={dist:.1f} "
-                f"err={math.degrees(heading_err):+.0f}\u00b0 "
-                f"({x_truth:.1f},{y_truth:.1f})")
+            g._gt.record_tick(TickSample(
+                step=g._step_count, t=t,
+                target_index=g._target_index, num_targets=g._num_targets,
+                mode="D", x=x_truth, y=y_truth, z=z,
+                roll=r_deg, pitch=p_deg, yaw=yaw_truth,
+                dist=dist, heading_err=heading_err,
+                vx_cmd=fwd, wz_cmd=turn, v_actual=0.0,
+            ))
 
         if dist < g._reach_threshold:
             g.scoring.on_reached()

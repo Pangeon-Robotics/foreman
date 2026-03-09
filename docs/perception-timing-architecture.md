@@ -47,7 +47,7 @@ All steps run in the same tick as the scan. The route replan happens on the next
 | `TELEMETRY_INTERVAL` | 50 | 1 Hz prints |
 | `STARTUP_SETTLE_STEPS` | 25 | 0.5s startup |
 | `FALL_CONFIRM_TICKS` | 10 | 0.2s sustained fall |
-| `PATH_HOLD_TICKS` | 250 | 5s path hold (dwa_path_export.py) |
+| `PATH_HOLD_TICKS` | 250 | 5s path hold (path_export.py) |
 | `PATH_WARMUP_TICKS` | 25 | ~1s wait for first TSDF data |
 
 ## Data Flow
@@ -88,7 +88,7 @@ God-view TSDF and costmap exist only for F1 scoring metrics (Surface F1, Cost F1
 | File | Role |
 |------|------|
 | `game_viz.py:tick_perception()` | Orchestrates the scan → TSDF → costmap → critic chain |
-| `dwa_path_export.py:export_path()` | Lazy Theta* routing with constrained clearance |
+| `path_export.py:export_path()` | Lazy Theta* routing with constrained clearance |
 | `navigator_helper.py:tick_walk_heading()` | Checks `_costmap_changed`, triggers replan |
 | `game_config.py` | All timing constants |
 | `perception.py` | PerceptionPipeline (TSDF + costmap building) |

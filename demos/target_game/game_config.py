@@ -82,11 +82,11 @@ class GameStatistics:
         return self.targets_reached / self.targets_spawned
 
 
-def configure_for_robot(robot: str) -> None:
+def configure_for_robot(robot: str) -> str:
     """Set module-level game constants for the given robot.
 
     Only sets game-level constants (fall detection height, wheeled config).
-    Gait parameters are owned by Layer 5.
+    Gait parameters are owned by Layer 5. Returns a status message.
     """
     import sys
     mod = sys.modules[__name__]
@@ -98,9 +98,6 @@ def configure_for_robot(robot: str) -> None:
     if game_mod is not None:
         for name, value in defaults.items():
             setattr(game_mod, name, value)
-    if defaults.get('WHEELED'):
-        print(f"Configured game for {robot} (wheeled): "
-              f"height={defaults['NOMINAL_BODY_HEIGHT']}m")
-    else:
-        print(f"Configured game for {robot}: "
-              f"height={defaults['NOMINAL_BODY_HEIGHT']}m")
+    wheeled = " (wheeled)" if defaults.get('WHEELED') else ""
+    return (f"Configured game for {robot}{wheeled}: "
+            f"height={defaults['NOMINAL_BODY_HEIGHT']}m")

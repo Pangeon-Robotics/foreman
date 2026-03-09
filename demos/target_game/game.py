@@ -29,6 +29,7 @@ from .game_config import (
 )
 from .navigator_helper import Navigator
 from .game_scoring import GameScoring
+from .telemetry import GameTelemetry
 from .game_viz import (
     stream_debug_viewer, write_god_view_path,
     tick_perception, tick_slam_trails,
@@ -103,7 +104,6 @@ class TargetGame:
         self._scene_xml_path: str | None = None
         self._cached_occ: dict | None = None
         self._occ_compute_step: int = -999
-        self._current_waypoint = None  # DEPRECATED — navigation uses _committed_path
         self._committed_path = None
         self._committed_path_step = 0
         self._costmap_changed = False
@@ -115,6 +115,9 @@ class TargetGame:
 
         # L5 MotionCommand class — resolved lazily to avoid config collision
         self._MotionCommand = None
+
+        # --- Telemetry (in-memory, never prints) ---
+        self._gt = GameTelemetry()
 
         # --- Composed helpers ---
         self.nav = Navigator(self)
@@ -147,7 +150,10 @@ class TargetGame:
                     rc = fw._proc.poll()
             except Exception:
                 pass
-            print(f"Simulation stopped unexpectedly (firmware exit={rc})")
+            self._gt.record_event(
+                "sim_stopped", step=self._step_count,
+                t=self._step_count * CONTROL_DT,
+                firmware_exit=rc)
             self._state = GameState.DONE
 
     # --- Pose helpers ---
@@ -276,8 +282,11 @@ class TargetGame:
                 self._stats.falls += 1
                 self._fall_tick_count = 0
                 self._post_fall_settle = 500  # 5s at 100Hz
-                print(f"FALL DETECTED at z={z:.3f}m "
-                      f"(sustained {FALL_CONFIRM_TICKS} ticks)")
+                self._gt.record_event(
+                    "fall", step=self._step_count,
+                    t=self._step_count * CONTROL_DT,
+                    target_index=self._target_index,
+                    z=z, ticks=FALL_CONFIRM_TICKS)
                 self._state = GameState.SPAWN_TARGET
                 return True
         else:

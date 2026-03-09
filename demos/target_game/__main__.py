@@ -34,6 +34,7 @@ from .scene_parser import _find_obstacle_bodies, _find_obstacle_geoms
 class GameRunResult:
     """Result from a single game run, consumed by scenario critics."""
     stats: GameStatistics
+    telemetry: object = None  # GameTelemetry instance
     telemetry_path: Path | None = None
     slam_trail: list[tuple[float, float]] = field(default_factory=list)
     truth_trail: list[tuple[float, float]] = field(default_factory=list)
@@ -119,10 +120,7 @@ def run_game(args) -> GameRunResult:
     _cleanup_stale_data(getattr(args, 'domain', None))
 
     print(f"Starting target game: robot={args.robot}, targets={args.targets}")
-    configure_for_robot(args.robot)
-
-    if getattr(args, 'genome', None):
-        print(f"Warning: --genome is deprecated (gait params owned by Layer 5, ignored)")
+    print(configure_for_robot(args.robot))
 
     patch_layer_configs(args.robot, Path(_root))
 
@@ -224,6 +222,24 @@ def run_game(args) -> GameRunResult:
             from .path_critic import PathCritic
             game.set_path_critic(PathCritic(robot=args.robot, robot_radius=0.35))
 
+        # Live tick output: fitness components per second
+        def _print_tick(s):
+            W = (4.0, 2.0, 2.0, 1.5, 1.0)  # stride, stab, grip, speed, turn
+            total = 10.5
+            weighted = (W[0]*s.stride_elegance + W[1]*s.stability +
+                        W[2]*s.grip + W[3]*s.speed + W[4]*s.turn)
+            fitness = 100.0 * weighted / total
+            # Get step_length from L5 telemetry for raw display
+            _lt = game._sim.telemetry if hasattr(game._sim, 'telemetry') else None
+            _sl = f"{_lt.step_length:.2f}m" if _lt else "?"
+            print(f"  [{s.t:5.1f}s] T{s.target_index}/{s.num_targets} "
+                  f"fit={fitness:4.1f}  "
+                  f"stride={_sl}({s.stride_elegance:.2f}) stab={s.stability:.2f} "
+                  f"grip={s.grip:.2f} speed={s.speed:.2f} turn={s.turn:.2f}  "
+                  f"d={s.dist:.1f}m v={s.v_actual:.2f}m/s",
+                  flush=True)
+        game._gt.tick_callback = _print_tick
+
         stats = game.run()
         ato = game._path_critic.aggregate_ato() if game._path_critic else None
 
@@ -231,7 +247,7 @@ def run_game(args) -> GameRunResult:
         scores = compute_scores(game, perception, args)
 
         return GameRunResult(
-            stats=stats, telemetry_path=telem_path,
+            stats=stats, telemetry=game._gt, telemetry_path=telem_path,
             slam_trail=list(game.slam_trail),
             truth_trail=list(game.truth_trail),
             perception_stats=perception.stats if perception is not None else None,
@@ -250,8 +266,6 @@ def main():
     parser.add_argument("--targets", type=int, default=5)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--genome", type=str, default=None,
-                        help="DEPRECATED: gait params now owned by Layer 5")
     parser.add_argument("--full-circle", action="store_true",
                         help="Spawn targets at any angle (uniform -pi to pi)")
     parser.add_argument("--domain", type=int, default=None,
@@ -265,9 +279,29 @@ def main():
     args = parser.parse_args()
 
     result = run_game(args)
+    gt = result.telemetry
 
     print(f"\nFinal: {result.stats.targets_reached}/{result.stats.targets_spawned} "
           f"reached ({result.stats.success_rate:.0%})")
+
+    # Per-target events
+    for ev in gt.events_of("reached"):
+        d = ev.data
+        ato_str = f"  ATO={d['ato']:.1f}" if d.get('ato') is not None else ""
+        print(f"  Target {ev.target_index}: reached in {ev.t:.1f}s{ato_str}")
+    for ev in gt.events_of("timeout"):
+        print(f"  Target {ev.target_index}: TIMEOUT")
+    for ev in gt.events_of("fall"):
+        print(f"  FALL at step {ev.step}")
+
+    # ATO summary
+    s = gt.summary
+    if "ato" in s:
+        ato = s["ato"]
+        print(f"\nATO: {ato.get('agg_ato', 0):.1f}  "
+              f"(path={ato.get('agg_path_efficiency', 0):.2f}  "
+              f"speed={ato.get('agg_speed', 0):.2f} m/s  "
+              f"slip={ato.get('agg_slip', 0):.2f})")
 
     if result.perception_stats is not None:
         ps = result.perception_stats

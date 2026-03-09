@@ -212,56 +212,35 @@ class PathCritic:
             "n_samples": len(path),
         }
 
-    def print_summary(self) -> None:
-        """Print per-target and aggregate ATO fitness summary."""
+    def get_reports(self) -> dict:
+        """Return per-target reports and aggregate ATO stats."""
         if not self._reports:
-            print("\n=== ATO FITNESS: no targets reached ===")
-            return
+            return {"reports": [], "v_ref": self._v_ref}
 
-        print(f"\n=== ATO FITNESS (V_ref={self._v_ref:.2f} m/s) ===")
-        print(f" {'#':>2}  {'A*_dist':>7}  {'time':>6}    {'ATO':>4}  {'path':>5}  "
-              f"{'v_avg':>5}  {'slip':>5}  {'regress':>7}  {'stall':>6}")
-        print("-" * 76)
-
-        total_astar = 0.0
-        total_actual = 0.0
-        total_commanded = 0.0
-        total_time = 0.0
-        total_regression = 0.0
-        total_stall = 0.0
-
-        for i, r in enumerate(self._reports, 1):
-            a_dist = r["astar_dist"]
-            t = r["total_time"]
-            ato = r["ato_score"]
-            pe = r["path_efficiency"]
-            v = r["avg_speed"]
-            slip = r.get("slip_efficiency", 1.0)
-            reg = r["regression"]
-            stall = r["stall_time"]
-            timeout = r["timed_out"]
-
-            total_astar += a_dist
-            total_actual += r["actual_dist"]
-            total_commanded += r.get("commanded_dist", r["actual_dist"])
-            total_time += t
-            total_regression += reg
-            total_stall += stall
-
-            suffix = "  TIMEOUT" if timeout else ""
-            print(f" {i:>2}  {a_dist:>6.1f}m  {t:>5.1f}s  {ato:>5.1f}  {pe:>4.0%}  "
-                  f"{v:>5.2f}  {slip:>4.0%}  {reg:>6.1f}m  {stall:>5.1f}s{suffix}")
+        total_astar = sum(r["astar_dist"] for r in self._reports)
+        total_actual = sum(r["actual_dist"] for r in self._reports)
+        total_commanded = sum(r.get("commanded_dist", r["actual_dist"]) for r in self._reports)
+        total_time = sum(r["total_time"] for r in self._reports)
+        total_regression = sum(r["regression"] for r in self._reports)
+        total_stall = sum(r["stall_time"] for r in self._reports)
 
         agg_ato = sum(r["ato_score"] for r in self._reports) / len(self._reports)
-        agg_pe = total_astar / max(total_actual, 0.01)
-        agg_pe = min(agg_pe, 1.0)
+        agg_pe = min(1.0, total_astar / max(total_actual, 0.01))
         agg_speed = total_actual / max(total_time, 0.01)
         agg_slip = min(1.0, total_actual / max(total_commanded, 0.01))
 
-        print("-" * 76)
-        print(f"     {total_astar:>6.1f}m  {total_time:>5.1f}s  {agg_ato:>5.1f}  {agg_pe:>4.0%}  "
-              f"{agg_speed:>5.2f}  {agg_slip:>4.0%}  {total_regression:>6.1f}m  "
-              f"{total_stall:>5.1f}s")
+        return {
+            "reports": list(self._reports),
+            "v_ref": self._v_ref,
+            "agg_ato": agg_ato,
+            "agg_path_efficiency": agg_pe,
+            "agg_speed": agg_speed,
+            "agg_slip": agg_slip,
+            "total_astar": total_astar,
+            "total_time": total_time,
+            "total_regression": total_regression,
+            "total_stall": total_stall,
+        }
 
     def running_ato(self) -> tuple[float, float, float, float, float]:
         """Return running ATO estimate for the current (in-progress) target."""
@@ -337,7 +316,7 @@ class PathCritic:
             return_path, force_passable, cost_weight,
             getattr(self, '_cost_truncation', 0.5))
 
-    # Alias: game_astar.py and dwa_path_export.py call this by name
+    # Alias: game_astar.py and path_export.py call this by name
     _astar_on_cost_grid = _astar_core
 
     @staticmethod

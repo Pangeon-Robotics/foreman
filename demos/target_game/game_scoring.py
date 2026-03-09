@@ -3,6 +3,8 @@
 Provides GameScoring with state machine lifecycle methods (startup, spawn,
 reached, timeout), the main run() loop, and post-game analysis (SLAM drift,
 pitch/roll dynamics).
+
+All output goes to GameTelemetry — this module never prints.
 """
 from __future__ import annotations
 
@@ -31,21 +33,18 @@ class GameScoring:
             roll_deg = abs(math.degrees(roll))
             if (z < C.NOMINAL_BODY_HEIGHT * C.FALL_THRESHOLD
                     or roll_deg > 5.0):
-                print(
-                    f"Startup FAILED: z={z:.3f}m  "
-                    f"R={math.degrees(roll):+.1f}\u00b0  "
-                    f"P={math.degrees(pitch):+.1f}\u00b0  "
-                    f"(fell or unstable settle)")
+                g._gt.record_event(
+                    "startup_fail", step=g._step_count,
+                    t=g._step_count * C.CONTROL_DT,
+                    z=z, roll=math.degrees(roll), pitch=math.degrees(pitch))
                 g._stats.falls += 1
                 g._state = C.GameState.DONE
                 return
-            if C.WHEELED:
-                print(f"Startup complete (wheeled): z={z:.3f}m")
-            else:
-                print(
-                    f"Startup complete: z={z:.3f}m  "
-                    f"R={math.degrees(roll):+.1f}\u00b0  "
-                    f"P={math.degrees(pitch):+.1f}\u00b0")
+            g._gt.record_event(
+                "startup_ok", step=g._step_count,
+                t=g._step_count * C.CONTROL_DT,
+                z=z, roll=math.degrees(roll), pitch=math.degrees(pitch),
+                wheeled=C.WHEELED)
             g._state = C.GameState.SPAWN_TARGET
 
     def tick_spawn(self):
@@ -63,9 +62,9 @@ class GameScoring:
                 if g._post_fall_settle > 0:
                     g._send_motion(behavior='stand')
                     return
-                # Settle expired without recovery — end game to avoid
-                # cascading falls that inflate the fall counter.
-                print("Fall recovery failed after 5s — ending game")
+                g._gt.record_event(
+                    "fall_recovery_fail", step=g._step_count,
+                    t=g._step_count * C.CONTROL_DT)
                 g._state = C.GameState.DONE
                 return
 
@@ -82,7 +81,6 @@ class GameScoring:
         g._target_step_count = 0
         g._reach_threshold = g._reach_threshold_base
         g._min_target_dist = float('inf')
-        g._current_waypoint = None
         g._committed_path = None
         g._committed_path_step = 0
         g._stats.targets_spawned += 1
@@ -99,9 +97,11 @@ class GameScoring:
             g._perception.set_target_position(target.x, target.y)
 
         dist = target.distance_to(nav_x, nav_y)
-        print(
-            f"\n[{g._target_index}/{g._num_targets}] "
-            f"SPAWN ({target.x:.1f},{target.y:.1f}) d={dist:.1f}")
+        g._gt.record_event(
+            "spawn", step=g._step_count,
+            t=g._step_count * C.CONTROL_DT,
+            target_index=g._target_index,
+            x=target.x, y=target.y, dist=dist)
 
         if g._path_critic is not None:
             g._path_critic.set_target(target.x, target.y)
@@ -114,14 +114,18 @@ class GameScoring:
         g = self.game
         t = g._target_step_count * C.CONTROL_DT
         g._stats.targets_reached += 1
-        ato_s = ""
+        ato = None
+        agg_ato = None
         if g._path_critic is not None:
             target = g._spawner.current_target
             report = g._path_critic.target_reached(target.x, target.y)
             if report:
-                agg = g._path_critic.aggregate_ato()
-                ato_s = f" ATO={report['ato_score']:.0f} agg={agg:.0f}"
-        print(f"  REACHED {t:.1f}s{ato_s}")
+                ato = report['ato_score']
+                agg_ato = g._path_critic.aggregate_ato()
+        g._gt.record_event(
+            "reached", step=g._step_count, t=t,
+            target_index=g._target_index,
+            ato=ato, agg_ato=agg_ato)
         g._state = C.GameState.SPAWN_TARGET
 
     def on_timeout(self):
@@ -129,14 +133,15 @@ class GameScoring:
         g = self.game
         t = g._target_step_count * C.CONTROL_DT
         g._stats.targets_timeout += 1
-        ato_s = ""
+        agg_ato = None
         if g._path_critic is not None:
             target = g._spawner.current_target
-            report = g._path_critic.target_timeout(target.x, target.y)
-            if report:
-                agg = g._path_critic.aggregate_ato()
-                ato_s = f" agg={agg:.0f}"
-        print(f"  TIMEOUT {t:.1f}s{ato_s}")
+            g._path_critic.target_timeout(target.x, target.y)
+            agg_ato = g._path_critic.aggregate_ato()
+        g._gt.record_event(
+            "timeout", step=g._step_count, t=t,
+            target_index=g._target_index,
+            agg_ato=agg_ato)
         g._state = C.GameState.SPAWN_TARGET
 
     def run(self) -> C.GameStatistics:
@@ -160,93 +165,61 @@ class GameScoring:
             os.unlink(g._PATH_VIZ_FILE)
         except OSError:
             pass
-        self.print_summary()
-        if g._path_critic is not None:
-            g._path_critic.print_summary()
+        self._build_summary()
         return g._stats
 
-    def print_summary(self):
-        """Print end-of-game summary."""
+    def _build_summary(self):
+        """Build end-of-game summary into telemetry."""
         g = self.game
         s = g._stats
-        print("\n=== GAME OVER ===")
-        print(f"Targets: {s.targets_reached}/{s.targets_spawned} reached "
-              f"({s.success_rate:.0%})")
-        print(f"Timeouts: {s.targets_timeout}  Falls: {s.falls}")
-        print(f"Total time: {s.total_time:.1f}s")
-        self._print_slam_analysis()
-        self._print_rp_analysis()
+        g._gt.summary["targets_reached"] = s.targets_reached
+        g._gt.summary["targets_spawned"] = s.targets_spawned
+        g._gt.summary["success_rate"] = s.success_rate
+        g._gt.summary["targets_timeout"] = s.targets_timeout
+        g._gt.summary["falls"] = s.falls
+        g._gt.summary["total_time"] = s.total_time
 
-    def _print_slam_analysis(self):
-        """Print SLAM drift analysis if odometry was active."""
-        g = self.game
-        if g._odometry is None or not g._truth_trail:
-            return
-        drifts = [
-            math.sqrt((s[0] - t[0])**2 + (s[1] - t[1])**2)
-            for s, t in zip(g._slam_trail, g._truth_trail)
-        ]
-        if not drifts:
-            return
-        print("\n=== SLAM DRIFT ANALYSIS ===")
-        print(f"Samples: {len(drifts)} "
-              f"({len(drifts) * 0.1:.1f}s at 10Hz)")
-        print(f"Drift: min={min(drifts):.3f}m  "
-              f"max={max(drifts):.3f}m  "
-              f"mean={sum(drifts)/len(drifts):.3f}m  "
-              f"final={drifts[-1]:.3f}m")
+        # SLAM drift
+        if g._odometry is not None and g._truth_trail:
+            drifts = [
+                math.sqrt((s_[0] - t_[0])**2 + (s_[1] - t_[1])**2)
+                for s_, t_ in zip(g._slam_trail, g._truth_trail)
+            ]
+            if drifts:
+                g._gt.summary["slam"] = {
+                    "samples": len(drifts),
+                    "min": min(drifts),
+                    "max": max(drifts),
+                    "mean": sum(drifts) / len(drifts),
+                    "final": drifts[-1],
+                }
 
-    def _print_rp_analysis(self):
-        """Print pitch/roll dynamics analysis."""
-        g = self.game
-        if not g._rp_log:
-            return
-        rolls = [r[1] for r in g._rp_log]
-        pitches = [r[2] for r in g._rp_log]
-        drolls = [r[3] for r in g._rp_log]
-        dpitches = [r[4] for r in g._rp_log]
+        # Roll/pitch analysis
+        if g._rp_log:
+            rolls = [r[1] for r in g._rp_log]
+            pitches = [r[2] for r in g._rp_log]
+            drolls = [r[3] for r in g._rp_log]
+            dpitches = [r[4] for r in g._rp_log]
+            g._gt.summary["rp"] = {
+                "samples": len(g._rp_log),
+                "roll_min": min(rolls), "roll_max": max(rolls),
+                "roll_mean": sum(abs(r) for r in rolls) / len(rolls),
+                "pitch_min": min(pitches), "pitch_max": max(pitches),
+                "pitch_mean": sum(abs(p) for p in pitches) / len(pitches),
+                "droll_min": min(drolls), "droll_max": max(drolls),
+                "dpitch_min": min(dpitches), "dpitch_max": max(dpitches),
+            }
+            # Per-mode stats
+            for label, code in [("walk", "W"), ("turn", "T"), ("drive", "D")]:
+                mr = [abs(r[1]) for r in g._rp_log if r[5] == code]
+                mp = [abs(r[2]) for r in g._rp_log if r[5] == code]
+                if mr:
+                    g._gt.summary["rp"][f"{label}_steps"] = len(mr)
+                    g._gt.summary["rp"][f"{label}_avg_roll"] = sum(mr) / len(mr)
+                    g._gt.summary["rp"][f"{label}_avg_pitch"] = sum(mp) / len(mp)
+                    g._gt.summary["rp"][f"{label}_max_roll"] = max(mr)
+                    g._gt.summary["rp"][f"{label}_max_pitch"] = max(mp)
 
-        print("\n=== PITCH/ROLL ANALYSIS ===")
-        print(f"Samples: {len(g._rp_log)} "
-              f"({len(g._rp_log)*C.CONTROL_DT:.1f}s)")
-        print(f"Roll:   min={min(rolls):+.1f}\u00b0  "
-              f"max={max(rolls):+.1f}\u00b0  "
-              f"mean={sum(abs(r) for r in rolls)/len(rolls):.1f}\u00b0")
-        print(f"Pitch:  min={min(pitches):+.1f}\u00b0  "
-              f"max={max(pitches):+.1f}\u00b0  "
-              f"mean="
-              f"{sum(abs(p) for p in pitches)/len(pitches):.1f}\u00b0")
-        print(f"dRoll:  min={min(drolls):+.0f}\u00b0/s  "
-              f"max={max(drolls):+.0f}\u00b0/s")
-        print(f"dPitch: min={min(dpitches):+.0f}\u00b0/s  "
-              f"max={max(dpitches):+.0f}\u00b0/s")
-
-        scored = [(abs(r[1]) + abs(r[2]), i, r)
-                  for i, r in enumerate(g._rp_log)]
-        scored.sort(reverse=True)
-        print("\nTop 10 worst tilt moments (|R|+|P|):")
-        print(f"  {'step':>6}  {'t':>5}  {'R':>7}  {'P':>7}  "
-              f"{'dR':>8}  {'dP':>8}  mode")
-        for _, idx, r in scored[:10]:
-            step, roll, pitch, dr, dp, mode = r
-            t = step * C.CONTROL_DT
-            print(f"  {step:6d}  {t:5.2f}  {roll:+7.1f}  "
-                  f"{pitch:+7.1f}  "
-                  f"{dr:+8.0f}  {dp:+8.0f}  {mode}")
-
-        for label, code in [("WALK", "W"), ("TURN", "T"),
-                            ("DRIVE", "D")]:
-            mode_rolls = [abs(r[1]) for r in g._rp_log
-                          if r[5] == code]
-            mode_pitches = [abs(r[2]) for r in g._rp_log
-                            if r[5] == code]
-            if mode_rolls:
-                print(
-                    f"\n{label} ({len(mode_rolls)} steps):  "
-                    f"avg|R|="
-                    f"{sum(mode_rolls)/len(mode_rolls):.1f}\u00b0  "
-                    f"avg|P|="
-                    f"{sum(mode_pitches)/len(mode_pitches):.1f}"
-                    f"\u00b0  "
-                    f"max|R|={max(mode_rolls):.1f}\u00b0  "
-                    f"max|P|={max(mode_pitches):.1f}\u00b0")
+        # Path critic
+        if g._path_critic is not None:
+            g._gt.summary["ato"] = g._path_critic.get_reports()
