@@ -53,8 +53,9 @@ def setup_perception(args, game, sim, odometry, obstacle_bodies, scene_path):
 
         setup_viewers(args, game, obstacle_bodies, scene_path)
 
-    except Exception:
-        pass
+    except Exception as e:
+        import sys
+        print(f"[game_setup] Perception init failed: {e}", file=sys.stderr)
 
     return perception
 

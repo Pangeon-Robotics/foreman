@@ -298,11 +298,6 @@ class PerceptionPipeline:
         elapsed_ms = (time.monotonic() - t0) * 1000
         self._build_times.append(elapsed_ms)
         self._scan_last_time = time.monotonic()
-        if elapsed_ms > 150:
-            n = len(self._build_times)
-            cg_ms = getattr(self, '_last_cg_ms', 0)
-            astar_ms = getattr(self, '_last_astar_ms', 0)
-            pass  # slow build logged internally (>150ms)
 
     @property
     def costmap_query(self):
