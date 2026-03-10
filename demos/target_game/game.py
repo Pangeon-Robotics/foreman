@@ -166,6 +166,10 @@ class TargetGame:
         the grace period, it's accepted as real (fall recovery, collision).
         """
         body = self._sim.get_body("base")
+        if body is None:
+            if self._cached_pose is not None:
+                return self._cached_pose
+            return (0.0, 0.0, 0.0, 0.465, 0.0, 0.0)  # default standing pose
         self._cached_body = body  # cache for _update_slam
         x = float(body.pos[0])
         y = float(body.pos[1])

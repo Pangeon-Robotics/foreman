@@ -107,6 +107,9 @@ class GameScoring:
             g._path_critic.set_target(target.x, target.y)
             g._path_critic.record(nav_x, nav_y, t=0.0)
 
+        # Write green dot path before walking starts
+        g.nav.write_initial_path()
+
         g._state = C.GameState.WALK_TO_TARGET
 
     def on_reached(self):
@@ -150,7 +153,7 @@ class GameScoring:
         start_time = time.monotonic()
 
         headed = not getattr(g._sim, '_headless', False)
-        _min_tick_dt = C.CONTROL_DT / 2.0 if not headed else C.CONTROL_DT
+        _min_tick_dt = C.CONTROL_DT  # match physics 100Hz rate in all modes
         _next_tick = time.monotonic()
         while g.tick():
             _next_tick += _min_tick_dt

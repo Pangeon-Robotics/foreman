@@ -1,8 +1,7 @@
 """Navigation helper producing MotionCommands for Layer 5.
 
-PD heading law follows the committed route. The route (Lazy Theta*
-on the costmap) is the single source of obstacle avoidance. Navigation
-just follows it as fast as possible.
+Single walking mode: PD heading control steers directly at the target.
+Green dot path is written to /tmp/dwa_best_arc.bin for the MuJoCo viewer.
 
 Wheeled robots use L5's send_wheel_command() for PD leg hold +
 differential wheel torque.
@@ -10,9 +9,9 @@ differential wheel torque.
 from __future__ import annotations
 
 import math
+import struct
 
 from . import game_config as C
-from .path_export import export_path
 from .telemetry import TickSample
 from .utils import normalize_angle as _normalize_angle
 
@@ -22,77 +21,71 @@ try:
 except ImportError:
     SlipDetector = None
 
+_PATH_VIZ_FILE = "/tmp/dwa_best_arc.bin"
 
-def _heading_to_route(path, nav_x, nav_y, nav_yaw, lookahead=1.0):
-    """Compute heading error to a point ~lookahead meters ahead on the path.
 
-    Finds the closest point on the path, then walks forward along the
-    path by lookahead distance to find the steering target. Returns
-    the heading error (desired_heading - nav_yaw), normalized to [-pi, pi].
-    """
-    if path is None or len(path) < 2:
-        return None
-
-    # Find closest point on path
-    best_i, best_d2 = 0, float('inf')
-    for i, (px, py) in enumerate(path):
-        d2 = (px - nav_x) ** 2 + (py - nav_y) ** 2
-        if d2 < best_d2:
-            best_d2 = d2
-            best_i = i
-
-    # Walk forward along path by lookahead distance
-    cumul = 0.0
-    target_pt = path[-1]
-    for i in range(best_i + 1, len(path)):
-        dx = path[i][0] - path[i - 1][0]
-        dy = path[i][1] - path[i - 1][1]
-        cumul += (dx * dx + dy * dy) ** 0.5
-        if cumul >= lookahead:
-            target_pt = path[i]
-            break
-
-    dx = target_pt[0] - nav_x
-    dy = target_pt[1] - nav_y
-    desired_heading = math.atan2(dy, dx)
-    return _normalize_angle(desired_heading - nav_yaw)
+def _write_path_dots(robot_x, robot_y, target_x, target_y, spacing=0.15):
+    """Write a straight-line path from robot to target as green dots."""
+    dx = target_x - robot_x
+    dy = target_y - robot_y
+    dist = math.sqrt(dx * dx + dy * dy)
+    if dist < 0.01:
+        return
+    n = max(2, int(dist / spacing))
+    buf = bytearray(n * 8)
+    for i in range(n):
+        t = i / (n - 1)
+        px = robot_x + dx * t
+        py = robot_y + dy * t
+        struct.pack_into('ff', buf, i * 8, px, py)
+    try:
+        with open(_PATH_VIZ_FILE, 'wb') as f:
+            f.write(buf)
+    except OSError:
+        pass
 
 
 class Navigator:
-    """PD route follower for TargetGame.
+    """PD heading controller for TargetGame.
 
-    WALK mode: PD heading law follows the committed route.
+    Single mode: steer directly at target.
       wz = Kp * heading_err + Kd * d(heading_err)/dt
-      vx = constant (route handles obstacle avoidance)
-
-    TIP mode: ignored for now (placeholder for future).
+      vx = VX_WALK * speed-turn coupling
     """
 
-    # PD heading gains — tuned for B2 at 100Hz
-    KP_HEADING = 3.0    # proportional: catch errors early before they grow
-    KD_HEADING = 0.1    # derivative: low damping, let corrections happen fast
+    # PD heading gains — tuned for dq_ff-enabled turning at 100Hz
+    KP_HEADING = 1.5
+    KD_HEADING = 0.3
 
     # Walk speed
-    VX_WALK = 1.0       # m/s (increase once turn-radius-aware routing is in)
-    WZ_MAX = 1.5        # rad/s — L5 clamps at 1.5
+    VX_WALK = 0.6       # m/s
+    WZ_MAX = 1.0        # rad/s
 
     def __init__(self, game):
         self.game = game
         self._prev_heading_err = 0.0
-        self._in_tip = False
         _masses = {'b2': 83.5, 'go2': 15.0, 'b2w': 83.5, 'go2w': 15.0}
         _robot = getattr(game, '_robot', 'b2')
         self._slip = SlipDetector(mass=_masses.get(_robot, 83.5)) if SlipDetector else None
+
+    def write_initial_path(self):
+        """Write path dots at target spawn time (before walking starts)."""
+        g = self.game
+        target = g._spawner.current_target
+        if target is None:
+            return
+        nav_x, nav_y, _ = g._get_nav_pose()
+        _write_path_dots(nav_x, nav_y, target.x, target.y)
 
     # ------------------------------------------------------------------
     # Main tick — legged robots via L5
     # ------------------------------------------------------------------
 
     def tick_walk_heading(self):
-        """Follow the route using PD heading control.
+        """Steer directly at target using PD heading control.
 
         PD law: wz = Kp * heading_err + Kd * d(heading_err)/dt
-        vx = constant. Route handles obstacle avoidance.
+        vx = VX_WALK * speed-turn coupling.
         Layer 5 handles gait selection, gain scheduling, and L4 dispatch.
         """
         g = self.game
@@ -106,19 +99,9 @@ class Navigator:
         nav_x, nav_y, nav_yaw = g._get_nav_pose()
         dist = target.distance_to(nav_x, nav_y)
 
-        # Event-driven route replan (on costmap change or no path)
-        if g._committed_path is None or getattr(g, '_costmap_changed', False):
-            if g._path_critic is not None:
-                export_path(g, target.x, target.y)
-                g._costmap_changed = False
-
-        # PD heading law: follow the route
-        heading_err = _heading_to_route(
-            g._committed_path, nav_x, nav_y, nav_yaw, lookahead=1.0)
-        if heading_err is None:
-            # No route — steer directly at target
-            heading_err = _normalize_angle(
-                math.atan2(target.y - nav_y, target.x - nav_x) - nav_yaw)
+        # Direct heading to target
+        heading_err = _normalize_angle(
+            math.atan2(target.y - nav_y, target.x - nav_x) - nav_yaw)
 
         # D term: rate of change of heading error (damping)
         heading_err_rate = (heading_err - self._prev_heading_err) / C.CONTROL_DT
@@ -128,9 +111,13 @@ class Navigator:
         wz_raw = self.KP_HEADING * heading_err + self.KD_HEADING * heading_err_rate
         wz = max(-self.WZ_MAX, min(self.WZ_MAX, wz_raw))
 
-        # Speed-turn coupling: slow when turning, min 60% to keep stride differential effective
+        # Speed-turn coupling: slow when turning, min 60% for effective stride
         alignment = max(0.0, math.cos(heading_err))
-        vx = self.VX_WALK * (0.3 + 0.7 * alignment)
+        vx = self.VX_WALK * (0.6 + 0.4 * alignment)
+
+        # Update path dots every 50 ticks (0.5s)
+        if g._target_step_count % 50 == 0:
+            _write_path_dots(nav_x, nav_y, target.x, target.y)
 
         # Path critic: record position at 10Hz
         if (g._path_critic is not None
