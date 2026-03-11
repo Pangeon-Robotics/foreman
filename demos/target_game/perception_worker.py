@@ -12,7 +12,6 @@ from __future__ import annotations
 import multiprocessing
 import os
 import struct
-import tempfile
 import time
 
 import numpy as np

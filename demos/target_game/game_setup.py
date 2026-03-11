@@ -37,7 +37,7 @@ def setup_perception(args, game, sim, odometry, obstacle_bodies, scene_path):
             "_l12_messages", str(root / "layers_1_2" / "messages.py"))
         PoseEstimate_ = _l12_msgs.PoseEstimate_
         PointCloud_ = _l12_msgs.PointCloud_
-        from dds import dds_init, stamp_cmd
+        from dds import dds_init
         dds_domain = domain if domain is not None else 1
         dds_init(domain_id=dds_domain, interface="lo")
 

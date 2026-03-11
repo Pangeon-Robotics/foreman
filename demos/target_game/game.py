@@ -33,7 +33,6 @@ from .telemetry import GameTelemetry
 from .game_viz import (
     stream_debug_viewer, write_god_view_path,
     tick_perception, tick_slam_trails,
-    get_occ_str as _get_occ_str_fn, gt_clearance as _gt_clearance_fn,
 )
 from .target import TargetSpawner
 from .utils import quat_to_yaw as _quat_to_yaw, quat_to_rpy as _quat_to_rpy
@@ -86,7 +85,6 @@ class TargetGame:
         self._path_critic = None
         self._fall_tick_count = 0
         self._post_fall_settle = 0
-        self._min_target_dist = float('inf')
         self._spawner = TargetSpawner(
             min_distance=min_dist, max_distance=max_dist,
             reach_threshold=reach_threshold, seed=seed)
@@ -102,11 +100,8 @@ class TargetGame:
         self._god_view_tsdf = None
         self._obstacle_bodies: list[str] = []
         self._scene_xml_path: str | None = None
-        self._cached_occ: dict | None = None
-        self._occ_compute_step: int = -999
-        self._committed_path = None
-        self._committed_path_step = 0
         self._costmap_changed = False
+        self._nav_prev_pos = None
         self._rp_log = []
         self._cached_pose: (
             tuple[float, float, float, float, float, float] | None
@@ -251,12 +246,6 @@ class TargetGame:
             x=p.x, y=p.y, yaw=p.yaw, timestamp=p.stamp, crc=0)
         self._pose_stamp(msg)
         self._pose_pub.Write(msg)
-
-    def _get_occ_str(self) -> str:
-        return _get_occ_str_fn(self)
-
-    def _gt_clearance(self) -> float:
-        return _gt_clearance_fn(self)
 
     def _get_nav_pose(self) -> tuple[float, float, float]:
         """Return (x, y, yaw) for navigation -- ground truth.

@@ -13,7 +13,7 @@ import struct
 
 from . import game_config as C
 from .telemetry import TickSample
-from .utils import normalize_angle as _normalize_angle
+from .utils import normalize_angle as _normalize_angle, clamp as _clamp
 
 # Slip detection (Layer 5 module, hardware-compatible)
 try:
@@ -262,10 +262,9 @@ class Navigator:
 
         if g._target_step_count % C.TELEMETRY_INTERVAL == 0:
             t = g._target_step_count * C.CONTROL_DT
-            _prev = getattr(g, '_nav_prev_pos', None)
-            if _prev is not None:
-                _dx = x_truth - _prev[0]
-                _dy = y_truth - _prev[1]
+            if g._nav_prev_pos is not None:
+                _dx = x_truth - g._nav_prev_pos[0]
+                _dy = y_truth - g._nav_prev_pos[1]
                 _v = math.sqrt(_dx*_dx + _dy*_dy) / (C.TELEMETRY_INTERVAL * C.CONTROL_DT)
             else:
                 _v = 0.0
@@ -342,7 +341,6 @@ class Navigator:
         dist_taper = min(1.0, dist / 1.0)
         fwd = C.WHEEL_FWD_TORQUE * alignment * dist_taper
 
-        from .utils import clamp as _clamp
         turn = _clamp(C.WHEEL_KP_YAW * heading_err, -C.WHEEL_MAX_TURN, C.WHEEL_MAX_TURN)
 
         g._sim.send_wheel_command(fwd, turn, dt=C.CONTROL_DT)

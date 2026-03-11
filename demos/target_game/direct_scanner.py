@@ -5,10 +5,6 @@ Casts all 32K rays instantaneously via mj_multiRay from game process.
 """
 from __future__ import annotations
 
-import math
-import threading
-import time
-
 import numpy as np
 
 

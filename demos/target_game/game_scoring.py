@@ -80,9 +80,6 @@ class GameScoring:
         g._target_index += 1
         g._target_step_count = 0
         g._reach_threshold = g._reach_threshold_base
-        g._min_target_dist = float('inf')
-        g._committed_path = None
-        g._committed_path_step = 0
         g._stats.targets_spawned += 1
 
         target_z = min(C.NOMINAL_BODY_HEIGHT, 0.30)

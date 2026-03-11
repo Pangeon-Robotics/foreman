@@ -9,7 +9,6 @@ zero noise.
 """
 from __future__ import annotations
 
-import struct
 
 import mujoco
 import numpy as np
@@ -224,39 +223,6 @@ class GodViewTSDF:
 
     def write_temp_file(self, path: str = "/tmp/god_view_tsdf.bin",
                         display_resolution: float = 0.05) -> None:
-        """Write surface voxels to binary file for MuJoCo renderer.
-
-        Downsamples from internal 1cm voxels to display_resolution (default
-        5cm) to keep the voxel count bounded.  Without this, the renderer's
-        stride-based subsampling creates visual churn as the history set
-        grows across frames.
-
-        Format: u32 n_voxels + f32 voxel_half_size (8 bytes header)
-                N x 3 float32 xyz (12 bytes per voxel)
-        """
-        voxels = self._tsdf.get_surface_voxels(include_history=True)
-        if len(voxels) == 0:
-            buf = bytearray(8)
-            struct.pack_into('<If', buf, 0, 0, 0.0)
-            with open(path, 'wb') as f:
-                f.write(buf)
-            return
-
-        # Snap to display grid and deduplicate for stable rendering.
-        # np.floor (not astype int32) handles negative coords correctly:
-        # -0.03/0.05 = -0.6 → floor -1, not truncate 0.
-        # Use cell centers so each 5cm cube sits exactly on-grid.
-        keys = np.floor(voxels / display_resolution).astype(np.int32)
-        _, idx = np.unique(keys, axis=0, return_index=True)
-        voxels = (keys[idx] + 0.5) * display_resolution
-
-        n = len(voxels)
-        half = display_resolution / 2.0
-
-        buf = bytearray(8 + n * 12)
-        struct.pack_into('<If', buf, 0, n, half)
-        voxels_f32 = voxels.astype(np.float32)
-        buf[8:] = voxels_f32.tobytes()
-
-        with open(path, 'wb') as f:
-            f.write(buf)
+        """Write surface voxels to binary file for MuJoCo renderer."""
+        from .game_viz import write_tsdf_binary
+        write_tsdf_binary(self._tsdf, path, display_resolution)

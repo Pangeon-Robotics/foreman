@@ -117,28 +117,3 @@ def build_cost_grids(pipeline, tsdf, imu_x: float,
         'nx': out_nx, 'ny': out_ny,
         'truncation': truncation,
     }
-
-
-def clear_local_tsdf(pipeline) -> None:
-    """Clear TSDF voxels near robot (contradicting evidence).
-
-    The robot's presence at a location is evidence that the space
-    is traversable.  Clears log_odds and obs_count in all TSDF
-    chunks within 2.5m, then forces one feasible DWA arc.
-    """
-    tsdf = pipeline._tsdf
-    with pipeline._imu_lock:
-        rx, ry = pipeline._imu_x, pipeline._imu_y
-    cs = 16 * tsdf.voxel_size  # chunk side in meters
-    r2 = 2.5 * 2.5
-    for key, chunk in list(tsdf._chunks.items()):
-        cx, cy, cz = key
-        chunk_wx = (cx + 0.5) * cs + tsdf.origin_x
-        chunk_wy = (cy + 0.5) * cs + tsdf.origin_y
-        if (chunk_wx - rx)**2 + (chunk_wy - ry)**2 <= r2:
-            chunk.log_odds[:] = 0.0
-            chunk.obs_count[:] = 0
-            chunk.dirty = True
-            tsdf._occ_chunk_dirty.add(key)
-    tsdf._dirty = True
-    pipeline._force_feasible = True

@@ -8,25 +8,25 @@ from __future__ import annotations
 
 import struct
 
+import numpy as np
+
 ROBOT_TSDF_FILE = "/tmp/robot_view_tsdf.bin"
 ROBOT_COSTMAP_FILE = "/tmp/robot_view_costmap.bin"
 
 
-def write_robot_tsdf_file(tsdf, display_resolution: float = 0.05) -> None:
-    """Write robot-view TSDF surface voxels to temp file for MuJoCo viewer.
+def write_tsdf_binary(tsdf, path: str, display_resolution: float = 0.05) -> None:
+    """Write TSDF surface voxels to binary file for MuJoCo renderer.
 
-    Same binary format as god-view: u32 n + f32 half, then N x 3 float32 xyz.
+    Format: u32 n_voxels + f32 voxel_half_size (8 bytes header)
+            N x 3 float32 xyz (12 bytes per voxel)
     Downsamples to display_resolution for bounded voxel count.
     """
-    import struct
-    import numpy as np
-
     voxels = tsdf.get_surface_voxels(include_history=True)
     if len(voxels) == 0:
         buf = bytearray(8)
         struct.pack_into('<If', buf, 0, 0, 0.0)
         try:
-            with open(ROBOT_TSDF_FILE, 'wb') as f:
+            with open(path, 'wb') as f:
                 f.write(buf)
         except OSError:
             pass
@@ -43,10 +43,15 @@ def write_robot_tsdf_file(tsdf, display_resolution: float = 0.05) -> None:
     buf[8:] = voxels.astype(np.float32).tobytes()
 
     try:
-        with open(ROBOT_TSDF_FILE, 'wb') as f:
+        with open(path, 'wb') as f:
             f.write(buf)
     except OSError:
         pass
+
+
+def write_robot_tsdf_file(tsdf, display_resolution: float = 0.05) -> None:
+    """Write robot-view TSDF surface voxels to temp file for MuJoCo viewer."""
+    write_tsdf_binary(tsdf, ROBOT_TSDF_FILE, display_resolution)
 
 
 def write_robot_costmap_file(tsdf, display_resolution: float = 0.05,
@@ -63,8 +68,6 @@ def write_robot_costmap_file(tsdf, display_resolution: float = 0.05,
     Header: u16 rows, u16 cols, f32 origin_x, f32 origin_y, f32 voxel_size
     Body: rows * cols uint8
     """
-    import struct
-    import numpy as np
     from scipy.ndimage import distance_transform_edt
 
     voxels = tsdf.get_surface_voxels(include_history=True)
@@ -128,7 +131,6 @@ def stream_debug_viewer(game) -> None:
 
     if game._step_count % 10 == 0:
         x, y, yaw, z, roll, pitch = game._get_robot_pose()
-        slam_x, slam_y, slam_yaw = x, y, yaw
         target = game._spawner.current_target
         tx = target.x if target else 0.0
         ty = target.y if target else 0.0
@@ -139,12 +141,12 @@ def stream_debug_viewer(game) -> None:
         except Exception:
             pass
         game._debug_server.send_robot_state(
-            slam_x, slam_y, slam_yaw, z, roll, pitch,
+            x, y, yaw, z, roll, pitch,
             joints, tx, ty,
             game._state.value,
             0.0, 0.0, 0,
             0.0, 0.0,
-            getattr(game, '_heading_in_tip', False),
+            False,  # heading_in_tip (unused)
         )
 
     if game._step_count % 25 == 0 and game._perception is not None:
@@ -239,63 +241,6 @@ def tick_perception(game) -> None:
                 meta['voxel_size'],
                 truncation=meta.get('truncation', 0.5))
             game._costmap_changed = True
-
-
-def get_occ_str(game) -> str:
-    """Return formatted occupancy accuracy string, recomputing every 2000 ticks."""
-    if game._scene_xml_path is None or game._perception is None:
-        return ""
-    if game._step_count - game._occ_compute_step >= 2000:  # 20s at 100Hz
-        try:
-            from .test_occupancy import compute_3ds_v2, compute_3ds_god
-            tsdf = game._perception._tsdf
-            if tsdf is not None:
-                game._cached_occ = compute_3ds_v2(
-                    tsdf, game._scene_xml_path)
-                # Z-filter GT for completeness: exclude surfaces
-                # below LiDAR min detection height
-                _lidar_min_z = getattr(
-                    game._perception, '_MIN_WORLD_Z', 0.05)
-                _tsdf_z_hi = getattr(
-                    game._perception._cfg, 'costmap_z_hi', 0.80)
-                game._cached_occ['god'] = compute_3ds_god(
-                    tsdf, game._scene_xml_path,
-                    gt_z_range=(_lidar_min_z, _tsdf_z_hi))
-                game._occ_compute_step = game._step_count
-        except Exception:
-            pass
-    if game._cached_occ is not None:
-        o = game._cached_occ
-        adh = o['adherence_mm']
-        cpl = o['completeness_pct']
-        phn = o['phantom_pct']
-        parts = f" 3DS: adh={adh:.1f}mm cpl={cpl:.1f}% phn={phn:.1f}%"
-        god = o.get('god')
-        if god is not None:
-            parts += f" god={god['score']:.0f}"
-        return parts
-    return ""
-
-
-def gt_clearance(game) -> float:
-    """Minimum ground-truth distance from robot surface to nearest obstacle."""
-    import math
-    if not game._obstacle_bodies:
-        return float('inf')
-    robot = game._sim.get_body("base")
-    if robot is None:
-        return float('inf')
-    rx, ry = float(robot.pos[0]), float(robot.pos[1])
-    min_d = float('inf')
-    for name in game._obstacle_bodies:
-        obs = game._sim.get_body(name)
-        if obs is None:
-            continue
-        d = math.sqrt(
-            (rx - float(obs.pos[0]))**2 + (ry - float(obs.pos[1]))**2)
-        if d < min_d:
-            min_d = d
-    return max(0.0, min_d - 0.60)
 
 
 def tick_slam_trails(game) -> None:
