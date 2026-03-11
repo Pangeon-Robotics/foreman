@@ -77,7 +77,7 @@ class Navigator:
 
     # Walk speed — v18 champion achieved 2.77 m/s at these settings
     VX_WALK = 2.0       # m/s — cruise speed far from target, heading aligned
-    _APPROACH_DIST = 2.0  # m — distance taper zone for final approach deceleration
+    _APPROACH_DIST = 4.0  # m — distance taper zone for final approach deceleration
 
     # Stride-differential safety: limit wz so absolute stride diff stays bounded.
     # Combined with WZ_ABS_MAX to prevent excessive wz at low stride.
@@ -94,6 +94,13 @@ class Navigator:
     _WP_REACH = 0.5  # meters
     # Replan if robot drifts this far from the committed route
     _REPLAN_DRIFT = 1.5  # meters
+
+    # Route commitment timing (per-target):
+    # 0–0.5s: costmaps building from perception TSDF (no route yet)
+    # 0.5–1.0s: router may replan on each costmap update
+    # >1.0s: route locked — only replan if path crosses a new cost area
+    _ROUTE_EXPLORE_S = 1.0  # seconds of free replanning after target spawn
+    _PATH_COST_THRESHOLD = 200  # cost cell value that triggers replan (near-lethal)
 
     def __init__(self, game):
         self.game = game
@@ -141,8 +148,11 @@ class Navigator:
     def _get_steer_target(self, nav_x, nav_y, target_x, target_y):
         """Get the point to steer toward from the committed route.
 
-        Advances waypoint index when robot reaches current waypoint.
-        Replans only if robot drifts too far from the route.
+        Route commitment protocol:
+        - First _ROUTE_EXPLORE_S seconds: replan freely on costmap updates
+        - After that: route is locked, only replan if the remaining path
+          crosses a newly-discovered cost area (obstacle)
+
         Returns (steer_x, steer_y).
         """
         if self._committed_path is None or len(self._committed_path) < 2:
@@ -157,14 +167,24 @@ class Navigator:
             else:
                 break
 
-        # Replan when costmap updates (new obstacle data from perception)
         g = self.game
-        if getattr(g, '_costmap_changed', False):
-            g._costmap_changed = False
-            self._commit_route(nav_x, nav_y, target_x, target_y)
-            return self._committed_path[self._wp_index] if self._wp_index < len(self._committed_path) else (target_x, target_y)
+        t_target = g._target_step_count * C.CONTROL_DT
 
-        # Check drift from nearest segment
+        # Consume the costmap-changed flag regardless of phase
+        costmap_updated = getattr(g, '_costmap_changed', False)
+        if costmap_updated:
+            g._costmap_changed = False
+
+        if t_target < self._ROUTE_EXPLORE_S:
+            # Exploration phase: replan on every costmap update
+            if costmap_updated:
+                self._commit_route(nav_x, nav_y, target_x, target_y)
+        else:
+            # Locked phase: only replan if remaining path hits a cost area
+            if costmap_updated and self._path_crosses_cost(g):
+                self._commit_route(nav_x, nav_y, target_x, target_y)
+
+        # Also replan if robot drifts far from the route (any phase)
         drift = self._dist_to_path(nav_x, nav_y)
         if drift > self._REPLAN_DRIFT:
             self._commit_route(nav_x, nav_y, target_x, target_y)
@@ -173,6 +193,32 @@ class Navigator:
         if self._wp_index < len(self._committed_path):
             return self._committed_path[self._wp_index]
         return target_x, target_y
+
+    def _path_crosses_cost(self, g) -> bool:
+        """Check if the remaining committed path crosses high-cost cells."""
+        critic = g._path_critic
+        if critic is None or getattr(critic, '_cost_grid', None) is None:
+            return False
+        path = self._committed_path
+        if path is None or self._wp_index >= len(path):
+            return False
+
+        grid = critic._cost_grid
+        ox = critic._cost_origin_x
+        oy = critic._cost_origin_y
+        vs = critic._cost_voxel_size
+        nx, ny = grid.shape
+        threshold = self._PATH_COST_THRESHOLD
+
+        # Sample remaining waypoints — check every other point for speed
+        for i in range(self._wp_index, len(path), 2):
+            wx, wy = path[i]
+            gx = int((wx - ox) / vs)
+            gy = int((wy - oy) / vs)
+            if 0 <= gx < nx and 0 <= gy < ny:
+                if grid[gx, gy] >= threshold:
+                    return True
+        return False
 
     def _dist_to_path(self, x, y):
         """Minimum distance from (x,y) to the committed path polyline."""
