@@ -213,8 +213,9 @@ def tick_perception(game) -> None:
 
     God-view TSDF (if enabled) runs on same schedule for F1 scoring.
     """
-    # LiDAR scan at ~4Hz (every 25 ticks = 0.25s at 100Hz)
-    if game._step_count % 25 == 0:
+    # LiDAR scan rate: default 4Hz (25 ticks), configurable for GIL management
+    _interval = getattr(game, '_perception_interval', 25)
+    if game._step_count % _interval == 0:
         _gt_x, _gt_y, _gt_yaw, _gt_z, _gt_roll, _gt_pitch = game._get_robot_pose()
 
         # God-view TSDF (for F1 scoring only, not used for navigation)

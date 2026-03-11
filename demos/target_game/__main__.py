@@ -150,6 +150,15 @@ def _replay_perception(game, perception):
             x, y = trail[i]
             game._god_view_tsdf.update(x, y, _yaw_at(i), 0.645)
 
+    # Write viewer temp files so headed viewer shows TSDFs after game ends
+    if not game._headless:
+        if perception._tsdf is not None:
+            from .game_viz import write_robot_tsdf_file, write_robot_costmap_file
+            write_robot_tsdf_file(perception._tsdf)
+            write_robot_costmap_file(perception._tsdf)
+        if game._god_view_tsdf is not None:
+            game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
+
 
 def run_game(args) -> GameRunResult:
     """Run target game with given configuration. Returns structured result."""
@@ -254,12 +263,14 @@ def run_game(args) -> GameRunResult:
         perception = setup_perception(args, game, sim, odometry,
                                       obstacle_bodies, scene_path)
 
-        # Defer live perception scans to avoid GIL contention with control loop.
-        # DirectScanner mj_multiRay blocks GIL for 100-300ms, starving DDS.
-        # Scans are replayed after game ends for F1 scoring.
-        # In headed mode, keep live scans so TSDFs are visible in the viewer.
-        if slam and perception is not None and args.headless:
-            game._defer_perception = True
+        # Defer live perception in headless mode (no viewer needs TSDF).
+        # In headed mode, use reduced scan rate (1Hz vs 4Hz) so TSDFs are
+        # visible but GIL contention is manageable.
+        if slam and perception is not None:
+            if args.headless:
+                game._defer_perception = True
+            else:
+                game._perception_interval = 100  # 1Hz instead of 4Hz
 
         if game._path_critic is None:
             from .path_critic import PathCritic
