@@ -257,7 +257,8 @@ def run_game(args) -> GameRunResult:
         # Defer live perception scans to avoid GIL contention with control loop.
         # DirectScanner mj_multiRay blocks GIL for 100-300ms, starving DDS.
         # Scans are replayed after game ends for F1 scoring.
-        if slam and perception is not None:
+        # In headed mode, keep live scans so TSDFs are visible in the viewer.
+        if slam and perception is not None and args.headless:
             game._defer_perception = True
 
         if game._path_critic is None:
