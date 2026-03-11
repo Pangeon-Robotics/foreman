@@ -115,6 +115,42 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
                 pass
 
 
+def _replay_perception(game, perception):
+    """Replay DirectScanner + god-view TSDF along truth trail after game ends.
+
+    Runs scans without GIL contention since the control loop is no longer active.
+    Produces TSDF data needed for F1 scoring metrics.
+    """
+    import math
+    trail = list(game.truth_trail)
+    if len(trail) < 2:
+        return
+
+    def _yaw_at(i):
+        """Estimate yaw from consecutive trail points."""
+        j = min(i + 1, len(trail) - 1)
+        if j == i:
+            j = max(i - 1, 0)
+        dx = trail[j][0] - trail[i][0]
+        dy = trail[j][1] - trail[i][1]
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return 0.0
+        return math.atan2(dy, dx)
+
+    # Replay robot-view scans every 10th trail point
+    if getattr(perception, '_direct_ready', False):
+        for i in range(0, len(trail), 10):
+            x, y = trail[i]
+            perception.direct_scan_only(x, y, 0.645, _yaw_at(i), roll=0.0, pitch=0.0)
+        perception.build_cost_grids_from_main()
+
+    # Replay god-view TSDF every 5th trail point
+    if game._god_view_tsdf is not None:
+        for i in range(0, len(trail), 5):
+            x, y = trail[i]
+            game._god_view_tsdf.update(x, y, _yaw_at(i), 0.645)
+
+
 def run_game(args) -> GameRunResult:
     """Run target game with given configuration. Returns structured result."""
     _cleanup_stale_data(getattr(args, 'domain', None))
@@ -218,6 +254,12 @@ def run_game(args) -> GameRunResult:
         perception = setup_perception(args, game, sim, odometry,
                                       obstacle_bodies, scene_path)
 
+        # Defer live perception scans to avoid GIL contention with control loop.
+        # DirectScanner mj_multiRay blocks GIL for 100-300ms, starving DDS.
+        # Scans are replayed after game ends for F1 scoring.
+        if slam and perception is not None:
+            game._defer_perception = True
+
         if game._path_critic is None:
             from .path_critic import PathCritic
             game.set_path_critic(PathCritic(robot=args.robot, robot_radius=0.35))
@@ -242,6 +284,10 @@ def run_game(args) -> GameRunResult:
 
         stats = game.run()
         ato = game._path_critic.aggregate_ato() if game._path_critic else None
+
+        # Deferred perception: replay scans along truth trail for F1 scoring
+        if getattr(game, '_defer_perception', False) and perception is not None:
+            _replay_perception(game, perception)
 
         occ_accuracy = compute_occupancy(perception, args, scene_path)
         scores = compute_scores(game, perception, args)

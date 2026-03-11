@@ -218,14 +218,17 @@ def tick_perception(game) -> None:
         _gt_x, _gt_y, _gt_yaw, _gt_z, _gt_roll, _gt_pitch = game._get_robot_pose()
 
         # God-view TSDF (for F1 scoring only, not used for navigation)
-        if game._god_view_tsdf is not None:
+        # Skip when deferred (avoids GIL contention with control loop)
+        if game._god_view_tsdf is not None and not getattr(game, '_defer_perception', False):
             game._god_view_tsdf.update(_gt_x, _gt_y, _gt_yaw, _gt_z)
             if not game._headless:
                 game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
 
         # Robot-view LiDAR scan → TSDF update
+        # Skip live scans when deferred (avoids GIL contention with control loop)
         if (game._perception is not None
-                and getattr(game._perception, '_direct_ready', False)):
+                and getattr(game._perception, '_direct_ready', False)
+                and not getattr(game, '_defer_perception', False)):
             nav_x, nav_y, nav_yaw = game._get_nav_pose()
             game._perception.direct_scan_only(
                 nav_x, nav_y, _gt_z, nav_yaw,
