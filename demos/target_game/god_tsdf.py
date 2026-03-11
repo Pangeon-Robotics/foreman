@@ -180,6 +180,7 @@ class GodViewTSDF:
             bodyexclude=self._exclude_body,
             geomid=self._geomid,
             dist=self._dist,
+            normal=None,
             nray=self._n_rays,
             cutoff=_MAX_RANGE,
         )

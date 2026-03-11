@@ -150,6 +150,7 @@ def _cast_rays(pipeline, x: float, y: float, z: float, yaw: float,
         bodyexclude=pipeline._direct_exclude_body,
         geomid=pipeline._direct_geomid,
         dist=pipeline._direct_dist,
+        normal=None,
         nray=pipeline._direct_n_rays, cutoff=10.0,
     )
 
