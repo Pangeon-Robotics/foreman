@@ -76,20 +76,16 @@ class Navigator:
     KD_HEADING = 0.5
 
     # Walk speed — v18 champion achieved 2.77 m/s at these settings
-    VX_WALK = 2.0       # m/s
-    VX_TURN = 0.5       # m/s — slow walk during turns (small stride = stable diff)
-
-    # Continuous speed/turn blending — avoids abrupt stride transitions
-    # heading_err below BLEND_LO: full speed
-    # heading_err above BLEND_HI: slow speed (turn mode)
-    _BLEND_LO = 0.17   # ~10° — below this, full walk speed
-    _BLEND_HI = 0.52   # ~30° — above this, full turn speed
+    VX_WALK = 2.0       # m/s — cruise speed far from target, heading aligned
+    _APPROACH_DIST = 2.0  # m — distance taper zone for final approach deceleration
 
     # Stride-differential safety: limit wz so absolute stride diff stays bounded.
-    # L4 uses stride_scale = 1 ± wz * 0.5, so max diff = step_length * wz * 0.5.
-    # At 4.37 Hz, keep this under _MAX_STRIDE_DIFF for stability.
-    _MAX_STRIDE_DIFF = 0.06  # m — max per-side stride asymmetry
+    # Combined with WZ_ABS_MAX to prevent excessive wz at low stride.
+    # At full speed (stride=0.42m): wz ≈ 0.48 rad/s (wide arcs)
+    # Near target (stride=0.10m): wz = 1.0 (tight convergence)
+    _MAX_STRIDE_DIFF = 0.10  # m — max per-side stride asymmetry
     _STEP_LENGTH_SCALE = 0.2085  # mirror L5 config for wz limit calc
+    _WZ_ABS_MAX = 1.0   # rad/s — hard cap regardless of stride
 
     # Startup ramp: seconds to reach full VX_WALK (avoids torque spike)
     _VX_RAMP_S = 2.0
@@ -236,41 +232,33 @@ class Navigator:
         # PD law
         wz_raw = self.KP_HEADING * heading_err + self.KD_HEADING * heading_err_rate
 
-        t_walk = g._target_step_count * C.CONTROL_DT
+        # Speed = VX_WALK × dist_factor × heading_factor
+        # Multiplicative coupling: smooth gradients, no feedback oscillation.
+        # - dist_factor: decelerate near target for convergence
+        # - heading_factor: slow when misaligned for turn authority
+        #   cos(err) is flat near 0 → small heading wobbles don't kill speed
+        dist_factor = min(1.0, dist / self._APPROACH_DIST)
+        heading_factor = max(0.25, math.cos(heading_err))
+        vx_target = self.VX_WALK * dist_factor * heading_factor
 
-        # Continuous speed/turn blend based on heading error magnitude
-        # Small heading error → full speed + tiny wz
-        # Large heading error → slow speed + full wz
-        abs_err = abs(heading_err)
-        if abs_err <= self._BLEND_LO:
-            alpha = 0.0
-        elif abs_err >= self._BLEND_HI:
-            alpha = 1.0
-        else:
-            alpha = (abs_err - self._BLEND_LO) / (self._BLEND_HI - self._BLEND_LO)
-
-        vx_target = self.VX_WALK * (1.0 - alpha) + self.VX_TURN * alpha
-
-        # EMA smoothing on vx — prevents abrupt stride changes at target transitions
+        # Asymmetric EMA: smooth stride transitions to prevent gait instability
+        # - Accel: moderate (alpha=0.05, ~1s rise) — prevents stride-up shock
+        # - Decel: faster (alpha=0.10, ~0.5s half) — responsive to turns/approach
         if vx_target < self._vx_ema:
-            ema_alpha = 0.05   # decel: ~1s to halve
+            self._vx_ema += 0.10 * (vx_target - self._vx_ema)
         else:
-            ema_alpha = 0.02   # accel: ~2.5s to reach full
-        self._vx_ema += ema_alpha * (vx_target - self._vx_ema)
+            self._vx_ema += 0.05 * (vx_target - self._vx_ema)
         vx = self._vx_ema
 
-        # Stride-differential-safe wz: limit so absolute diff stays bounded
-        # At current vx, step_length ≈ vx * _STEP_LENGTH_SCALE
-        # Stride diff = step_length * wz * 0.5 (L4 factor)
-        sl_est = max(vx * self._STEP_LENGTH_SCALE, 0.02)
-        wz_safe = self._MAX_STRIDE_DIFF / (sl_est * 0.5)
-        wz = _clamp(wz_raw, -wz_safe, wz_safe)
-
         # Startup ramp: avoid torque spike from instant full stride at 4.37 Hz
-        # Uses global step count — ramp applies only at game start, not per-target
         t_global = g._step_count * C.CONTROL_DT
         if t_global < self._VX_RAMP_S:
             vx *= t_global / self._VX_RAMP_S
+
+        # Stride-differential-safe wz + absolute cap
+        sl_est = max(vx * self._STEP_LENGTH_SCALE, 0.02)
+        wz_safe = min(self._WZ_ABS_MAX, self._MAX_STRIDE_DIFF / (sl_est * 0.5))
+        wz = _clamp(wz_raw, -wz_safe, wz_safe)
 
         # Update path dots from committed route (only the remaining portion)
         if g._target_step_count % 50 == 0 and self._committed_path:
@@ -298,7 +286,7 @@ class Navigator:
         # Diagnostics
         r_deg = math.degrees(roll)
         p_deg = math.degrees(pitch)
-        mode = "T" if alpha > 0.5 else "W"
+        mode = "W"
         if len(g._rp_log) > 0:
             prev = g._rp_log[-1]
             droll = (r_deg - prev[1]) / C.CONTROL_DT
