@@ -24,28 +24,43 @@ except ImportError:
 _PATH_VIZ_FILE = "/tmp/dwa_best_arc.bin"
 
 
-def _write_path_dots(points, spacing=0.15):
-    """Write a list of (x,y) waypoints as green dots."""
+def _resample_path(points, spacing=0.20):
+    """Resample a polyline to evenly-spaced points (≥5 per meter)."""
     if not points or len(points) < 2:
+        return points or []
+    result = [points[0]]
+    residual = 0.0
+    for i in range(1, len(points)):
+        dx = points[i][0] - points[i - 1][0]
+        dy = points[i][1] - points[i - 1][1]
+        seg = math.sqrt(dx * dx + dy * dy)
+        if seg < 1e-6:
+            continue
+        ux, uy = dx / seg, dy / seg
+        pos = residual
+        while pos < seg:
+            t = pos / seg
+            result.append((points[i - 1][0] + dx * t,
+                           points[i - 1][1] + dy * t))
+            pos += spacing
+        residual = pos - seg
+    result.append(points[-1])
+    return result
+
+
+def _write_path_dots(points):
+    """Write resampled (x,y) waypoints as green dots (≥5/m)."""
+    pts = _resample_path(points)
+    if len(pts) < 2:
         return
-    buf = bytearray(len(points) * 8)
-    for i, (px, py) in enumerate(points):
+    buf = bytearray(len(pts) * 8)
+    for i, (px, py) in enumerate(pts):
         struct.pack_into('ff', buf, i * 8, px, py)
     try:
         with open(_PATH_VIZ_FILE, 'wb') as f:
             f.write(buf)
     except OSError:
         pass
-
-
-def _straight_line_points(x0, y0, x1, y1, spacing=0.15):
-    """Generate evenly-spaced points along a straight line."""
-    dx, dy = x1 - x0, y1 - y0
-    dist = math.sqrt(dx * dx + dy * dy)
-    if dist < 0.01:
-        return [(x0, y0)]
-    n = max(2, int(dist / spacing))
-    return [(x0 + dx * i / (n - 1), y0 + dy * i / (n - 1)) for i in range(n)]
 
 
 class Navigator:
@@ -82,7 +97,7 @@ class Navigator:
         if path:
             _write_path_dots(path)
         else:
-            _write_path_dots(_straight_line_points(nav_x, nav_y, target.x, target.y))
+            _write_path_dots([(nav_x, nav_y), (target.x, target.y)])
 
     def _plan_astar_path(self, sx, sy, gx, gy):
         """Run A* on the cost grid, return list of (x,y) or None."""
@@ -158,7 +173,7 @@ class Navigator:
                 _write_path_dots(path)
             else:
                 _write_path_dots(
-                    _straight_line_points(nav_x, nav_y, target.x, target.y))
+                    [(nav_x, nav_y), (target.x, target.y)])
 
         # Path critic: record position at 10Hz
         if (g._path_critic is not None
