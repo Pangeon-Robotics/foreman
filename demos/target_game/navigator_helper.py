@@ -79,25 +79,28 @@ class Navigator:
     VX_WALK = 0.6       # m/s
     WZ_MAX = 1.0        # rad/s
 
+    # Route following: advance to next waypoint when within this radius
+    _WP_REACH = 0.5  # meters
+    # Replan if robot drifts this far from the committed route
+    _REPLAN_DRIFT = 1.5  # meters
+
     def __init__(self, game):
         self.game = game
         self._prev_heading_err = 0.0
+        self._committed_path = None  # list of (x,y) waypoints
+        self._wp_index = 0  # current waypoint we're steering toward
         _masses = {'b2': 83.5, 'go2': 15.0, 'b2w': 83.5, 'go2w': 15.0}
         _robot = getattr(game, '_robot', 'b2')
         self._slip = SlipDetector(mass=_masses.get(_robot, 83.5)) if SlipDetector else None
 
     def write_initial_path(self):
-        """Write path dots at target spawn time (before walking starts)."""
+        """Plan and commit A* route at target spawn time."""
         g = self.game
         target = g._spawner.current_target
         if target is None:
             return
         nav_x, nav_y, _ = g._get_nav_pose()
-        path = self._plan_astar_path(nav_x, nav_y, target.x, target.y)
-        if path:
-            _write_path_dots(path)
-        else:
-            _write_path_dots([(nav_x, nav_y), (target.x, target.y)])
+        self._commit_route(nav_x, nav_y, target.x, target.y)
 
     def _plan_astar_path(self, sx, sy, gx, gy):
         """Run A* on the cost grid, return list of (x,y) or None."""
@@ -109,19 +112,78 @@ class Navigator:
         path = _astar_core(
             critic._cost_grid, critic._cost_origin_x, critic._cost_origin_y,
             critic._cost_voxel_size, critic._robot_radius,
-            (sx, sy), (gx, gy), return_path=True, force_passable=True,
+            (sx, sy), (gx, gy), return_path=True, force_passable=False,
             cost_truncation=getattr(critic, '_cost_truncation', 0.5))
         return path
 
-    def _get_astar_waypoint(self, nav_x, nav_y, target_x, target_y):
-        """Get next A* waypoint (lookahead), or None if no costmap."""
+    def _commit_route(self, sx, sy, gx, gy):
+        """Plan A* path and commit it as the route to follow."""
+        path = self._plan_astar_path(sx, sy, gx, gy)
+        if path and len(path) >= 2:
+            self._committed_path = path
+        else:
+            self._committed_path = [(sx, sy), (gx, gy)]
+        self._wp_index = min(1, len(self._committed_path) - 1)
+        _write_path_dots(self._committed_path)
+
+    def _get_steer_target(self, nav_x, nav_y, target_x, target_y):
+        """Get the point to steer toward from the committed route.
+
+        Advances waypoint index when robot reaches current waypoint.
+        Replans only if robot drifts too far from the route.
+        Returns (steer_x, steer_y).
+        """
+        if self._committed_path is None or len(self._committed_path) < 2:
+            return target_x, target_y
+
+        # Advance past reached waypoints
+        while self._wp_index < len(self._committed_path) - 1:
+            wx, wy = self._committed_path[self._wp_index]
+            d = math.sqrt((nav_x - wx)**2 + (nav_y - wy)**2)
+            if d < self._WP_REACH:
+                self._wp_index += 1
+            else:
+                break
+
+        # Replan when costmap updates (new obstacle data from perception)
         g = self.game
-        critic = g._path_critic
-        if critic is None:
-            return None
-        wp = critic.plan_waypoints(nav_x, nav_y, target_x, target_y,
-                                   lookahead=1.5)
-        return wp
+        if getattr(g, '_costmap_changed', False):
+            g._costmap_changed = False
+            self._commit_route(nav_x, nav_y, target_x, target_y)
+            return self._committed_path[self._wp_index] if self._wp_index < len(self._committed_path) else (target_x, target_y)
+
+        # Check drift from nearest segment
+        drift = self._dist_to_path(nav_x, nav_y)
+        if drift > self._REPLAN_DRIFT:
+            self._commit_route(nav_x, nav_y, target_x, target_y)
+
+        # Steer toward current waypoint
+        if self._wp_index < len(self._committed_path):
+            return self._committed_path[self._wp_index]
+        return target_x, target_y
+
+    def _dist_to_path(self, x, y):
+        """Minimum distance from (x,y) to the committed path polyline."""
+        path = self._committed_path
+        if not path or len(path) < 2:
+            return 0.0
+        best = float('inf')
+        # Only check from current waypoint onward
+        start = max(0, self._wp_index - 1)
+        for i in range(start, min(start + 5, len(path) - 1)):
+            ax, ay = path[i]
+            bx, by = path[i + 1]
+            dx, dy = bx - ax, by - ay
+            seg2 = dx * dx + dy * dy
+            if seg2 < 1e-10:
+                d2 = (x - ax)**2 + (y - ay)**2
+            else:
+                t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / seg2))
+                px, py = ax + t * dx, ay + t * dy
+                d2 = (x - px)**2 + (y - py)**2
+            if d2 < best:
+                best = d2
+        return math.sqrt(best)
 
     # ------------------------------------------------------------------
     # Main tick — legged robots via L5
@@ -145,12 +207,9 @@ class Navigator:
         nav_x, nav_y, nav_yaw = g._get_nav_pose()
         dist = target.distance_to(nav_x, nav_y)
 
-        # Steer toward A* waypoint if costmap available, else direct to target
-        wp = self._get_astar_waypoint(nav_x, nav_y, target.x, target.y)
-        if wp is not None:
-            steer_x, steer_y = wp
-        else:
-            steer_x, steer_y = target.x, target.y
+        # Follow committed A* route waypoint-by-waypoint
+        steer_x, steer_y = self._get_steer_target(
+            nav_x, nav_y, target.x, target.y)
         heading_err = _normalize_angle(
             math.atan2(steer_y - nav_y, steer_x - nav_x) - nav_yaw)
 
@@ -166,14 +225,11 @@ class Navigator:
         alignment = max(0.0, math.cos(heading_err))
         vx = self.VX_WALK * (0.6 + 0.4 * alignment)
 
-        # Update path dots every 50 ticks (0.5s)
-        if g._target_step_count % 50 == 0:
-            path = self._plan_astar_path(nav_x, nav_y, target.x, target.y)
-            if path:
-                _write_path_dots(path)
-            else:
-                _write_path_dots(
-                    [(nav_x, nav_y), (target.x, target.y)])
+        # Update path dots from committed route (only the remaining portion)
+        if g._target_step_count % 50 == 0 and self._committed_path:
+            remaining = self._committed_path[self._wp_index:]
+            if remaining:
+                _write_path_dots(remaining)
 
         # Path critic: record position at 10Hz
         if (g._path_critic is not None

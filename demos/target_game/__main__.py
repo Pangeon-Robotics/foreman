@@ -94,6 +94,8 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
         "/tmp/robot_view_costmap.bin",
         "/tmp/dwa_best_arc.bin",
         "/tmp/god_view_tsdf_test.bin",
+        "/tmp/robot_costmap_live.bin",
+        "/tmp/robot_costmap_live.bin.tmp",
     ]:
         for f in glob.glob(pattern):
             try:
@@ -114,50 +116,6 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
             except OSError:
                 pass
 
-
-def _replay_perception(game, perception):
-    """Replay DirectScanner + god-view TSDF along truth trail after game ends.
-
-    Runs scans without GIL contention since the control loop is no longer active.
-    Produces TSDF data needed for F1 scoring metrics.
-    """
-    import math
-    trail = list(game.truth_trail)
-    if len(trail) < 2:
-        return
-
-    def _yaw_at(i):
-        """Estimate yaw from consecutive trail points."""
-        j = min(i + 1, len(trail) - 1)
-        if j == i:
-            j = max(i - 1, 0)
-        dx = trail[j][0] - trail[i][0]
-        dy = trail[j][1] - trail[i][1]
-        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-            return 0.0
-        return math.atan2(dy, dx)
-
-    # Replay robot-view scans every 10th trail point
-    if getattr(perception, '_direct_ready', False):
-        for i in range(0, len(trail), 10):
-            x, y = trail[i]
-            perception.direct_scan_only(x, y, 0.645, _yaw_at(i), roll=0.0, pitch=0.0)
-        perception.build_cost_grids_from_main()
-
-    # Replay god-view TSDF every 5th trail point
-    if game._god_view_tsdf is not None:
-        for i in range(0, len(trail), 5):
-            x, y = trail[i]
-            game._god_view_tsdf.update(x, y, _yaw_at(i), 0.645)
-
-    # Write viewer temp files so headed viewer shows TSDFs after game ends
-    if not game._headless:
-        if perception._tsdf is not None:
-            from .game_viz import write_robot_tsdf_file, write_robot_costmap_file
-            write_robot_tsdf_file(perception._tsdf)
-            write_robot_costmap_file(perception._tsdf)
-        if game._god_view_tsdf is not None:
-            game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
 
 
 def run_game(args) -> GameRunResult:
@@ -251,19 +209,6 @@ def run_game(args) -> GameRunResult:
         game._headless = args.headless
         if obstacle_bodies:
             game.set_obstacle_bodies(obstacle_bodies)
-            # Build god-view costmap for A* navigation (no GIL impact — static)
-            try:
-                from .test_costmap_helpers import build_god_view_costmap
-                from layer_6.config.defaults import load_config as _load_pcfg
-                _pcfg = _load_pcfg(args.robot)
-                gv_grid, gv_meta = build_god_view_costmap(
-                    str(scene_path), z_lo=_pcfg.costmap_z_lo, z_hi=0.80,
-                    output_resolution=_pcfg.tsdf_output_resolution,
-                    xy_extent=_pcfg.tsdf_xy_extent,
-                    truncation=_pcfg.tsdf_truncation)
-                game.set_god_view_costmap(gv_grid, gv_meta)
-            except Exception:
-                pass
         game.set_scene_path(str(scene_path))
 
         spawn_fn = getattr(args, 'spawn_fn', None)
@@ -276,26 +221,9 @@ def run_game(args) -> GameRunResult:
         perception = setup_perception(args, game, sim, odometry,
                                       obstacle_bodies, scene_path)
 
-        # Defer live perception in headless mode (no viewer needs TSDF).
-        # In headed mode, use reduced scan rate (1Hz vs 4Hz) so TSDFs are
-        # visible but GIL contention is manageable.
-        if slam and perception is not None:
-            if args.headless:
-                game._defer_perception = True
-            else:
-                game._perception_interval = 100  # 1Hz instead of 4Hz
-
         if game._path_critic is None:
             from .path_critic import PathCritic
             game.set_path_critic(PathCritic(robot=args.robot, robot_radius=0.35))
-
-        # Seed god-view costmap into path_critic for A* navigation
-        if game._god_view_costmap is not None and game._path_critic is not None:
-            gv_grid, gv_meta = game._god_view_costmap
-            game._path_critic.set_world_cost(
-                gv_grid, gv_meta['origin_x'], gv_meta['origin_y'],
-                gv_meta['voxel_size'],
-                truncation=gv_meta.get('truncation', 0.5))
 
         # Live tick output: fitness components per second
         def _print_tick(s):
@@ -318,10 +246,6 @@ def run_game(args) -> GameRunResult:
         stats = game.run()
         ato = game._path_critic.aggregate_ato() if game._path_critic else None
 
-        # Deferred perception: replay scans along truth trail for F1 scoring
-        if getattr(game, '_defer_perception', False) and perception is not None:
-            _replay_perception(game, perception)
-
         occ_accuracy = compute_occupancy(perception, args, scene_path)
         scores = compute_scores(game, perception, args)
 
@@ -329,11 +253,15 @@ def run_game(args) -> GameRunResult:
             stats=stats, telemetry=game._gt, telemetry_path=telem_path,
             slam_trail=list(game.slam_trail),
             truth_trail=list(game.truth_trail),
-            perception_stats=perception.stats if perception is not None else None,
+            perception_stats=None,
             ato_score=ato, occupancy_accuracy=occ_accuracy,
-            tsdf=perception._tsdf if perception is not None else None,
+            tsdf=None,
             scene_path=str(scene_path), scores=scores)
     finally:
+        # Shut down perception subprocess
+        perc_sub = getattr(game, '_perception_subprocess', None)
+        if perc_sub is not None:
+            perc_sub.shutdown()
         if perception is not None:
             perception.shutdown()
         sim.stop()

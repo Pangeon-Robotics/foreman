@@ -121,12 +121,16 @@ def _lazy_theta_star(
     cost_norm[cost_grid == 255] = 0.0
 
     # ── Line-of-sight check ───────────────────────────────────────
+    # LOS blocks on high-cost cells (>50% normalized) even when
+    # force_passable is set, so Theta* routes around obstacles.
+    _LOS_COST_BLOCK = 0.50
+
     def _los(x0, y0, x1, y1):
         """Bresenham-style LOS check on the passability grid.
 
         Returns True if a straight line from (x0,y0) to (x1,y1) crosses
-        only passable cells. Also accumulates cost along the line for
-        the cost-weighted g-score.
+        only passable cells with cost below _LOS_COST_BLOCK. Also
+        accumulates cost along the line for the cost-weighted g-score.
         """
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
@@ -142,7 +146,10 @@ def _lazy_theta_star(
             for _ in range(dx + 1):
                 if not (0 <= cx < nx and 0 <= cy < ny and passable[cx, cy]):
                     return False, 0.0
-                acc_cost += cost_norm[cx, cy]
+                c = cost_norm[cx, cy]
+                if c >= _LOS_COST_BLOCK:
+                    return False, 0.0
+                acc_cost += c
                 n_steps += 1
                 err -= dy
                 if err < 0:
@@ -155,7 +162,10 @@ def _lazy_theta_star(
             for _ in range(dy + 1):
                 if not (0 <= cx < nx and 0 <= cy < ny and passable[cx, cy]):
                     return False, 0.0
-                acc_cost += cost_norm[cx, cy]
+                c = cost_norm[cx, cy]
+                if c >= _LOS_COST_BLOCK:
+                    return False, 0.0
+                acc_cost += c
                 n_steps += 1
                 err -= dx
                 if err < 0:

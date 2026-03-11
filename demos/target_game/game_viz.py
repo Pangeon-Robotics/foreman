@@ -204,58 +204,41 @@ def write_god_view_path(game) -> None:
 
 
 def tick_perception(game) -> None:
-    """Run perception pipeline: LiDAR scan → TSDF → costmap → route replan.
+    """Send pose to perception subprocess + read costmap updates.
 
-    Event-driven chain:
-      1. LiDAR scan at ~4Hz (every 25 ticks at 100Hz) updates TSDF
-      2. TSDF change triggers costmap rebuild
-      3. Costmap change sets _costmap_changed flag → route replans
+    Perception runs in a separate process (no GIL contention).
+    This tick just sends the robot pose and checks for new costmaps.
 
-    God-view TSDF (if enabled) runs on same schedule for F1 scoring.
+    God-view TSDF (if enabled) updates here for F1 scoring only.
     """
-    # LiDAR scan rate: default 4Hz (25 ticks), configurable for GIL management
-    # Always scan on first tick so TSDFs appear immediately in the viewer
-    _interval = getattr(game, '_perception_interval', 25)
-    if game._step_count % _interval == 0 or game._step_count == 1:
-        _gt_x, _gt_y, _gt_yaw, _gt_z, _gt_roll, _gt_pitch = game._get_robot_pose()
+    if game._step_count % 10 != 0 and game._step_count != 1:
+        return
 
-        # God-view TSDF (for F1 scoring only, not used for navigation)
-        # Skip when deferred (avoids GIL contention with control loop)
-        if game._god_view_tsdf is not None and not getattr(game, '_defer_perception', False):
+    _gt_x, _gt_y, _gt_yaw, _gt_z, _gt_roll, _gt_pitch = game._get_robot_pose()
+
+    # God-view TSDF (F1 scoring only, not used for navigation)
+    if game._god_view_tsdf is not None:
+        if game._step_count % 25 == 0 or game._step_count == 1:
             game._god_view_tsdf.update(_gt_x, _gt_y, _gt_yaw, _gt_z)
             if not game._headless:
                 game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
 
-        # Robot-view LiDAR scan → TSDF update
-        # Skip live scans when deferred (avoids GIL contention with control loop)
-        if (game._perception is not None
-                and getattr(game._perception, '_direct_ready', False)
-                and not getattr(game, '_defer_perception', False)):
-            nav_x, nav_y, nav_yaw = game._get_nav_pose()
-            game._perception.direct_scan_only(
-                nav_x, nav_y, _gt_z, nav_yaw,
-                roll=_gt_roll, pitch=_gt_pitch)
+    # Send pose to perception subprocess (10Hz)
+    perc_sub = getattr(game, '_perception_subprocess', None)
+    if perc_sub is not None:
+        nav_x, nav_y, nav_yaw = game._get_nav_pose()
+        perc_sub.update_pose(nav_x, nav_y, _gt_z, nav_yaw,
+                             _gt_roll, _gt_pitch)
 
-            # TSDF changed → rebuild costmap (event-driven)
-            game._perception.build_cost_grids_from_main()
-
-            # Costmap → path critic (single source of truth for routing)
-            if game._path_critic is not None:
-                cost_grid = game._perception.world_cost_grid
-                meta = game._perception.world_cost_meta
-                if cost_grid is not None and meta is not None:
-                    game._path_critic.set_world_cost(
-                        cost_grid, meta['origin_x'], meta['origin_y'],
-                        meta['voxel_size'],
-                        truncation=meta.get('truncation', 0.5))
-                    # Signal route replan needed
-                    game._costmap_changed = True
-
-            # Viewer file writes (only in headed mode)
-            if (not game._headless
-                    and game._perception._tsdf is not None):
-                write_robot_tsdf_file(game._perception._tsdf)
-                write_robot_costmap_file(game._perception._tsdf)
+        # Read costmap from subprocess (check for new file)
+        result = perc_sub.read_costmap()
+        if result is not None and game._path_critic is not None:
+            grid, meta = result
+            game._path_critic.set_world_cost(
+                grid, meta['origin_x'], meta['origin_y'],
+                meta['voxel_size'],
+                truncation=meta.get('truncation', 0.5))
+            game._costmap_changed = True
 
 
 def get_occ_str(game) -> str:

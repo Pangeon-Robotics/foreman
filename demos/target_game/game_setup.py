@@ -60,21 +60,16 @@ def setup_perception(args, game, sim, odometry, obstacle_bodies, scene_path):
     return perception
 
 
-def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
-                               odometry, ChannelSubscriber, PointCloud_,
-                               dds_domain):
-    """Set up TSDF and direct scanner for obstacle avoidance."""
+def _perception_config_dict(args):
+    """Build serializable perception config dict for subprocess."""
     from layer_6.config.defaults import load_config
-    from .perception import PerceptionPipeline
-
     pcfg = load_config(args.robot)
     for key, val in getattr(args, 'perception_overrides', {}).items():
         setattr(pcfg, key, val)
     for key, val in getattr(args, 'dwa_overrides', {}).items():
         setattr(pcfg, key, val)
 
-    if not hasattr(pcfg, 'scan_min_interval'):
-        pcfg.scan_min_interval = 0.25
+    pcfg.scan_min_interval = 0.25
     pcfg.costmap_z_hi = 0.80
     pcfg.tsdf_voxel_size = 0.01
     pcfg.tsdf_output_resolution = 0.05
@@ -86,42 +81,47 @@ def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
     pcfg.tsdf_depth_extension = 5
     pcfg.tsdf_decay_rate = 0.0
     pcfg.tsdf_unknown_cell_cost = 0.5
+    pcfg.min_world_z = 0.05
 
-    perception = PerceptionPipeline(odometry, pcfg)
-    perception._MIN_WORLD_Z = 0.05
+    # Serialize to dict (multiprocessing spawn can't pickle arbitrary objects)
+    return {k: v for k, v in vars(pcfg).items()
+            if isinstance(v, (int, float, str, bool, tuple, list))}
 
-    _god_mj_model = None
-    _god_mj_data = None
+
+def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
+                               odometry, ChannelSubscriber, PointCloud_,
+                               dds_domain):
+    """Spawn perception subprocess for obstacle avoidance.
+
+    Perception runs in a separate process (no GIL contention).
+    Communicates via shared memory (pose) and temp files (costmap).
+    """
+    from .perception_worker import PerceptionSubprocess
+
+    config_dict = _perception_config_dict(args)
+
+    # God-view TSDF for F1 scoring (separate from perception subprocess)
     if getattr(args, 'god', False) and obstacle_bodies:
         from .god_tsdf import GodViewTSDF
         god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
         game._god_view_tsdf = god_tsdf
-        _god_mj_model = god_tsdf._model
-        _god_mj_data = god_tsdf._data
 
-    slam = getattr(args, 'slam', False)
-    if slam:
-        perception._use_reduced_rays = True
-    perception.init_direct_scanner(
-        str(scene_path), robot=args.robot,
-        mj_model=_god_mj_model, mj_data=_god_mj_data)
-
-    if not perception._direct_ready:
-        cloud_sub = ChannelSubscriber("rt/pointcloud", PointCloud_)
-        cloud_sub.Init(perception.on_point_cloud, 5)
-    game._perception = perception
-
-    if not perception._direct_ready:
-        import time as _time
-        _pc_deadline = _time.monotonic() + 5.0
-        while perception.costmap_query is None and _time.monotonic() < _pc_deadline:
-            _time.sleep(0.1)
+    # Spawn perception subprocess
+    perc_sub = PerceptionSubprocess(
+        scene_xml=str(scene_path),
+        robot=args.robot,
+        config_dict=config_dict,
+        scan_hz=4.0,
+    )
+    perc_sub.start()
+    game._perception_subprocess = perc_sub
 
     from .path_critic import PathCritic
     critic = PathCritic(robot=args.robot, robot_radius=0.35)
     game.set_path_critic(critic)
 
-    return perception
+    # Return None — no in-process PerceptionPipeline anymore
+    return None
 
 
 def setup_viewers(args, game, obstacle_bodies, scene_path):
