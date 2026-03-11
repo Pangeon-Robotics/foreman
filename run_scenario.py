@@ -14,9 +14,6 @@ import sys
 from pathlib import Path
 
 _WORKSPACE = Path(__file__).resolve().parent.parent  # robotics/
-_SEED_GENOMES = {
-    "b2": _WORKSPACE / "training" / "models" / "b2" / "ga_v14_seed.json",
-}
 
 SCENARIOS = ["open", "scattered", "corridor", "L_wall", "dead_end", "dense", "test"]
 
@@ -41,10 +38,6 @@ Scenarios (easiest to hardest):
                         help="Scenario name (or 'all')")
     parser.add_argument("--robot", default="b2",
                         help="Robot model (default: b2)")
-    parser.add_argument("--genome", default=None,
-                        help="Path to genome JSON (default: auto-detect v14 seed)")
-    parser.add_argument("--no-genome", action="store_true",
-                        help="Run without any genome file")
     parser.add_argument("--headless", action="store_true",
                         help="Run headless at max speed (default: headed)")
     parser.add_argument("--viewer", action="store_true",
@@ -117,20 +110,6 @@ Scenarios (easiest to hardest):
 
     if args.targets is not None:
         cmd.extend(["--targets", str(args.targets)])
-
-    # Genome handling — resolve to absolute since subprocess runs from _WORKSPACE
-    if not args.no_genome:
-        genome = args.genome
-        if genome is not None:
-            genome = str(Path(genome).resolve())
-        else:
-            genome = _SEED_GENOMES.get(args.robot)
-            if genome and genome.exists():
-                genome = str(genome)
-            else:
-                genome = None
-        if genome:
-            cmd.extend(["--genome", genome])
 
     sys.exit(subprocess.call(cmd, cwd=str(_WORKSPACE)))
 

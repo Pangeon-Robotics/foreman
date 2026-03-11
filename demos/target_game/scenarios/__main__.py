@@ -35,8 +35,6 @@ Scenarios (easiest to hardest):
                         help="Robot model (default: b2)")
     parser.add_argument("--scenario", default=None,
                         help="Run single scenario (default: all)")
-    parser.add_argument("--genome", default=None,
-                        help="Path to GA-evolved genome JSON")
     parser.add_argument("--domain", type=int, default=2,
                         help="DDS domain ID (default: 2)")
     parser.add_argument("--headed", action="store_true",
@@ -75,7 +73,6 @@ Scenarios (easiest to hardest):
     # Run
     runner = ScenarioRunner(
         robot=args.robot,
-        genome=args.genome,
         domain=args.domain,
         headless=not args.headed,
         viewer=args.viewer,

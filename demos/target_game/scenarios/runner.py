@@ -30,8 +30,6 @@ class ScenarioRunner:
     ----------
     robot : str
         Robot model (b2, go2, etc.).
-    genome : str or None
-        Path to genome JSON file.
     domain : int
         DDS domain ID (default 2, avoids firmware conflicts).
     headless : bool
@@ -41,7 +39,6 @@ class ScenarioRunner:
     def __init__(
         self,
         robot: str = "b2",
-        genome: str | None = None,
         domain: int = 2,
         headless: bool = True,
         viewer: bool = False,
@@ -49,7 +46,6 @@ class ScenarioRunner:
         god_view: bool = False,
     ):
         self._robot = robot
-        self._genome = genome
         self._domain = domain
         self._headless = headless
         self._viewer = viewer
@@ -125,7 +121,7 @@ class ScenarioRunner:
                      else scenario.num_targets),
             headless=self._headless,
             seed=seed,
-            genome=self._genome,
+            genome=None,
             full_circle=scenario.full_circle,
             domain=self._domain,
             slam=scenario.use_slam,
