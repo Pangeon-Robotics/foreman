@@ -24,25 +24,28 @@ except ImportError:
 _PATH_VIZ_FILE = "/tmp/dwa_best_arc.bin"
 
 
-def _write_path_dots(robot_x, robot_y, target_x, target_y, spacing=0.15):
-    """Write a straight-line path from robot to target as green dots."""
-    dx = target_x - robot_x
-    dy = target_y - robot_y
-    dist = math.sqrt(dx * dx + dy * dy)
-    if dist < 0.01:
+def _write_path_dots(points, spacing=0.15):
+    """Write a list of (x,y) waypoints as green dots."""
+    if not points or len(points) < 2:
         return
-    n = max(2, int(dist / spacing))
-    buf = bytearray(n * 8)
-    for i in range(n):
-        t = i / (n - 1)
-        px = robot_x + dx * t
-        py = robot_y + dy * t
+    buf = bytearray(len(points) * 8)
+    for i, (px, py) in enumerate(points):
         struct.pack_into('ff', buf, i * 8, px, py)
     try:
         with open(_PATH_VIZ_FILE, 'wb') as f:
             f.write(buf)
     except OSError:
         pass
+
+
+def _straight_line_points(x0, y0, x1, y1, spacing=0.15):
+    """Generate evenly-spaced points along a straight line."""
+    dx, dy = x1 - x0, y1 - y0
+    dist = math.sqrt(dx * dx + dy * dy)
+    if dist < 0.01:
+        return [(x0, y0)]
+    n = max(2, int(dist / spacing))
+    return [(x0 + dx * i / (n - 1), y0 + dy * i / (n - 1)) for i in range(n)]
 
 
 class Navigator:
@@ -75,7 +78,35 @@ class Navigator:
         if target is None:
             return
         nav_x, nav_y, _ = g._get_nav_pose()
-        _write_path_dots(nav_x, nav_y, target.x, target.y)
+        path = self._plan_astar_path(nav_x, nav_y, target.x, target.y)
+        if path:
+            _write_path_dots(path)
+        else:
+            _write_path_dots(_straight_line_points(nav_x, nav_y, target.x, target.y))
+
+    def _plan_astar_path(self, sx, sy, gx, gy):
+        """Run A* on the cost grid, return list of (x,y) or None."""
+        g = self.game
+        critic = g._path_critic
+        if critic is None or getattr(critic, '_cost_grid', None) is None:
+            return None
+        from .astar import _astar_core
+        path = _astar_core(
+            critic._cost_grid, critic._cost_origin_x, critic._cost_origin_y,
+            critic._cost_voxel_size, critic._robot_radius,
+            (sx, sy), (gx, gy), return_path=True, force_passable=True,
+            cost_truncation=getattr(critic, '_cost_truncation', 0.5))
+        return path
+
+    def _get_astar_waypoint(self, nav_x, nav_y, target_x, target_y):
+        """Get next A* waypoint (lookahead), or None if no costmap."""
+        g = self.game
+        critic = g._path_critic
+        if critic is None:
+            return None
+        wp = critic.plan_waypoints(nav_x, nav_y, target_x, target_y,
+                                   lookahead=1.5)
+        return wp
 
     # ------------------------------------------------------------------
     # Main tick — legged robots via L5
@@ -99,9 +130,14 @@ class Navigator:
         nav_x, nav_y, nav_yaw = g._get_nav_pose()
         dist = target.distance_to(nav_x, nav_y)
 
-        # Direct heading to target
+        # Steer toward A* waypoint if costmap available, else direct to target
+        wp = self._get_astar_waypoint(nav_x, nav_y, target.x, target.y)
+        if wp is not None:
+            steer_x, steer_y = wp
+        else:
+            steer_x, steer_y = target.x, target.y
         heading_err = _normalize_angle(
-            math.atan2(target.y - nav_y, target.x - nav_x) - nav_yaw)
+            math.atan2(steer_y - nav_y, steer_x - nav_x) - nav_yaw)
 
         # D term: rate of change of heading error (damping)
         heading_err_rate = (heading_err - self._prev_heading_err) / C.CONTROL_DT
@@ -117,7 +153,12 @@ class Navigator:
 
         # Update path dots every 50 ticks (0.5s)
         if g._target_step_count % 50 == 0:
-            _write_path_dots(nav_x, nav_y, target.x, target.y)
+            path = self._plan_astar_path(nav_x, nav_y, target.x, target.y)
+            if path:
+                _write_path_dots(path)
+            else:
+                _write_path_dots(
+                    _straight_line_points(nav_x, nav_y, target.x, target.y))
 
         # Path critic: record position at 10Hz
         if (g._path_critic is not None

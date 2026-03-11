@@ -251,6 +251,19 @@ def run_game(args) -> GameRunResult:
         game._headless = args.headless
         if obstacle_bodies:
             game.set_obstacle_bodies(obstacle_bodies)
+            # Build god-view costmap for A* navigation (no GIL impact — static)
+            try:
+                from .test_costmap_helpers import build_god_view_costmap
+                from layer_6.config.defaults import load_config as _load_pcfg
+                _pcfg = _load_pcfg(args.robot)
+                gv_grid, gv_meta = build_god_view_costmap(
+                    str(scene_path), z_lo=_pcfg.costmap_z_lo, z_hi=0.80,
+                    output_resolution=_pcfg.tsdf_output_resolution,
+                    xy_extent=_pcfg.tsdf_xy_extent,
+                    truncation=_pcfg.tsdf_truncation)
+                game.set_god_view_costmap(gv_grid, gv_meta)
+            except Exception:
+                pass
         game.set_scene_path(str(scene_path))
 
         spawn_fn = getattr(args, 'spawn_fn', None)
@@ -275,6 +288,14 @@ def run_game(args) -> GameRunResult:
         if game._path_critic is None:
             from .path_critic import PathCritic
             game.set_path_critic(PathCritic(robot=args.robot, robot_radius=0.35))
+
+        # Seed god-view costmap into path_critic for A* navigation
+        if game._god_view_costmap is not None and game._path_critic is not None:
+            gv_grid, gv_meta = game._god_view_costmap
+            game._path_critic.set_world_cost(
+                gv_grid, gv_meta['origin_x'], gv_meta['origin_y'],
+                gv_meta['voxel_size'],
+                truncation=gv_meta.get('truncation', 0.5))
 
         # Live tick output: fitness components per second
         def _print_tick(s):
