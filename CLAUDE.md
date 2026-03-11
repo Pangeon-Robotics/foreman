@@ -123,7 +123,7 @@ Supported robots: **b2** (legged), **go2** (legged), **go2w** (wheeled), **b2w**
 
 Runs the full stack: legged robots send MotionCommands through Layer 5 (which handles gait selection, gain scheduling, and Layer 4 dispatch). Wheeled robots use L5's `send_wheel_command()` (PD leg hold + differential wheel torque). Navigation steering uses Layer 6's WaypointNavigator for proportional control. Uses `scene_target.xml` with a mocap target marker. The `__main__.py` patches cross-layer config namespace collisions at import time (see gotcha below).
 
-With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body velocity) via `perception.py:PerceptionPipeline`. With `--obstacles`: loads `scene_target_obstacles.xml` and enables LiDAR point cloud processing into costmaps + DWA local planning. Costmap visualization is handled by `viz.py:CostmapOverlay`.
+With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body velocity) via `perception.py:PerceptionPipeline`. With `--obstacles`: loads `scene_target_obstacles.xml` and enables LiDAR point cloud processing into costmaps + DWA local planning.
 
 **Target game module map** (composition pattern, all files <400 lines):
 | File | Concern | Data domain |
@@ -136,20 +136,19 @@ With `--slam`: enables Layer 6 SLAM odometry (dead-reckoning from IMU + body vel
 | `game_setup.py` | Game initialization helpers (scenes, perception) | Both |
 | `game_viz.py` | Game visualization file writers | Both |
 | `game_astar.py` | God-view A* wrapper for game | **God-view only** |
-| `navigator_helper.py` | Navigator helper (L6 steering → L5 MotionCmd) | Robot-view |
+| `navigator_helper.py` | Navigator helper (A* routing, waypoint following → L5 MotionCmd) | Robot-view |
 | `dwa_navigator.py` | DWANavigator helper (DWA planning, waypoints) | **Robot-view only** |
-| `path_export.py` | Green dot path export + constrained A* | Robot-view |
 | `dwa_controller.py` | DWAController helper (gait conversion, telemetry) | Robot-view |
 | `stuck_recovery.py` | StuckRecovery helper (stuck detection + TIP) | Robot-view |
 | `path_critic.py` | PathCritic (ATO metrics, recording, summary) | Data-agnostic |
 | `astar.py` | A* search on cost grids | Data-agnostic |
 | `path_smoother.py` | Catmull-Rom path smoothing | Data-agnostic |
 | `perception.py` | PerceptionPipeline core, LiveCostmapQuery | **Robot-view only** |
+| `perception_worker.py` | Perception subprocess entry point + IPC | **Robot-view only** |
 | `reactive_scan.py` | ReactiveScanResult + reactive_scan() | **Robot-view only** |
 | `direct_scanner.py` | DirectScanner (bypass DDS LiDAR) | **Robot-view only** |
 | `costmap_builder.py` | Cost grid building + local TSDF clearing | **Robot-view only** |
 | `god_tsdf.py` | GodViewTSDF (perfect MuJoCo raycasts) | **God-view only** |
-| `viz.py` | CostmapOverlay, visualization helpers | Both (renders both) |
 | `target.py` | Target and TargetSpawner classes | N/A |
 | `utils.py` | Cross-layer shared utilities (canonical location) | N/A |
 | `scores.py` | Perception F1 metrics (Surface, Cost, Router) | Both (god vs robot) |
@@ -170,6 +169,8 @@ self.scoring = GameScoring(self)     # game_scoring.py
 ```
 
 **Robot-view / god-view compliance**: Robot-view code (green dots, DWA, costmap) must NEVER access god-view data (GodViewTSDF, god_view_costmap, scene XML geometry). Both pipelines share ground-truth robot position for scan integration; the data separation is in what each pipeline *sees* (noisy LiDAR vs perfect raycasts), not where it looks from.
+
+**Perception subprocess architecture**: Perception (LiDAR → TSDF → costmap) runs in a separate process (`perception_worker.py`) to eliminate GIL contention with the 100Hz control loop. IPC uses `multiprocessing.Array` for pose input (6 doubles: x, y, z, yaw, roll, pitch) and temp files for costmap output (`/tmp/robot_costmap_live.bin`). The game process reads costmap via `PerceptionSubprocess.read_costmap()` with mtime-based cache invalidation. Navigator routes on this robot-view costmap via A* with waypoint-following (replans when costmap updates or robot drifts >1.5m from route).
 
 ### Scenario Testing
 Progressive obstacle scenarios for validating DWA navigation:

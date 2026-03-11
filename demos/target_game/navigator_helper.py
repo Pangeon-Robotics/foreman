@@ -71,13 +71,28 @@ class Navigator:
       vx = VX_WALK * speed-turn coupling
     """
 
-    # PD heading gains — tuned for dq_ff-enabled turning at 100Hz
-    KP_HEADING = 1.5
-    KD_HEADING = 0.3
+    # PD heading gains — v18 GA champion (4.817) with increased damping
+    KP_HEADING = 4.8
+    KD_HEADING = 0.5
 
-    # Walk speed
-    VX_WALK = 0.6       # m/s
-    WZ_MAX = 1.0        # rad/s
+    # Walk speed — v18 champion achieved 2.77 m/s at these settings
+    VX_WALK = 2.0       # m/s
+    VX_TURN = 0.5       # m/s — slow walk during turns (small stride = stable diff)
+
+    # Continuous speed/turn blending — avoids abrupt stride transitions
+    # heading_err below BLEND_LO: full speed
+    # heading_err above BLEND_HI: slow speed (turn mode)
+    _BLEND_LO = 0.17   # ~10° — below this, full walk speed
+    _BLEND_HI = 0.52   # ~30° — above this, full turn speed
+
+    # Stride-differential safety: limit wz so absolute stride diff stays bounded.
+    # L4 uses stride_scale = 1 ± wz * 0.5, so max diff = step_length * wz * 0.5.
+    # At 4.37 Hz, keep this under _MAX_STRIDE_DIFF for stability.
+    _MAX_STRIDE_DIFF = 0.06  # m — max per-side stride asymmetry
+    _STEP_LENGTH_SCALE = 0.2085  # mirror L5 config for wz limit calc
+
+    # Startup ramp: seconds to reach full VX_WALK (avoids torque spike)
+    _VX_RAMP_S = 2.0
 
     # Route following: advance to next waypoint when within this radius
     _WP_REACH = 0.5  # meters
@@ -89,6 +104,7 @@ class Navigator:
         self._prev_heading_err = 0.0
         self._committed_path = None  # list of (x,y) waypoints
         self._wp_index = 0  # current waypoint we're steering toward
+        self._vx_ema = 0.0  # EMA-smoothed commanded vx (prevents abrupt stride changes)
         _masses = {'b2': 83.5, 'go2': 15.0, 'b2w': 83.5, 'go2w': 15.0}
         _robot = getattr(game, '_robot', 'b2')
         self._slip = SlipDetector(mass=_masses.get(_robot, 83.5)) if SlipDetector else None
@@ -219,11 +235,42 @@ class Navigator:
 
         # PD law
         wz_raw = self.KP_HEADING * heading_err + self.KD_HEADING * heading_err_rate
-        wz = max(-self.WZ_MAX, min(self.WZ_MAX, wz_raw))
 
-        # Speed-turn coupling: slow when turning, min 60% for effective stride
-        alignment = max(0.0, math.cos(heading_err))
-        vx = self.VX_WALK * (0.6 + 0.4 * alignment)
+        t_walk = g._target_step_count * C.CONTROL_DT
+
+        # Continuous speed/turn blend based on heading error magnitude
+        # Small heading error → full speed + tiny wz
+        # Large heading error → slow speed + full wz
+        abs_err = abs(heading_err)
+        if abs_err <= self._BLEND_LO:
+            alpha = 0.0
+        elif abs_err >= self._BLEND_HI:
+            alpha = 1.0
+        else:
+            alpha = (abs_err - self._BLEND_LO) / (self._BLEND_HI - self._BLEND_LO)
+
+        vx_target = self.VX_WALK * (1.0 - alpha) + self.VX_TURN * alpha
+
+        # EMA smoothing on vx — prevents abrupt stride changes at target transitions
+        if vx_target < self._vx_ema:
+            ema_alpha = 0.05   # decel: ~1s to halve
+        else:
+            ema_alpha = 0.02   # accel: ~2.5s to reach full
+        self._vx_ema += ema_alpha * (vx_target - self._vx_ema)
+        vx = self._vx_ema
+
+        # Stride-differential-safe wz: limit so absolute diff stays bounded
+        # At current vx, step_length ≈ vx * _STEP_LENGTH_SCALE
+        # Stride diff = step_length * wz * 0.5 (L4 factor)
+        sl_est = max(vx * self._STEP_LENGTH_SCALE, 0.02)
+        wz_safe = self._MAX_STRIDE_DIFF / (sl_est * 0.5)
+        wz = _clamp(wz_raw, -wz_safe, wz_safe)
+
+        # Startup ramp: avoid torque spike from instant full stride at 4.37 Hz
+        # Uses global step count — ramp applies only at game start, not per-target
+        t_global = g._step_count * C.CONTROL_DT
+        if t_global < self._VX_RAMP_S:
+            vx *= t_global / self._VX_RAMP_S
 
         # Update path dots from committed route (only the remaining portion)
         if g._target_step_count % 50 == 0 and self._committed_path:
@@ -251,7 +298,7 @@ class Navigator:
         # Diagnostics
         r_deg = math.degrees(roll)
         p_deg = math.degrees(pitch)
-        mode = "W"
+        mode = "T" if alpha > 0.5 else "W"
         if len(g._rp_log) > 0:
             prev = g._rp_log[-1]
             droll = (r_deg - prev[1]) / C.CONTROL_DT
