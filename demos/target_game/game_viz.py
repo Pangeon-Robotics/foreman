@@ -268,11 +268,12 @@ def tick_perception(game) -> None:
     _gt_x, _gt_y, _gt_yaw, _gt_z, _gt_roll, _gt_pitch = game._get_robot_pose()
 
     # God-view TSDF (F1 scoring only, not used for navigation)
-    if game._god_view_tsdf is not None:
+    # Skip in headless mode — mj_multiRay blocks GIL for 10-50ms,
+    # causing DDS timing instability and falls. Replay post-game instead.
+    if game._god_view_tsdf is not None and not game._headless:
         if game._step_count % 25 == 0 or game._step_count == 1:
             game._god_view_tsdf.update(_gt_x, _gt_y, _gt_yaw, _gt_z)
-            if not game._headless:
-                game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
+            game._god_view_tsdf.write_temp_file("/tmp/god_view_tsdf.bin")
 
     # Send pose to perception subprocess (10Hz)
     perc_sub = getattr(game, '_perception_subprocess', None)

@@ -83,8 +83,8 @@ class Navigator:
     """Walk the path, stop when reached.
 
     PD heading control steers toward the next waypoint on the A* route.
-    Speed scales with heading alignment: full speed when facing the
-    waypoint, zero when perpendicular.
+    Speed = VX_WALK * dist_factor * heading_factor with EMA smoothing.
+    L5 handles gait selection and turn-speed coupling.
     """
 
     # PD heading gains
@@ -93,7 +93,11 @@ class Navigator:
 
     # Walk speed
     VX_WALK = 2.0       # m/s
-    _WZ_MAX = 2.0       # rad/s — robot physical limit (L5 handles stride safety)
+    _WZ_ABS_MAX = 1.0   # rad/s — stride-differential safety cap
+    _APPROACH_DIST = 4.0  # m — distance taper zone for deceleration
+    _VX_RAMP_S = 2.0    # s — startup ramp to avoid torque spike
+    _MAX_STRIDE_DIFF = 0.10  # m — max per-side stride asymmetry
+    _STEP_LENGTH_SCALE = 0.2085  # mirror L5 config for wz limit calc
 
     # Route following
     _WP_REACH = 0.30    # m — advance to next waypoint when this close
@@ -102,6 +106,7 @@ class Navigator:
     def __init__(self, game):
         self.game = game
         self._prev_heading_err = 0.0
+        self._vx_ema = 0.0
         self._committed_path = None  # list of (x,y) Theta* waypoints
         self._wp_index = 0
         self._has_costmap_path = False
@@ -117,6 +122,7 @@ class Navigator:
         self._has_costmap_path = False
         self._committed_path = None
         self._prev_heading_err = 0.0
+        self._vx_ema = 0.0
         _clear_path_dots()
 
         # Try to plan immediately if costmap already exists
@@ -231,8 +237,8 @@ class Navigator:
         """Walk the path, stop when reached.
 
         PD heading control steers toward the next A* waypoint.
-        Speed = VX_WALK * cos(heading_err): full speed when aligned,
-        zero when perpendicular. L5 handles gait and stride.
+        Speed = VX_WALK * dist_factor * heading_factor with EMA smoothing.
+        L5 handles gait selection and turn-speed coupling.
         """
         g = self.game
         x, y, yaw, z, roll, pitch = g._get_robot_pose()
@@ -261,11 +267,28 @@ class Navigator:
         heading_err_rate = (heading_err - self._prev_heading_err) / C.CONTROL_DT
         self._prev_heading_err = heading_err
         wz_raw = self.KP_HEADING * heading_err + self.KD_HEADING * heading_err_rate
-        wz = _clamp(wz_raw, -self._WZ_MAX, self._WZ_MAX)
 
-        # Constant forward speed — L5 turn-speed coupling is the sole
-        # mechanism for reducing speed during turns.
-        vx = self.VX_WALK
+        # Stride-differential-safe wz + absolute cap
+        sl_est = max(self._vx_ema * self._STEP_LENGTH_SCALE, 0.02)
+        wz_safe = min(self._WZ_ABS_MAX, self._MAX_STRIDE_DIFF / (sl_est * 0.5))
+        wz = _clamp(wz_raw, -wz_safe, wz_safe)
+
+        # Speed = VX_WALK * dist_factor * heading_factor
+        dist_factor = min(1.0, dist / self._APPROACH_DIST)
+        heading_factor = max(0.25, math.cos(heading_err))
+        vx_target = self.VX_WALK * dist_factor * heading_factor
+
+        # Asymmetric EMA: smooth stride transitions
+        if vx_target < self._vx_ema:
+            self._vx_ema += 0.10 * (vx_target - self._vx_ema)
+        else:
+            self._vx_ema += 0.05 * (vx_target - self._vx_ema)
+        vx = self._vx_ema
+
+        # Startup ramp: avoid torque spike from instant full stride
+        t_global = g._step_count * C.CONTROL_DT
+        if t_global < self._VX_RAMP_S:
+            vx *= t_global / self._VX_RAMP_S
 
         g._send_motion(vx=vx, wz=wz)
 

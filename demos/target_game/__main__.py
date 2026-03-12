@@ -244,6 +244,14 @@ def run_game(args) -> GameRunResult:
         stats = game.run()
         ato = game._path_critic.aggregate_ato() if game._path_critic else None
 
+        # Post-game god-view TSDF replay (deferred from gameplay to avoid GIL)
+        god_tsdf = getattr(game, '_god_view_tsdf', None)
+        if god_tsdf is not None and getattr(args, 'headless', False):
+            trail = list(game.truth_trail)
+            for i in range(0, len(trail), 5):
+                tx, ty = trail[i]
+                god_tsdf.update(tx, ty, 0.0, 0.465)
+
         occ_accuracy = compute_occupancy(perception, args, scene_path)
         scores = compute_scores(game, perception, args)
 
