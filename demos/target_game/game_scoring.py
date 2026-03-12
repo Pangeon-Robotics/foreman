@@ -54,6 +54,13 @@ class GameScoring:
             g._state = C.GameState.DONE
             return
 
+        # Between-target settle: stand to let TransitionState do stop ramp
+        settle = getattr(g, '_post_reach_settle', 0)
+        if settle > 0:
+            g._post_reach_settle = settle - 1
+            g._send_motion(behavior='stand')
+            return
+
         if g._post_fall_settle > 0:
             g._post_fall_settle -= 1
             _, _, _, z, _, _ = g._get_robot_pose()
@@ -109,6 +116,9 @@ class GameScoring:
 
         g._state = C.GameState.WALK_TO_TARGET
 
+    # Brief stand between targets so TransitionState sees walk→stand→walk
+    _REACH_SETTLE_STEPS = 50  # 0.5s at 100 Hz
+
     def on_reached(self):
         """Handle target reached event."""
         g = self.game
@@ -126,6 +136,9 @@ class GameScoring:
             "reached", step=g._step_count, t=t,
             target_index=g._target_index,
             ato=ato, agg_ato=agg_ato)
+        # Stand briefly so TransitionState does stop ramp before next target
+        g._send_motion(behavior='stand')
+        g._post_reach_settle = self._REACH_SETTLE_STEPS
         g._state = C.GameState.SPAWN_TARGET
 
     def on_timeout(self):

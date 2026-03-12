@@ -59,7 +59,7 @@ class TargetGame:
         num_targets: int = 5,
         min_dist: float = 3.0,
         max_dist: float = 6.0,
-        reach_threshold: float = 0.5,
+        reach_threshold: float = REACH_DISTANCE,
         timeout_steps: int = TARGET_TIMEOUT_STEPS,
         seed: int | None = None,
         angle_range: tuple[float, float] | list[tuple[float, float]] = (
@@ -85,6 +85,7 @@ class TargetGame:
         self._path_critic = None
         self._fall_tick_count = 0
         self._post_fall_settle = 0
+        self._post_reach_settle = 0
         self._spawner = TargetSpawner(
             min_distance=min_dist, max_distance=max_dist,
             reach_threshold=reach_threshold, seed=seed)

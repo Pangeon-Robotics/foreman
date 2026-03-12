@@ -1,17 +1,43 @@
 """Visualization file writers and debug viewer streaming.
 
-Writes robot-view TSDF surface voxels and costmap data to temp files
-that the MuJoCo viewer subprocess reads for rendering. Also handles
-debug viewer state streaming and god-view A* path file writing.
+Writes robot-view TSDF surface voxels to temp file (from subprocess).
+Game process reads TSDF voxels, builds costmap, writes costmap viz file.
+Also handles debug viewer streaming and god-view A* path file writing.
 """
 from __future__ import annotations
 
+import math
+import os
 import struct
 
 import numpy as np
 
 ROBOT_TSDF_FILE = "/tmp/robot_view_tsdf.bin"
 ROBOT_COSTMAP_FILE = "/tmp/robot_view_costmap.bin"
+
+# Robot clearance radius for A* exclusion zones
+_CLEARANCE_M = 0.25
+
+
+def _write_costmap_viz(grid, meta):
+    """Write A* cost grid as the viewer costmap file.
+
+    Viewer expects 16-byte header: u16 rows, u16 cols, f32 ox, f32 oy, f32 vs.
+    Grid in (rows=Y, cols=X) layout.
+    """
+    grid_t = grid.T  # (nx, ny) → (ny, nx) = (rows, cols)
+    rows, cols = grid_t.shape
+    hdr = struct.pack('<HHfff', rows, cols,
+                      meta['origin_x'], meta['origin_y'],
+                      meta['voxel_size'])
+    tmp = ROBOT_COSTMAP_FILE + ".tmp"
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(hdr)
+            f.write(np.ascontiguousarray(grid_t).tobytes())
+        os.replace(tmp, ROBOT_COSTMAP_FILE)
+    except OSError:
+        pass
 
 
 def write_tsdf_binary(tsdf, path: str, display_resolution: float = 0.05) -> None:
@@ -54,66 +80,89 @@ def write_robot_tsdf_file(tsdf, display_resolution: float = 0.05) -> None:
     write_tsdf_binary(tsdf, ROBOT_TSDF_FILE, display_resolution)
 
 
-def write_robot_costmap_file(tsdf, display_resolution: float = 0.05,
-                             cost_floor: float = 0.20) -> None:
-    """Write robot-view costmap built from TSDF surface history.
+def _read_tsdf_voxels(path=ROBOT_TSDF_FILE):
+    """Read TSDF voxel file written by subprocess. Returns Nx3 float32 or None.
 
-    Uses the same surface voxels as the grey cube visualization
-    (include_history=True), so the costmap always matches visible cubes.
-    Runs a cropped EDT for speed.
-
-    Cost = 1 / (1 + dist^2) -- inverse-square falloff, no distance cutoff.
-    Cells below cost_floor (5%) are zeroed so the data is honest.
-
-    Header: u16 rows, u16 cols, f32 origin_x, f32 origin_y, f32 voxel_size
-    Body: rows * cols uint8
+    Format: u32 n_voxels + f32 voxel_half_size (8 bytes header)
+            N x 3 float32 xyz (12 bytes per voxel)
     """
-    from scipy.ndimage import distance_transform_edt
-
-    voxels = tsdf.get_surface_voxels(include_history=True)
-    if len(voxels) == 0:
-        return
-
-    res = display_resolution
-    ox, oy = tsdf.origin_x, tsdf.origin_y
-
-    # Project to 2D grid indices
-    gx = ((voxels[:, 0] - ox) / res).astype(np.int32)
-    gy = ((voxels[:, 1] - oy) / res).astype(np.int32)
-
-    # Crop to bounding box + margin sized from where cost hits floor
-    # 1/(1+d^2) = floor -> d = sqrt(1/floor - 1)
-    max_dist = (1.0 / cost_floor - 1.0) ** 0.5
-    margin = int(max_dist / res) + 2
-    x_lo, x_hi = int(gx.min()) - margin, int(gx.max()) + margin + 1
-    y_lo, y_hi = int(gy.min()) - margin, int(gy.max()) + margin + 1
-
-    # Build occupied grid on cropped region
-    cnx, cny = x_hi - x_lo, y_hi - y_lo
-    occupied = np.zeros((cnx, cny), dtype=np.bool_)
-    lgx, lgy = gx - x_lo, gy - y_lo
-    valid = (lgx >= 0) & (lgx < cnx) & (lgy >= 0) & (lgy < cny)
-    occupied[lgx[valid], lgy[valid]] = True
-
-    # EDT -> inverse-square cost with scale factor for steep dropoff
-    dist = distance_transform_edt(~occupied).astype(np.float32) * res
-    scale = 0.10  # characteristic distance (m)
-    cost_f = 1.0 / (1.0 + (dist / scale) ** 2)
-    cost_u8 = (cost_f * 254).astype(np.uint8)
-    cost_u8[cost_u8 < int(cost_floor * 254)] = 0
-
-    # Transpose to (row=Y, col=X) for renderer
-    grid_t = cost_u8.T
-    rows, cols = grid_t.shape
-    crop_ox = ox + x_lo * res
-    crop_oy = oy + y_lo * res
-    buf = struct.pack('<HHfff', rows, cols, crop_ox, crop_oy, res)
     try:
-        with open(ROBOT_COSTMAP_FILE, 'wb') as f:
-            f.write(buf)
-            f.write(np.ascontiguousarray(grid_t).tobytes())
-    except OSError:
-        pass
+        with open(path, 'rb') as f:
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                return None
+            n, _half = struct.unpack('<If', hdr)
+            if n == 0:
+                return None
+            body = f.read(n * 12)
+            if len(body) < n * 12:
+                return None
+    except (OSError, FileNotFoundError):
+        return None
+    return np.frombuffer(body, dtype=np.float32).reshape(n, 3).copy()
+
+
+def _build_costmap(voxels, robot_x, robot_y, voxel_size=0.05, truncation=0.5):
+    """Build A* cost grid from TSDF surface voxels.
+
+    Binary grid: 0=free, 254=blocked. Circular dilation at _CLEARANCE_M
+    for robot-width clearance. Robot footprint cleared.
+
+    Returns (grid, meta) or None.
+    """
+    from scipy.ndimage import binary_dilation
+
+    # Z-band filter
+    z_mask = (voxels[:, 2] >= 0.05) & (voxels[:, 2] <= 0.80)
+    voxels = voxels[z_mask]
+    if len(voxels) == 0:
+        return None
+
+    vs = voxel_size
+
+    # Grid bounds covering all voxels + margin for dilation
+    margin_m = _CLEARANCE_M + vs * 2
+    wx_min = float(voxels[:, 0].min()) - margin_m
+    wy_min = float(voxels[:, 1].min()) - margin_m
+    wx_max = float(voxels[:, 0].max()) + margin_m
+    wy_max = float(voxels[:, 1].max()) + margin_m
+
+    nx = int(math.ceil((wx_max - wx_min) / vs))
+    ny = int(math.ceil((wy_max - wy_min) / vs))
+
+    # Project voxels to 2D grid
+    gx = ((voxels[:, 0] - wx_min) / vs).astype(np.int32)
+    gy = ((voxels[:, 1] - wy_min) / vs).astype(np.int32)
+    occupied = np.zeros((nx, ny), dtype=np.bool_)
+    valid = (gx >= 0) & (gx < nx) & (gy >= 0) & (gy < ny)
+    occupied[gx[valid], gy[valid]] = True
+
+    # Circular dilation for robot clearance
+    r_cells = max(1, int(round(_CLEARANCE_M / vs)))
+    y_k, x_k = np.ogrid[-r_cells:r_cells + 1, -r_cells:r_cells + 1]
+    disk = (x_k * x_k + y_k * y_k) <= r_cells * r_cells
+    inflated = binary_dilation(occupied, structure=disk)
+    grid = np.where(inflated, np.uint8(254), np.uint8(0))
+
+    # Robot footprint clearing (0.35m)
+    cx = int((robot_x - wx_min) / vs)
+    cy = int((robot_y - wy_min) / vs)
+    fp_r = int(0.35 / vs)
+    ax_lo = max(0, cx - fp_r)
+    ax_hi = min(nx, cx + fp_r + 1)
+    ay_lo = max(0, cy - fp_r)
+    ay_hi = min(ny, cy + fp_r + 1)
+    if ax_lo < ax_hi and ay_lo < ay_hi:
+        aix, aiy = np.ogrid[ax_lo:ax_hi, ay_lo:ay_hi]
+        fp_mask = (aix - cx) ** 2 + (aiy - cy) ** 2 <= fp_r ** 2
+        grid[ax_lo:ax_hi, ay_lo:ay_hi][fp_mask] = 0
+
+    meta = {
+        'origin_x': wx_min, 'origin_y': wy_min,
+        'voxel_size': vs, 'nx': nx, 'ny': ny,
+        'truncation': truncation,
+    }
+    return grid, meta
 
 
 def stream_debug_viewer(game) -> None:
@@ -206,10 +255,10 @@ def write_god_view_path(game) -> None:
 
 
 def tick_perception(game) -> None:
-    """Send pose to perception subprocess + read costmap updates.
+    """Send pose to perception subprocess + build costmap from TSDF voxels.
 
-    Perception runs in a separate process (no GIL contention).
-    This tick just sends the robot pose and checks for new costmaps.
+    Subprocess writes TSDF voxel file at scan_hz.
+    Game process reads it, builds costmap, feeds path_critic and viewer.
 
     God-view TSDF (if enabled) updates here for F1 scoring only.
     """
@@ -232,15 +281,26 @@ def tick_perception(game) -> None:
         perc_sub.update_pose(nav_x, nav_y, _gt_z, nav_yaw,
                              _gt_roll, _gt_pitch)
 
-        # Read costmap from subprocess (check for new file)
-        result = perc_sub.read_costmap()
-        if result is not None and game._path_critic is not None:
-            grid, meta = result
-            game._path_critic.set_world_cost(
-                grid, meta['origin_x'], meta['origin_y'],
-                meta['voxel_size'],
-                truncation=meta.get('truncation', 0.5))
-            game._costmap_changed = True
+        # Check if TSDF voxel file has been updated
+        try:
+            mt = os.path.getmtime(ROBOT_TSDF_FILE)
+        except OSError:
+            mt = 0.0
+        if not hasattr(game, '_tsdf_mtime'):
+            game._tsdf_mtime = 0.0
+        if mt == game._tsdf_mtime:
+            return  # No new TSDF data
+        game._tsdf_mtime = mt
+
+        # Read TSDF voxels → build costmap for viz (not navigation).
+        # Navigation uses the god-view costmap seeded at startup —
+        # robot-view costmap is too sparse early on and overwrites it.
+        voxels = _read_tsdf_voxels()
+        if voxels is not None:
+            result = _build_costmap(voxels, nav_x, nav_y)
+            if result is not None:
+                grid, meta = result
+                _write_costmap_viz(grid, meta)
 
 
 def tick_slam_trails(game) -> None:

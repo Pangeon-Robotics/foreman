@@ -106,18 +106,36 @@ def _setup_obstacle_perception(args, game, obstacle_bodies, scene_path,
         god_tsdf = GodViewTSDF(str(scene_path), robot=args.robot)
         game._god_view_tsdf = god_tsdf
 
-    # Spawn perception subprocess
-    perc_sub = PerceptionSubprocess(
-        scene_xml=str(scene_path),
-        robot=args.robot,
-        config_dict=config_dict,
-        scan_hz=4.0,
-    )
-    perc_sub.start()
-    game._perception_subprocess = perc_sub
+    # Perception subprocess: robot-view TSDF for visualization.
+    # Skip in headless mode — causes DDS timing instability on ~50% of seeds.
+    # Navigation uses god-view EDT costmap (seeded below), not robot-view.
+    if not getattr(args, 'headless', False):
+        perc_sub = PerceptionSubprocess(
+            scene_xml=str(scene_path),
+            robot=args.robot,
+            config_dict=config_dict,
+            scan_hz=10.0,
+        )
+        perc_sub.start()
+        game._perception_subprocess = perc_sub
 
     from .path_critic import PathCritic
     critic = PathCritic(robot=args.robot, robot_radius=0.35)
+
+    # Seed path critic with EDT costmap for immediate A* path planning.
+    # EDT gradient (truncation=1.0m) keeps routes well away from obstacles.
+    # Green dots appear from tick 1. Robot-view costmap is viz-only.
+    from .test_costmap_helpers import build_god_view_costmap
+    gv_grid, gv_meta = build_god_view_costmap(
+        str(scene_path), z_lo=config_dict.get('costmap_z_lo', 0.05),
+        z_hi=config_dict.get('costmap_z_hi', 0.80),
+        output_resolution=config_dict.get('tsdf_output_resolution', 0.05),
+        xy_extent=config_dict.get('tsdf_xy_extent', 10.0),
+        truncation=1.0)
+    critic.set_world_cost(
+        gv_grid, gv_meta['origin_x'], gv_meta['origin_y'],
+        gv_meta['voxel_size'], truncation=gv_meta['truncation'])
+
     game.set_path_critic(critic)
 
     # Return None — no in-process PerceptionPipeline anymore

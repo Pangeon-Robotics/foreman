@@ -94,8 +94,6 @@ def _cleanup_stale_data(domain: int | None = None) -> None:
         "/tmp/robot_view_costmap.bin",
         "/tmp/dwa_best_arc.bin",
         "/tmp/god_view_tsdf_test.bin",
-        "/tmp/robot_costmap_live.bin",
-        "/tmp/robot_costmap_live.bin.tmp",
     ]:
         for f in glob.glob(pattern):
             try:
