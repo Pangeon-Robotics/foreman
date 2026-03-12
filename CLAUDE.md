@@ -172,6 +172,8 @@ self.scoring = GameScoring(self)     # game_scoring.py
 
 **Perception subprocess architecture**: Perception (LiDAR → TSDF → costmap) runs in a separate process (`perception_worker.py`) to eliminate GIL contention with the 100Hz control loop. IPC uses `multiprocessing.Array` for pose input (6 doubles: x, y, z, yaw, roll, pitch) and temp files for costmap output (`/tmp/robot_costmap_live.bin`). The game process reads costmap via `PerceptionSubprocess.read_costmap()` with mtime-based cache invalidation. Navigator routes on this robot-view costmap via A* with waypoint-following (replans when costmap updates or robot drifts >1.5m from route).
 
+**Headless TSDF replay**: In headless mode, PerceptionSubprocess is skipped entirely (mj_multiRay blocks GIL for 10-50ms, causing DDS timing instability and falls). Instead, both god-view and robot-view TSDFs are replayed post-game along the truth trail for F1 scoring. God-view replays every 5th trail point; robot-view replays every 10th via `game_setup.py:replay_robot_tsdf()` using DirectScanner with the god-view's MuJoCo model. Navigation during gameplay uses a god-view EDT costmap seeded at startup from scene XML (no perception needed). Typical replay scores: Surface F1 ~96, Cost F1 ~99, Router F1 ~100.
+
 ### Scenario Testing
 Progressive obstacle scenarios for validating DWA navigation:
 ```bash
@@ -282,6 +284,11 @@ viewer.sync()
 
 ### Simulation Gains
 Test gains: kp=500, kd=25. Production gains (kp=2500) cause oscillation in simulation.
+
+### Learned Body Model (L5 Turn-Speed Coupling)
+Layer 5's `body_model.py` loads a K=5 MLP ensemble from `training/models/b2/play/ensemble.npz` to predict body-state instability for (vx, wz) combinations. At init, it precomputes a 21×21 `turn_factor` lookup table (bilinear interpolation at runtime). The turn_factor scales wz: `wz_safe = wz * turn_factor(vx, wz)`. Values range from 0.87 (13% reduction at low-speed sharp turns) to 1.0 (no reduction at moderate speeds).
+
+The ensemble is trained via the play curriculum (`training/hnn/play_pipeline.py`) with `disable_turn_coupling=True` on SimulationManager — this prevents the coupling table from contaminating training data (model trained on uncoupled dynamics, then used to *apply* coupling). The `.npz` format is numpy-only (no JAX/Flax dependency at runtime). Export: `training/hnn/export_npz.py`.
 
 ## Dependencies
 
