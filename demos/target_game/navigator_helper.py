@@ -263,9 +263,9 @@ class Navigator:
         wz_raw = self.KP_HEADING * heading_err + self.KD_HEADING * heading_err_rate
         wz = _clamp(wz_raw, -self._WZ_MAX, self._WZ_MAX)
 
-        # Speed proportional to heading alignment — L5 handles turn-speed coupling
-        cos_err = max(0.0, math.cos(heading_err))
-        vx = self.VX_WALK * cos_err
+        # Constant forward speed — L5 turn-speed coupling is the sole
+        # mechanism for reducing speed during turns.
+        vx = self.VX_WALK
 
         g._send_motion(vx=vx, wz=wz)
 
