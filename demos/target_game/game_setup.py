@@ -205,11 +205,54 @@ def compute_occupancy(perception, args, scene_path):
         return None
 
 
-def compute_scores(game, perception, args):
+def replay_robot_tsdf(god_tsdf, trail, scene_path, robot):
+    """Create robot-view TSDF by replaying DirectScanner along truth trail.
+
+    Used in headless mode where PerceptionSubprocess is skipped (GIL).
+    Shares god-view's MuJoCo model for identical collision geometry.
+    Returns a TSDF instance, or None if no god_tsdf or trail.
+    """
+    if god_tsdf is None or len(trail) < 2:
+        return None
+
+    from types import SimpleNamespace
+    from layer_6.world_model.tsdf import TSDF
+    from .direct_scanner import init_direct_scanner, _cast_rays
+
+    cfg = SimpleNamespace(
+        tsdf_xy_extent=10.0, tsdf_z_range=(-0.5, 1.5),
+        tsdf_voxel_size=0.01, tsdf_truncation=0.5,
+        tsdf_log_odds_hit=3.0, tsdf_log_odds_free=0.25,
+        tsdf_log_odds_max=5.0, tsdf_log_odds_min=-2.0,
+        tsdf_unknown_cell_cost=0.5, costmap_z_lo=0.05,
+        costmap_z_hi=0.80, tsdf_output_resolution=0.05,
+        tsdf_depth_extension=5, tsdf_decay_rate=0.0,
+    )
+    robot_tsdf = TSDF(cfg)
+
+    stub = SimpleNamespace(
+        _MIN_WORLD_Z=0.05, _use_reduced_rays=False, _tsdf=robot_tsdf)
+    init_direct_scanner(
+        stub, str(scene_path), robot=robot,
+        mj_model=god_tsdf._model, mj_data=god_tsdf._data)
+
+    z = 0.465
+    for i in range(0, len(trail), 10):
+        tx, ty = trail[i]
+        result = _cast_rays(stub, tx, ty, z, 0.0)
+        if result is not None:
+            hits, sx, sy = result
+            robot_tsdf.integrate_scan_world(hits, sx, sy)
+
+    return robot_tsdf
+
+
+def compute_scores(game, perception, args, robot_tsdf=None):
     """Compute perception F1 scores (god TSDF vs robot TSDF). Returns dict or None."""
     god_tsdf_obj = getattr(game, '_god_view_tsdf', None)
-    robot_tsdf_obj = perception._tsdf if perception is not None else None
-    if god_tsdf_obj is None or robot_tsdf_obj is None:
+    if robot_tsdf is None:
+        robot_tsdf = perception._tsdf if perception is not None else None
+    if god_tsdf_obj is None or robot_tsdf is None:
         return None
     try:
         from .scores import compute_surface_f1, compute_cost_f1, compute_router_f1
@@ -220,8 +263,8 @@ def compute_scores(game, perception, args):
         _res = getattr(_scfg, 'tsdf_output_resolution', 0.05)
 
         scores = {
-            "surface": compute_surface_f1(god_tsdf_obj._tsdf, robot_tsdf_obj, _res),
-            "cost": compute_cost_f1(god_tsdf_obj._tsdf, robot_tsdf_obj, _z_lo, _z_hi, _res),
+            "surface": compute_surface_f1(god_tsdf_obj._tsdf, robot_tsdf, _res),
+            "cost": compute_cost_f1(god_tsdf_obj._tsdf, robot_tsdf, _z_lo, _z_hi, _res),
         }
         trail = list(game.truth_trail)
         if len(trail) >= 2:
@@ -229,7 +272,7 @@ def compute_scores(game, perception, args):
             dy = trail[-1][1] - trail[0][1]
             if (dx * dx + dy * dy) > 1.0:
                 scores["router"] = compute_router_f1(
-                    god_tsdf_obj._tsdf, robot_tsdf_obj,
+                    god_tsdf_obj._tsdf, robot_tsdf,
                     trail[0], trail[-1], _z_lo, _z_hi, _res)
         if "router" not in scores:
             scores["router"] = {"f1": 0.0, "precision": 0.0, "recall": 0.0,

@@ -215,7 +215,7 @@ def run_game(args) -> GameRunResult:
         if telemetry_log is not None:
             game.set_telemetry(telemetry_log)
 
-        from .game_setup import setup_perception, compute_occupancy, compute_scores
+        from .game_setup import setup_perception, compute_occupancy, compute_scores, replay_robot_tsdf
         perception = setup_perception(args, game, sim, odometry,
                                       obstacle_bodies, scene_path)
 
@@ -244,16 +244,20 @@ def run_game(args) -> GameRunResult:
         stats = game.run()
         ato = game._path_critic.aggregate_ato() if game._path_critic else None
 
-        # Post-game god-view TSDF replay (deferred from gameplay to avoid GIL)
+        # Post-game TSDF replay (deferred from gameplay to avoid GIL)
+        robot_replay_tsdf = None
         god_tsdf = getattr(game, '_god_view_tsdf', None)
         if god_tsdf is not None and getattr(args, 'headless', False):
             trail = list(game.truth_trail)
             for i in range(0, len(trail), 5):
                 tx, ty = trail[i]
                 god_tsdf.update(tx, ty, 0.0, 0.465)
+            robot_replay_tsdf = replay_robot_tsdf(
+                god_tsdf, trail, scene_path, args.robot)
 
         occ_accuracy = compute_occupancy(perception, args, scene_path)
-        scores = compute_scores(game, perception, args)
+        scores = compute_scores(game, perception, args,
+                                robot_tsdf=robot_replay_tsdf)
 
         return GameRunResult(
             stats=stats, telemetry=game._gt, telemetry_path=telem_path,
