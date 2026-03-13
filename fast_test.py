@@ -29,14 +29,12 @@ _ENV["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libddsc.so.0.10.4"
 
 # Module-level config for worker processes (set via _init_worker)
 _worker_targets = 4
-_worker_genome = None
 
 
-def _init_worker(targets, genome):
+def _init_worker(targets):
     """Initialize module-level state in worker processes."""
-    global _worker_targets, _worker_genome
+    global _worker_targets
     _worker_targets = targets
-    _worker_genome = genome
 
 
 def kill_firmware_on_domain(domain_id: int) -> None:
@@ -72,9 +70,6 @@ def run_worker(args: tuple) -> dict:
         "--seed", str(seed),
         "--targets", str(_worker_targets),
     ]
-    if _worker_genome:
-        cmd.extend(["--genome", _worker_genome])
-
     t0 = time.monotonic()
     try:
         proc = subprocess.run(
@@ -130,8 +125,6 @@ def main():
                         help="Seed offset for reproducibility")
     parser.add_argument("--targets", type=int, default=None,
                         help="Number of targets per run (default: scenario default)")
-    parser.add_argument("--config", type=str, default=None,
-                        help="Path to genome JSON with gait parameter overrides")
     parser.add_argument("--results-json", type=str, default=None,
                         help="Path to write results JSON (default: tmp/ato_results.json)")
     args = parser.parse_args()
@@ -139,19 +132,12 @@ def main():
     n = args.n
     domain_start = args.domain_start
     targets = args.targets
-    genome = args.config
-
-    # Resolve genome path to absolute
-    if genome:
-        genome = str(Path(genome).resolve())
 
     seeds = [args.seed_offset + i for i in range(n)]
     targets_str = f"{targets} targets" if targets else "scenario default targets"
     print(f"Running {n} parallel scattered scenarios (domains {domain_start}-{domain_start + n - 1})")
     print(f"Seeds: {seeds}")
     print(f"Each run: {targets_str}")
-    if genome:
-        print(f"Genome: {genome}")
     print()
 
     t0 = time.monotonic()
@@ -167,7 +153,7 @@ def main():
     with ProcessPoolExecutor(
         max_workers=n,
         initializer=_init_worker,
-        initargs=(targets or 4, genome),
+        initargs=(targets or 4,),
     ) as executor:
         futures = {
             executor.submit(run_worker, wa): wa[0]

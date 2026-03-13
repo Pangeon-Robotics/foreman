@@ -285,10 +285,25 @@ viewer.sync()
 ### Simulation Gains
 Test gains: kp=500, kd=25. Production gains (kp=2500) cause oscillation in simulation.
 
-### Learned Body Model (L5 Turn-Speed Coupling)
-Layer 5's `body_model.py` loads a K=5 MLP ensemble from `training/models/b2/play/ensemble.npz` to predict body-state instability for (vx, wz) combinations. At init, it precomputes a 21×21 `turn_factor` lookup table (bilinear interpolation at runtime). The turn_factor scales wz: `wz_safe = wz * turn_factor(vx, wz)`. Values range from 0.87 (13% reduction at low-speed sharp turns) to 1.0 (no reduction at moderate speeds).
+### Learned Body Model (L5 Momentum Controller)
+Layer 5's `body_model.py` loads a K=5 MLP ensemble from `training/models/b2/play/ensemble.npz`. The ensemble predicts 6D delta body state [dvx, dvy, dwz, droll, dpitch, dyaw] 200ms ahead from 29D observations.
 
-The ensemble is trained via the play curriculum (`training/hnn/play_pipeline.py`) with `disable_turn_coupling=True` on SimulationManager — this prevents the coupling table from contaminating training data (model trained on uncoupled dynamics, then used to *apply* coupling). The `.npz` format is numpy-only (no JAX/Flax dependency at runtime). Export: `training/hnn/export_npz.py`.
+**29D observation layout**: body_state(6) + gait_cmd(5) + foot_contacts(4) + imu(6) + leg_phases(4) + posture_cmd(4). Leg phases encode per-leg gait timing (FR, FL, RR, RL in [0,1]) so the predictor can distinguish swing vs stance. Posture commands (body_roll, body_pitch, body_x_offset, body_y_offset) are included so the speed-gradient can compute d(Q)/d(posture) via finite differences.
+
+**Phase 1 — Turn-Speed Coupling** (`LearnedTurnCoupling`): Precomputed 21×21 lookup table from synthetic 29D observations (leg_phases + posture_cmd = zeros). `turn_factor(vx, wz)` attenuates speed during turns. Zero runtime cost. Always active as a safety bound.
+
+**Phase 2 — Momentum Controller** (`MomentumPredictor`): Active posture-based stabilization using real sensor data. Three chaos control methods (see `docs/chaos-control-gait-stabilization.md`):
+- **Speed-gradient** (Fradkov): finite-difference gradient of instability w.r.t. posture params → additive corrections to body_roll (±0.10 rad), body_pitch (±0.10 rad), body_x_offset (±0.05m), body_y_offset (±0.05m). Runs at 20Hz.
+- **Pyragas delayed feedback**: ring buffer compares body state to one gait period ago → dampens irregular strides via posture corrections. Runs at 100Hz.
+- **Multi-step rollout**: autoregressive trajectory prediction for monitoring (3 steps × 200ms = 600ms horizon).
+- **OGY deadzone**: zero corrections when instability Q < 0.01 (stable gait → don't interfere).
+- **Ensemble disagreement**: high member variance → reduced correction strength (cautious when uncertain).
+
+Posture corrections flow through L4's BodyPoseCommand → L3's `transform_feet_to_body_frame()` RPY rotation + CoM offset → IK solver. Safety limits: roll/pitch ±0.26 rad, x/y offset ±0.10m (L3 clamps).
+
+`BodyObservation` carries real sensor state (roll, pitch, gyro, foot contacts, leg_phases, posture_cmd) from `simulation.py` into `locomotion.py`. When unavailable, falls back to Phase 1 behavior. Plumbing: `SimulationManager._build_body_observation()` → `Locomotion.update(body_obs=)` → `_walk_pipeline()` → `MomentumPredictor.stabilize()`.
+
+The ensemble is trained via the play curriculum (`training/hnn/play_pipeline.py`) with `disable_turn_coupling=True`. The `.npz` format is numpy-only (no JAX/Flax at runtime). Export: `training/hnn/export_npz.py`.
 
 ## Dependencies
 
@@ -308,6 +323,8 @@ The ensemble is trained via the play curriculum (`training/hnn/play_pipeline.py`
 - `foreman/plans/` — Version-specific design docs (v10-v14)
 - `foreman/docs/pd-control-law.md` — PD servo law, cascaded architecture, gain tuning, qd_target feedforward
 - `foreman/docs/perception-timing-architecture.md` — Perception pipeline, timing rates, event-driven chain
+- `foreman/docs/chaos-control-gait-stabilization.md` — Chaos control theory applied to gait (OGY, Pyragas, speed-gradient)
+- `improvements/momentum_controller_design.md` — Momentum controller design document (Phase 2 architecture)
 - Each layer's own `CLAUDE.md` — Authoritative for that layer's development
 
 ## Genome Versions (DEPRECATED)
