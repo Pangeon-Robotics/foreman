@@ -303,7 +303,7 @@ Posture corrections flow through L4's BodyPoseCommand → L3's `transform_feet_t
 
 `BodyObservation` carries real sensor state (roll, pitch, gyro, foot contacts, leg_phases, posture_cmd) from `simulation.py` into `locomotion.py`. When unavailable, falls back to Phase 1 behavior. Plumbing: `SimulationManager._build_body_observation()` → `Locomotion.update(body_obs=)` → `_walk_pipeline()` → `MomentumPredictor.stabilize()`.
 
-The ensemble is trained via the play curriculum (`training/hnn/play_pipeline.py`) with `disable_turn_coupling=True`. The `.npz` format is numpy-only (no JAX/Flax at runtime). Export: `training/hnn/export_npz.py`.
+The ensemble is trained on 10M+ diverse movement samples via `training/scripts/play_diverse.py` using DirectCollector (pure MuJoCo physics, no DDS). 24 movement modes cover gaits (trot, walk, pace, bound), directional (reverse, lateral, spin), perturbations (push recovery, stumble), recoveries (freefall, getup, roll), terrain (slopes, bumps, stairs), and more. Fall detection with settle captures full tumble dynamics. Current MSE: 0.00177. The `.npz` format is numpy-only (no JAX/Flax at runtime). Export: `training/hnn/ensemble.py:export_ensemble_npz()`.
 
 ## Dependencies
 
