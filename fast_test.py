@@ -327,7 +327,7 @@ def main():
         "timestamp": time.time(),
         "n_runs": n,
         "targets_per_run": targets or 4,
-        "genome": genome,
+        "genome": None,
         "seeds": seeds,
         "mean_ato": round(mean_ato, 1) if ato_scores else None,
         "median_ato": round(median_ato, 1) if ato_scores else None,

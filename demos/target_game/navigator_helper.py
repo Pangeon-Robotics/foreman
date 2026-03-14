@@ -94,7 +94,7 @@ class Navigator:
     # Walk speed
     VX_WALK = 2.0       # m/s
     _WZ_ABS_MAX = 1.0   # rad/s — stride-differential safety cap
-    _APPROACH_DIST = 4.0  # m — distance taper zone for deceleration
+    _APPROACH_DIST = 1.0  # m — distance taper zone for deceleration
     _VX_RAMP_S = 2.0    # s — startup ramp to avoid torque spike
     _MAX_STRIDE_DIFF = 0.10  # m — max per-side stride asymmetry
     _STEP_LENGTH_SCALE = 0.2085  # mirror L5 config for wz limit calc
@@ -280,9 +280,9 @@ class Navigator:
 
         # Asymmetric EMA: smooth stride transitions
         if vx_target < self._vx_ema:
-            self._vx_ema += 0.10 * (vx_target - self._vx_ema)
+            self._vx_ema += 0.15 * (vx_target - self._vx_ema)
         else:
-            self._vx_ema += 0.05 * (vx_target - self._vx_ema)
+            self._vx_ema += 0.10 * (vx_target - self._vx_ema)
         vx = self._vx_ema
 
         # Startup ramp: avoid torque spike from instant full stride

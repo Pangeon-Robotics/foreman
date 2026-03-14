@@ -285,25 +285,18 @@ viewer.sync()
 ### Simulation Gains
 Test gains: kp=500, kd=25. Production gains (kp=2500) cause oscillation in simulation.
 
-### Learned Body Model (L5 Momentum Controller)
-Layer 5's `body_model.py` loads a K=5 MLP ensemble from `training/models/b2/play/ensemble.npz`. The ensemble predicts 6D delta body state [dvx, dvy, dwz, droll, dpitch, dyaw] 200ms ahead from 29D observations.
+### Hamiltonian Body Model
+The robot's body is modeled in 60D Hamiltonian phase space: 30 generalized coordinates **q** (positions) + 30 conjugate momenta **p** for 9 rigid bodies (base + 8 leg segments). Gaits are emergent periodic orbits in phase space — no gait parameters, no phase offsets. See `docs/hamiltonian-body-model.md` for the full specification.
 
-**29D observation layout**: body_state(6) + gait_cmd(5) + foot_contacts(4) + imu(6) + leg_phases(4) + posture_cmd(4). Leg phases encode per-leg gait timing (FR, FL, RR, RL in [0,1]) so the predictor can distinguish swing vs stance. Posture commands (body_roll, body_pitch, body_x_offset, body_y_offset) are included so the speed-gradient can compute d(Q)/d(posture) via finite differences.
+**HNN architecture**: Separable H(q,p) = T(q,p) + V(q). T uses a Cholesky-parameterized inverse mass matrix; V is an MLP. K=5 ensemble with energy supervision from MuJoCo ground-truth T and V. Dynamics via `jax.grad(H)` — Hamilton's equations are exact by construction.
 
-**Phase 1 — Turn-Speed Coupling** (`LearnedTurnCoupling`): Precomputed 21×21 lookup table from synthetic 29D observations (leg_phases + posture_cmd = zeros). `turn_factor(vx, wz)` attenuates speed during turns. Zero runtime cost. Always active as a safety bound.
+**Input**: 76D (q_30 + p_30 + tau_12 + contacts_4). **Output**: 60D predicted (q, p) at t+dt. Non-conservative forces (torques, contacts, damping) are observable inputs, not absorbed into H.
 
-**Phase 2 — Momentum Controller** (`MomentumPredictor`): Active posture-based stabilization using real sensor data. Three chaos control methods (see `docs/chaos-control-gait-stabilization.md`):
-- **Speed-gradient** (Fradkov): finite-difference gradient of instability w.r.t. posture params → additive corrections to body_roll (±0.10 rad), body_pitch (±0.10 rad), body_x_offset (±0.05m), body_y_offset (±0.05m). Runs at 20Hz.
-- **Pyragas delayed feedback**: ring buffer compares body state to one gait period ago → dampens irregular strides via posture corrections. Runs at 100Hz.
-- **Multi-step rollout**: autoregressive trajectory prediction for monitoring (3 steps × 200ms = 600ms horizon).
-- **OGY deadzone**: zero corrections when instability Q < 0.01 (stable gait → don't interfere).
-- **Ensemble disagreement**: high member variance → reduced correction strength (cautious when uncertain).
+**Data collection**: DirectCollector (pure MuJoCo, no DDS) collects 60D phase space trajectories. Two collection modes: `play_diverse.py` (40 modes, randomized params) and `play_fundamentals.py` (25 recipes, verified-stable params for full 15s episodes). Phase space extraction: `data.xpos[body_ids]` for positions, `mj_fullM()` @ `data.qvel` for conjugate momenta.
 
-Posture corrections flow through L4's BodyPoseCommand → L3's `transform_feet_to_body_frame()` RPY rotation + CoM offset → IK solver. Safety limits: roll/pitch ±0.26 rad, x/y offset ±0.10m (L3 clamps).
+**Critical: DirectCollector velocity feedforward (dq_ff)**. The PD controller MUST use `dq_ff = 0.9 * (targets - prev_targets) / dt` as velocity feedforward, matching the GA's control loop. Without this, the kd term acts as pure damping and ALL locomotion gaits fall within 2-5 seconds. At kp=500, stable gaits also require higher duty factors: walk ≥ 0.60, trot/spin/reverse ≥ 0.70.
 
-`BodyObservation` carries real sensor state (roll, pitch, gyro, foot contacts, leg_phases, posture_cmd) from `simulation.py` into `locomotion.py`. When unavailable, falls back to Phase 1 behavior. Plumbing: `SimulationManager._build_body_observation()` → `Locomotion.update(body_obs=)` → `_walk_pipeline()` → `MomentumPredictor.stabilize()`.
-
-The ensemble is trained on 10M+ diverse movement samples via `training/scripts/play_diverse.py` using DirectCollector (pure MuJoCo physics, no DDS). 24 movement modes cover gaits (trot, walk, pace, bound), directional (reverse, lateral, spin), perturbations (push recovery, stumble), recoveries (freefall, getup, roll), terrain (slopes, bumps, stairs), and more. Fall detection with settle captures full tumble dynamics. Current MSE: 0.00177. The `.npz` format is numpy-only (no JAX/Flax at runtime). Export: `training/hnn/ensemble.py:export_ensemble_npz()`.
+**Movement taxonomy**: 52 natural quadruped movements catalogued in `docs/quadruped-movement-taxonomy.md`. All movements map to geometric structures in phase space (fixed points, limit cycles, transient/heteroclinic trajectories).
 
 ## Dependencies
 
@@ -324,7 +317,11 @@ The ensemble is trained on 10M+ diverse movement samples via `training/scripts/p
 - `foreman/docs/pd-control-law.md` — PD servo law, cascaded architecture, gain tuning, qd_target feedforward
 - `foreman/docs/perception-timing-architecture.md` — Perception pipeline, timing rates, event-driven chain
 - `foreman/docs/chaos-control-gait-stabilization.md` — Chaos control theory applied to gait (OGY, Pyragas, speed-gradient)
-- `improvements/momentum_controller_design.md` — Momentum controller design document (Phase 2 architecture)
+- `foreman/docs/hamiltonian-body-model.md` — Hamiltonian phase space body model specification
+- `foreman/docs/quadruped-movement-taxonomy.md` — 52 natural quadruped movement patterns
+- `foreman/docs/fundamental-movements.md` — The 10 fundamental movements and comfort zone status
+- `foreman/docs/play-curriculum.md` — Play curriculum: comfort zone expansion strategy
+- `philosophy/embodied_learning.md` — Core principles: learn physics not parameters, animal movement vocabulary, comfort zone learning
 - Each layer's own `CLAUDE.md` — Authoritative for that layer's development
 
 ## Genome Versions (DEPRECATED)

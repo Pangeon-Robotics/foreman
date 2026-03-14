@@ -1,36 +1,26 @@
 """Regex patterns and output parsing for fast_test.py.
 
-Extracted from fast_test.py to keep files under 400 lines.
+Parses the scenario report table output from run_scenario.py.
 """
 import re
 
-# Regex patterns for parsing scenario runner stdout
-ATO_TABLE_LINE = re.compile(
-    r"^\s*(\d+)\s+"          # target number
-    r"([\d.]+)m\s+"          # A* distance
-    r"([\d.]+)s\s+"          # time
-    r"([\d.]+)\s+"           # ATO score
-    r"(\d+%)\s+"             # path efficiency
-    r"([\d.]+)\s+"           # v_avg
-    r"(\d+%)\s+"             # slip efficiency
-    r"([\d.]+)m\s+"          # regression
-    r"([\d.]+)s"             # stall
-    r"(.*)"                  # optional TIMEOUT suffix
+# Summary table line: "scattered   1/2   50%   1   16.4   0.36m   n/a   n/a   3/3   PASS"
+# Fields: scenario, targets (N/M), success%, falls, ATO, SLAM drift, 3DS, 3DS-G, critics, result
+REPORT_LINE = re.compile(
+    r"^\s*(\w+)"            # scenario name
+    r"\s+(\d+)/(\d+)"      # targets reached/total
+    r"\s+\d+%"             # success rate (ignore)
+    r"\s+(\d+)"            # falls
+    r"\s+([\d.]+|n/a)"     # ATO score
+    r"\s+([\d.]+m|n/a)"    # SLAM drift
 )
-ATO_AGG_LINE = re.compile(
-    r"^\s+([\d.]+)m\s+"      # total A* distance
-    r"([\d.]+)s\s+"          # total time
-    r"([\d.]+)\s+"           # aggregate ATO
-    r"(\d+%)\s+"             # aggregate path efficiency
-    r"([\d.]+)\s+"           # aggregate v_avg
-    r"(\d+%)\s+"             # aggregate slip efficiency
-    r"([\d.]+)m\s+"          # total regression
-    r"([\d.]+)s"             # total stall
+
+FALL_LINE = re.compile(r"FALL|fell", re.IGNORECASE)
+
+# Telemetry line: fit=X  stride=Xm  ... v=X.Xm/s
+TELEMETRY_LINE = re.compile(
+    r"T(\d+)/(\d+)\s+fit=([\d.]+).*v=([\d.]+)m/s"
 )
-TARGET_REACHED = re.compile(r"TARGET (\d+) REACHED in ([\d.]+)s")
-TARGET_TIMEOUT = re.compile(r"TARGET (\d+) TIMEOUT after ([\d.]+)s")
-PER_TARGET_ATO = re.compile(r"ATO=([\d.]+)\s+agg=([\d.]+)")
-TARGETS_LINE = re.compile(r"Targets:\s*(\d+)/(\d+)\s+reached")
 
 
 def parse_output(stdout: str) -> dict:
@@ -42,7 +32,6 @@ def parse_output(stdout: str) -> dict:
         "total": 0,
         "falls": 0,
         "error": None,
-        # ATO component breakdown (from aggregate line)
         "path_efficiency": None,
         "v_avg": None,
         "slip_efficiency": None,
@@ -52,54 +41,61 @@ def parse_output(stdout: str) -> dict:
 
     lines = stdout.split("\n")
 
-    # Parse per-target reached/timeout events with their ATO
-    for i, line in enumerate(lines):
-        m = TARGET_REACHED.search(line)
-        if m:
-            idx, t = int(m.group(1)), float(m.group(2))
-            ato = 0.0
-            # Next line should have ATO details
-            if i + 1 < len(lines):
-                am = PER_TARGET_ATO.search(lines[i + 1])
-                if am:
-                    ato = float(am.group(1))
-            result["targets"].append({"idx": idx, "time": t, "ato": ato, "timeout": False})
-            continue
-        m = TARGET_TIMEOUT.search(line)
-        if m:
-            idx, t = int(m.group(1)), float(m.group(2))
-            result["targets"].append({"idx": idx, "time": t, "ato": 0.0, "timeout": True})
-
-    # Parse the ATO FITNESS aggregate line (last numbers line in the table)
-    in_ato_table = False
+    # Parse the scenario report table line
+    in_report = False
     for line in lines:
-        if "=== ATO FITNESS" in line:
-            in_ato_table = True
+        if "SCENARIO TEST REPORT" in line:
+            in_report = True
             continue
-        if in_ato_table:
-            # Try aggregate line (no target number, just starts with distance)
-            m = ATO_AGG_LINE.match(line)
+        if in_report:
+            m = REPORT_LINE.match(line)
             if m:
-                result["aggregate_ato"] = float(m.group(3))
-                # Extract components
-                pe_str = m.group(4)  # e.g., "95%"
-                result["path_efficiency"] = int(pe_str.rstrip("%")) / 100.0
-                result["v_avg"] = float(m.group(5))
-                slip_str = m.group(6)  # e.g., "85%"
-                result["slip_efficiency"] = int(slip_str.rstrip("%")) / 100.0
-                result["regression"] = float(m.group(7))
-                result["stall"] = float(m.group(8))
+                result["reached"] = int(m.group(2))
+                result["total"] = int(m.group(3))
+                result["falls"] = int(m.group(4))
+                ato_str = m.group(5)
+                if ato_str != "n/a":
+                    result["aggregate_ato"] = float(ato_str)
 
-    # Parse targets line ("Targets: 3/4 reached (75%)")
+    # Extract per-target data from telemetry lines
+    # Track which targets we've seen by looking at target transitions
+    target_times = {}  # target_idx -> last seen time
+    target_vavgs = {}  # target_idx -> list of velocities
     for line in lines:
-        m = TARGETS_LINE.search(line)
+        m = TELEMETRY_LINE.search(line)
         if m:
-            result["reached"] = int(m.group(1))
-            result["total"] = int(m.group(2))
+            tidx = int(m.group(1))
+            total = int(m.group(2))
+            v = float(m.group(4))
+            if tidx not in target_vavgs:
+                target_vavgs[tidx] = []
+            target_vavgs[tidx].append(v)
 
-    # Check for falls
+    # Build per-target entries
+    for tidx in sorted(target_vavgs.keys()):
+        vavgs = target_vavgs[tidx]
+        avg_v = sum(vavgs) / len(vavgs) if vavgs else 0.0
+        reached = tidx < result["reached"] + 1 if result["total"] > 0 else False
+        timeout = tidx >= result["reached"] + 1 if result["total"] > 0 else True
+        result["targets"].append({
+            "idx": tidx,
+            "ato": result["aggregate_ato"] or 0.0 if not timeout else 0.0,
+            "timeout": timeout,
+        })
+
+    # Compute mean v_avg from all telemetry
+    all_vavgs = []
+    for vlist in target_vavgs.values():
+        all_vavgs.extend(vlist)
+    if all_vavgs:
+        result["v_avg"] = sum(all_vavgs) / len(all_vavgs)
+
+    # Count falls from output
+    fall_count = 0
     for line in lines:
-        if "FALL DETECTED" in line:
-            result["falls"] += 1
+        if "FALL DETECTED" in line or "fell" in line.lower():
+            fall_count += 1
+    if fall_count > 0 and result["falls"] == 0:
+        result["falls"] = fall_count
 
     return result
