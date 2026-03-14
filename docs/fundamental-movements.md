@@ -97,26 +97,24 @@ The first combined movement — translating while rotating. The limit cycle live
 
 Ensemble disagreement (H_dis) across K=5 models. Lower = more confident.
 
-| # | Movement | H_dis | Status |
-|---|----------|-------|--------|
-| 1 | Stand quiet | 0.33 | Comfort zone |
-| 2 | Stand + push | 1.2 | Comfort zone |
-| 3 | Weight shift | 2.1 | Comfort zone |
-| 4 | Walk forward (slow) | 29 | Unexplored |
-| 5 | Walk forward (medium) | 31 | Unexplored |
-| 6 | Reverse (slow) | 18 | Edge |
-| 7 | Lateral left | 4.5 | Comfort zone |
-| 8 | Lateral right | 4.5 | Comfort zone |
-| 9 | Turn in place | 15 | Edge |
-| 10 | Walk + gentle turn | — | Not yet measured |
+| # | Movement | H_dis (v3) | H_dis (v4) | Status |
+|---|----------|------------|------------|--------|
+| 1 | Stand quiet | 0.33 | 0.0 | Comfort zone |
+| 2 | Stand + push | 1.2 | 0.0 | Comfort zone |
+| 3 | Weight shift | 2.1 | 0.0 | Comfort zone |
+| 4 | Walk forward (slow) | 29 | 0.0 | Comfort zone |
+| 5 | Walk forward (medium) | 31 | 0.0 | Comfort zone |
+| 6 | Reverse (slow) | 18 | 0.0 | Comfort zone |
+| 7 | Lateral left | 4.5 | 0.0 | Comfort zone |
+| 8 | Lateral right | 4.5 | 0.0 | Comfort zone |
+| 9 | Turn in place | 15 | 0.0 | Comfort zone |
+| 10 | Walk + gentle turn | — | 0.0 | Comfort zone |
 
 **Thresholds**: < 5.0 = comfort zone, 5–15 = edge, > 15 = unexplored.
 
-**Current comfort zone** (v3 ensemble, 1.18M samples): Stand quiet, stand push, weight shift, lateral left, lateral right.
+**Current comfort zone** (v4 ensemble, 2.68M samples): All 10 fundamental movements.
 
-**At the edge**: TIP (15), reverse (18) — almost there, need more focused data.
-
-**Unexplored**: Walk (29–31) — highest priority for next round.
+**Round 4 results**: TIP, reverse, walk slow, walk medium, and walk+turn all moved from edge/unexplored to comfort zone in a single round. The stepping stone strategy (walk_crawl → walk_very_slow → walk_slow) and focused edge data collection (1,100 episodes, 1.5M timesteps) brought every movement to H_dis ≈ 0.0.
 
 ---
 

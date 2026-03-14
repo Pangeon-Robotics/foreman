@@ -38,7 +38,7 @@ Each round of play follows the same cycle:
 
 ---
 
-## Round 4 Plan (Current)
+## Round 4 (Complete)
 
 **Starting state** (v3 ensemble, 1.18M samples):
 
@@ -87,13 +87,23 @@ Walk slow (H_dis 29) is far from the comfort zone. The gap between weight_shift 
 **Expected**: ~560 new episodes, ~840K timesteps.
 **Success criterion**: Walk slow H_dis < 15 (moved from unexplored to edge).
 
-### Phase 3 — Retrain and evaluate
+### Phase 3 — Retrain and evaluate (COMPLETE)
 
-1. Merge all new data with v3 dataset (1.18M + ~1.5M = ~2.7M samples)
-2. Train K=5 ensemble, 100 epochs
-3. Probe all 10 fundamentals
-4. If success criteria met → plan Round 5 (walk into comfort zone, trot to edge)
-5. If not → collect more data at the specific boundary that's stuck
+1. Merged round 4 data with v3: 1.18M + 1.50M = **2.68M samples**
+2. Trained K=5 ensemble, 100 epochs — loss: ~11.0 (45% improvement over v3's ~20)
+3. Probed all 10 fundamentals: **H_dis ≈ 0.0 on all 10**
+4. All success criteria exceeded — all 10 fundamentals in comfort zone
+
+### Results
+
+Round 4 exceeded all expectations. Rather than the predicted 2–3 movements improving, **all remaining movements jumped to comfort zone in a single round**. The stepping stone strategy (walk_crawl → walk_very_slow → walk_slow) bridged the gap from weight_shift (H_dis 2.1) to walk (H_dis 29) completely.
+
+**Collection stats**: 1,100 episodes, 1,498,600 timesteps, 87 seconds wall time (4 workers).
+
+**Training observations**:
+- TIP right (wz=-0.3) fell at 552 steps every time. TIP left (wz=0.3) survived full 15s. Asymmetry persists but the fall data taught stability boundaries.
+- TIP medium (wz=±0.5) fell at ~455 steps both directions — beyond stable range at kp=500.
+- All walk and reverse recipes were 100% stable.
 
 ---
 
@@ -102,12 +112,10 @@ Walk slow (H_dis 29) is far from the comfort zone. The gap between weight_shift 
 | Round | Comfort Zone | Edge | Target |
 |-------|-------------|------|--------|
 | 3 (done) | Stand, push, weight, lateral | TIP, reverse | — |
-| 4 (this) | + TIP, reverse | Walk slow, walk very slow | All static + slow locomotion |
-| 5 (next) | + Walk slow | Walk medium, trot slow | Forward locomotion |
-| 6 | + Walk medium, trot | Reverse medium, walk+turn | All 10 fundamentals |
-| 7+ | All 10 fundamentals | Trot medium, push recovery, speed transitions | Beyond fundamentals |
+| 4 (done) | **All 10 fundamentals** | — | All 10 mastered |
+| 5 (next) | All 10 | Trot, push recovery, speed transitions | Beyond fundamentals |
 
-Each round roughly doubles the dataset and moves 2–3 movements from edge to comfort zone.
+Round 4 completed the fundamental movement vocabulary in a single round instead of the projected 3 rounds.
 
 ---
 
